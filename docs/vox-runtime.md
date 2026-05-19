@@ -2,7 +2,7 @@
 
 `vox-runtime` is the long-lived execution system for Vox.
 
-It loads compiled Vox plans, executes them, caches pure results, tracks `Econ` versions, and owns runtime handles for large host values. The runtime also provides a package for projects 
+It loads compiled Vox plans, executes them, caches pure results, tracks `Econ` versions, and owns runtime handles for large host values.
 
 Language semantics are defined in [docs/vox-programming-language.md](/home/rayzh/Projects/Vox/docs/vox-programming-language.md:1).
 
@@ -69,16 +69,79 @@ Most optimization happens in `vox-compiler`. Runtime-specific reuse decisions, s
 
 When exposed as a daemon, `vox-runtime` should use a compact binary protocol.
 
-The protocol should stay small. It only needs operations for:
+The protocol should stay small.
 
-- handshake;
-- mount and unmount library;
-- load, reload, unload, and run script;
-- set optimization mode;
-- describe and release handle;
-- refresh `Econ`;
-- inspect and clear caches;
-- shutdown.
+### Framing
+
+Each frame should contain:
+
+- magic;
+- protocol version;
+- opcode;
+- flags;
+- request id;
+- payload length;
+- payload bytes.
+
+Rules:
+
+- one request yields one response;
+- events are optional and never replace the response;
+- object ids on the wire are integers, not strings;
+- large values are always represented by handles.
+
+### Values
+
+Small values may be encoded inline:
+
+- `int`
+- `float`
+- `bool`
+- `string`
+- `tuple`
+- `null`
+
+Large values must be represented by `handle_id`.
+
+### Operations
+
+The runtime only needs these operations:
+
+- `hello`: handshake and version check.
+- `mount_library`: mount a library root or bundle.
+- `unmount_library`: remove a mounted library revision.
+- `load_script`: compile and store a script artifact.
+- `reload_script`: replace a script with a new revision.
+- `unload_script`: release a script artifact.
+- `set_xopt`: set default `NOpt`, `IOpt`, or `SOpt` for a script.
+- `run_script`: execute a compiled script with arguments.
+- `describe_handle`: return lightweight metadata for a handle.
+- `release_handle`: drop one handle reference.
+- `refresh_econ`: refresh an `Econ` snapshot and invalidate dependent cache entries.
+- `cache_stats`: report cache counts and size estimates.
+- `clear_cache`: clear cache entries by scope.
+- `shutdown`: stop the runtime cleanly.
+
+### Request Contents
+
+A request payload should contain only:
+
+- target object id, when required;
+- operation-specific arguments;
+- optional optimization override for `run_script`;
+- source path or source blob for load and reload;
+- typed argument values for script parameters.
+
+### Response Contents
+
+A response should contain only what the client needs:
+
+- success or failure;
+- created or updated object ids;
+- script revision ids;
+- inline result value or handle id;
+- diagnostics, when relevant;
+- lightweight metadata for inspect-style operations.
 
 Do not expose compiler IR, REPL cells, or graph editing state on this boundary.
 
@@ -97,12 +160,12 @@ The runtime must not serialize large host values by default.
 
 Host libraries should provide:
 
-- type signatures;
+- type metadata;
 - function signatures;
 - purity metadata;
 - a stable call boundary for execution.
 
-We adopt host integration with Shared objects following the C ABI. 
+Shared objects are the preferred extension model when cross-language host support is needed. The plugin boundary should be a versioned C ABI.
 
 `vox-runtime` should call compiled host functions through registered adapters. It should not require host libraries to ship LLVM IR.
 

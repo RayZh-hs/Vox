@@ -30,15 +30,49 @@ The REPL is not the runtime protocol.
 
 Internally, the REPL may keep a growing synthetic script or module-like state and recompile it incrementally. That is a tool concern, not a runtime concern.
 
-The REPL may also offer convenience commands such as:
+These actions should map onto compiler or runtime library calls, not expand the runtime protocol.
 
-- show visible bindings;
-- show inferred type;
-- reload a file;
-- run a script with arguments;
-- inspect handles.
+## Commands
 
-These commands should map onto compiler or runtime library calls, not expand the runtime protocol.
+Everything that does not start with `:` is treated as Vox input.
+
+The REPL should support a small command set:
+
+- `:help`: show available commands.
+- `:quit`: exit the REPL.
+- `:reset`: clear interactive state.
+- `:list`: show visible imports, bindings, and functions.
+- `:type <expr>`: show the inferred type of an expression.
+- `:purity <expr>`: show whether an expression is pure or `evil`.
+- `:load <file>`: load a Vox file into the current state, checking for conflicts ahead of time to prevent partial state updates.
+- `:reload`: reload the last loaded file.
+- `:run [name] [args...]`: run the current script or a named script with arguments.
+- `:handles`: list live handles visible to the REPL session.
+- `:show <handle | handle-id>`: show lightweight metadata for a handle.
+- `:drop <name>`: remove a binding or definition from interactive state.
+
+## Shorthands
+
+The REPL supports the following shorthands:
+
+- `$`: Shorthand for the last evaluated object.
+
+## Example
+
+```text
+>>> import math;
+>>> val x = 4.0;
+>>> math.sqrt(x)
+2.0
+>>> :type $
+Float
+>>> :xopt SOpt
+>>> :load demo.vox
+>>> :run
+<image.Image handle=12>
+>>> :show 12
+image.Image 1920x1080
+```
 
 ## Behavior
 
