@@ -4,7 +4,7 @@
 
 It loads compiled Vox plans, executes them, caches pure results, tracks `Econ` versions, and owns runtime handles for large host values.
 
-Language semantics are defined in [docs/vox-programming-language.md](/home/rayzh/Projects/Vox/docs/vox-programming-language.md:1).
+Language semantics are defined in [the language overview](../language/overview.md).
 
 ## Role
 

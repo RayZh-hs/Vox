@@ -1,0 +1,18 @@
+[book]
+title = "Vox Documentation"
+authors = ["Vox contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "dist"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+git-repository-url = "https://github.com/rayzh/Vox"
+edit-url-template = "https://github.com/rayzh/Vox/edit/main/docs/{path}"
+additional-css = ["theme/grammar-links.css"]
+additional-js = ["theme/grammar-links.js"]

@@ -1,0 +1,19 @@
+code.language-ebnf .grammar-symbol {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+  text-underline-offset: 0.12em;
+}
+
+code.language-ebnf .grammar-symbol:hover {
+  color: var(--links);
+  text-decoration-color: currentColor;
+}
+
+code.language-ebnf .grammar-definition {
+  text-decoration-thickness: 0.08em;
+}
+
+code.language-ebnf .grammar-reference {
+  text-decoration-style: dotted;
+}
