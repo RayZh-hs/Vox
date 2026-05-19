@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "crates/vox-core",
+    "crates/vox-compiler",
+    "crates/vox-runtime",
+    "crates/vox-repl",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+camino = "1.2"
+rustyline = "18.0"
+thiserror = "2.0"

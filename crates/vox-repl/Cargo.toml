@@ -1,0 +1,10 @@
+[package]
+name = "vox-repl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustyline.workspace = true
+vox-core = { path = "../vox-core" }
+vox-runtime = { path = "../vox-runtime" }
