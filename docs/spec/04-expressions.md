@@ -219,6 +219,8 @@ A block evaluates to:
 - the value of its trailing expression, if present; or
 - the unit value `()`, otherwise.
 
+`{}` is also a valid unit literal. It is equivalent to `()`.
+
 ## 8. Range Expressions
 
 Vox uses Rust-style range semantics.
