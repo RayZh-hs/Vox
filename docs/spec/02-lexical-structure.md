@@ -225,17 +225,21 @@ ParenExpr
   ::= "(" Expr ")"
 
 RecordLiteral
-  ::= "{" (RecordField ("," RecordField)* ","?)? "}"
+  ::= "{" (RecordFieldInit ("," RecordFieldInit)* ","?)? "}"
 
-RecordField
-  ::= Identifier "=" Expr
+RecordFieldInit
+  ::= Identifier ":" Expr
+   |  Identifier ":" Type "=" Expr
 ```
 
 Rules:
 
 - `()` is the unit literal;
 - a single parenthesized expression without a comma is not a tuple literal;
-- record literal keys are constant identifier names.
+- record literal keys are constant identifier names;
+- `name: expr` initializes a field from a value expression;
+- `name: Type = expr` initializes a field from a value expression with an
+  explicit field type annotation.
 
 ## 7. Statement Terminators
 
