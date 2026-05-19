@@ -14,3 +14,5 @@ If tests contain issues, be alert! Do not always assume that your code is wrong.
 NEVER implement a feature without full understanding of the requirements. If you are not sure about something, ask for clarification in `docs/issues.ignore.md` and wait for the answer before proceeding. Make no assumptions on your own.
 
 When implementing the codebase, you may use any external library you wish.
+
+When writing documents, keep your writing clear, concise, to-the-point and human-readable. Avoid technical jargon, non-standard terminology like "facade", and unnecessary details. Never repeat yourself.

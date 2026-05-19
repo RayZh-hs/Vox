@@ -92,23 +92,12 @@ fun radiusForQuality(base: Float, quality: Int): Float {
     }
 }
 
-// `when` is an expression for finite branching.
-// Each line except `else`, if not prefixed with an identifier, is implicitly matched against `it`, which is the expression in "when".
-fun qualityLabel(quality: Int): String {
-    when (q: quality) {
-        in 0..3 -> "draft";
-        in 4..7 -> "normal";
-        q in 8..10 || q == 10 -> "high";   // If the match pattern has pattern bindings, these are available in the expression body.
-        else -> "custom";
-    }
-}
-
 // Local mutation is allowed only for local calculation.
 // It does not imply reference-mutable object semantics.
 fun sum(values: List[Float]): Float {
     var total = 0.0;
 
-    for value in values {
+    for (value in values) {
         total = total + value;
     }
 
