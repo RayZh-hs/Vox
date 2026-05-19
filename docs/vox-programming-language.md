@@ -1,6 +1,6 @@
 # Vox
 
-A high-performance, data-flow compatible programming language designed with modern syntax, optimized for vector processing and parallel execution.
+A high-performance, data-flow compatible programming language, designed with modern syntax, optimized for vector processing and parallel execution. It is designed to be embeddable in other PLs, with rust as the first host language.
 
 ## Vox Syntax Overview
 
@@ -119,9 +119,13 @@ fun sum(values: List[Float]): Float {
 // They are primarily for local transforms and host-provided higher-order functions.
 fun soften(values: List[Float]): List[Float] {
     // All these forms are okay:
-    // values.map(x -> { x  * 0.9 })
-    // values.map(lambda(x: Float) { x * 0.9 }) // Lambdas can capture variables.
-    values.map(x -> x * 0.9);
+    // values.map(x -> x  * 0.9)                // Type of x here is inferred from `values`.
+    // values.map((x: Float) -> x * values[0])  // When lambdas capture environment, it is transparently converted into a closure.
+    values.map(x -> {
+        // Wrap in {} for multiline since the trailing expression is the return value.
+        x += 1;
+        x * 0.9
+    }); 
 }
 
 // If the function you want to chain is within a package, use a parenthesis to disambiguate the receiver.
@@ -213,14 +217,6 @@ fun findUser(id: String): User? {
     users.find(user -> user.id == id)
 }
 ```
-
----
-
-```
-val list = List[Big]{...}
-```
-
----
 
 Use `?.` to chain nullable expressions. Use `?:` to provide a default value when an expression is null.
 
