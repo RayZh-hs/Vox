@@ -1,10 +1,21 @@
+use std::{
+    borrow::Cow,
+    sync::{Arc, Mutex},
+};
+
 use rustyline::{
-    Context, Helper, Result as RustylineResult,
-    completion::{Completer, FilenameCompleter, Pair},
+    Context, Helper, RepeatCount, Result as RustylineResult,
+    completion::{Candidate, Completer, FilenameCompleter, Pair, longest_common_prefix},
     highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
-    hint::Hinter,
+    hint::{Hint, Hinter},
+    history::DefaultHistory,
     validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator},
 };
+
+const MENU_WRAP_COLUMNS: usize = 80;
+const MENU_COLUMN_PADDING: usize = 2;
+const MENU_HINT_STYLE: &str = "\x1b[2m";
+const MENU_HINT_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletionSnapshot {
@@ -77,17 +88,162 @@ impl CompletionSnapshot {
     }
 }
 
-#[derive(Default)]
-pub struct ReplHelper {
+#[derive(Debug, Clone, Default)]
+pub struct CompletionUi {
+    state: Arc<Mutex<CompletionUiState>>,
+}
+
+#[derive(Debug, Default)]
+struct CompletionUiState {
     snapshot: CompletionSnapshot,
-    files: FilenameCompleter,
+    menu: Option<CompletionMenu>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompletionMenu {
+    line: String,
+    pos: usize,
+    hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionHint(String);
+
+impl Hint for CompletionHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+
+    fn completion(&self) -> Option<&str> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabCompletion {
+    UseDefault,
+    Noop,
+    Repaint,
+    Insert(String),
+    Replace {
+        delete: RepeatCount,
+        replacement: String,
+    },
+}
+
+impl CompletionUi {
+    pub fn set_snapshot(&self, snapshot: CompletionSnapshot) {
+        let mut state = self.state.lock().unwrap();
+        state.snapshot = snapshot;
+        state.menu = None;
+    }
+
+    pub fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> RustylineResult<(usize, Vec<Pair>)> {
+        let snapshot = self.state.lock().unwrap().snapshot.clone();
+        complete_line(&snapshot, line, pos, ctx)
+    }
+
+    pub fn prepare_tab(&self, line: &str, pos: usize) -> RustylineResult<TabCompletion> {
+        self.clear_menu();
+
+        let history = DefaultHistory::new();
+        let ctx = Context::new(&history);
+        let (start, candidates) = self.complete(line, pos, &ctx)?;
+        if candidates.is_empty() {
+            return Ok(TabCompletion::UseDefault);
+        }
+
+        if candidates.len() == 1 {
+            return Ok(replacement_command(
+                line,
+                start,
+                pos,
+                candidates[0].replacement(),
+            ));
+        }
+
+        let replacement = longest_common_prefix(&candidates)
+            .filter(|prefix| prefix.len() > pos.saturating_sub(start))
+            .map(str::to_owned);
+        let hint = render_menu_hint(&candidates);
+
+        if let Some(replacement) = replacement {
+            let preview = replace_range(line, start, pos, &replacement);
+            self.store_menu(preview, start + replacement.len(), hint);
+            Ok(replacement_command(line, start, pos, &replacement))
+        } else {
+            self.store_menu(line.to_owned(), pos, hint);
+            Ok(TabCompletion::Repaint)
+        }
+    }
+
+    fn hint_for(&self, _: &str, _: usize) -> Option<CompletionHint> {
+        self.state
+            .lock()
+            .unwrap()
+            .menu
+            .as_ref()
+            .map(|menu| CompletionHint(menu.hint.clone()))
+    }
+
+    fn handle_highlight_event(&self, kind: CmdKind) -> bool {
+        if !matches!(kind, CmdKind::ForcedRefresh) {
+            return false;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        if state.menu.is_some() {
+            state.menu = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_menu(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.menu = None;
+    }
+
+    pub fn dismiss_menu(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.menu.take().is_some()
+    }
+
+    fn store_menu(&self, line: String, pos: usize, hint: String) {
+        let mut state = self.state.lock().unwrap();
+        state.menu = Some(CompletionMenu { line, pos, hint });
+    }
+}
+
+pub struct ReplHelper {
+    completion_ui: CompletionUi,
     highlighter: MatchingBracketHighlighter,
     validator: MatchingBracketValidator,
 }
 
 impl ReplHelper {
+    pub fn new(completion_ui: CompletionUi) -> Self {
+        Self {
+            completion_ui,
+            highlighter: MatchingBracketHighlighter::default(),
+            validator: MatchingBracketValidator::default(),
+        }
+    }
+
     pub fn set_snapshot(&mut self, snapshot: CompletionSnapshot) {
-        self.snapshot = snapshot;
+        self.completion_ui.set_snapshot(snapshot);
+    }
+}
+
+impl Default for ReplHelper {
+    fn default() -> Self {
+        Self::new(CompletionUi::default())
     }
 }
 
@@ -107,13 +263,26 @@ impl Highlighter for ReplHelper {
         self.highlighter.highlight(line, pos)
     }
 
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if hint.starts_with('\n') {
+            Cow::Owned(format!("{MENU_HINT_STYLE}{hint}{MENU_HINT_RESET}"))
+        } else {
+            Cow::Borrowed(hint)
+        }
+    }
+
     fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
-        self.highlighter.highlight_char(line, pos, kind)
+        self.completion_ui.handle_highlight_event(kind)
+            || self.highlighter.highlight_char(line, pos, kind)
     }
 }
 
 impl Hinter for ReplHelper {
-    type Hint = String;
+    type Hint = CompletionHint;
+
+    fn hint(&self, line: &str, pos: usize, _: &Context<'_>) -> Option<Self::Hint> {
+        self.completion_ui.hint_for(line, pos)
+    }
 }
 
 impl Completer for ReplHelper {
@@ -125,56 +294,7 @@ impl Completer for ReplHelper {
         pos: usize,
         ctx: &Context<'_>,
     ) -> RustylineResult<(usize, Vec<Pair>)> {
-        let prefix = &line[..pos];
-        if prefix.starts_with(':') {
-            return self.complete_command_line(line, pos, ctx);
-        }
-
-        let start = symbol_start(prefix);
-        let token = &prefix[start..];
-        Ok((start, self.snapshot.complete_symbol(token)))
-    }
-}
-
-impl ReplHelper {
-    fn complete_command_line(
-        &self,
-        line: &str,
-        pos: usize,
-        ctx: &Context<'_>,
-    ) -> RustylineResult<(usize, Vec<Pair>)> {
-        let prefix = &line[..pos];
-        let Some(space) = prefix.find(char::is_whitespace) else {
-            return Ok((0, self.snapshot.complete_commands(prefix)));
-        };
-
-        let command = prefix[..space].trim();
-        let argument_start = space
-            + prefix[space..]
-                .chars()
-                .take_while(|ch| ch.is_whitespace())
-                .count();
-
-        match command {
-            ":snapshot" | ":restore" => {
-                let start = command_token_start(prefix, argument_start);
-                Ok((start, self.snapshot.complete_snapshots(&prefix[start..])))
-            }
-            ":run" => self.files.complete(line, pos, ctx),
-            ":xopt" => {
-                let start = command_token_start(prefix, argument_start);
-                Ok((start, self.snapshot.complete_xopts(&prefix[start..])))
-            }
-            ":show" => {
-                let start = command_token_start(prefix, argument_start);
-                Ok((start, self.snapshot.complete_handles(&prefix[start..])))
-            }
-            ":drop" | ":type" => {
-                let start = command_token_start(prefix, argument_start);
-                Ok((start, self.snapshot.complete_symbol(&prefix[start..])))
-            }
-            _ => Ok((0, Vec::new())),
-        }
+        self.completion_ui.complete(line, pos, ctx)
     }
 }
 
@@ -203,4 +323,124 @@ fn to_pairs(candidates: Vec<String>) -> Vec<Pair> {
             replacement: candidate,
         })
         .collect()
+}
+
+fn complete_line(
+    snapshot: &CompletionSnapshot,
+    line: &str,
+    pos: usize,
+    ctx: &Context<'_>,
+) -> RustylineResult<(usize, Vec<Pair>)> {
+    let prefix = &line[..pos];
+    if prefix.starts_with(':') {
+        return complete_command_line(snapshot, line, pos, ctx);
+    }
+
+    let start = symbol_start(prefix);
+    let token = &prefix[start..];
+    Ok((start, snapshot.complete_symbol(token)))
+}
+
+fn complete_command_line(
+    snapshot: &CompletionSnapshot,
+    line: &str,
+    pos: usize,
+    ctx: &Context<'_>,
+) -> RustylineResult<(usize, Vec<Pair>)> {
+    let prefix = &line[..pos];
+    let Some(space) = prefix.find(char::is_whitespace) else {
+        return Ok((0, snapshot.complete_commands(prefix)));
+    };
+
+    let command = prefix[..space].trim();
+    let argument_start = space
+        + prefix[space..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+
+    match command {
+        ":snapshot" | ":restore" => {
+            let start = command_token_start(prefix, argument_start);
+            Ok((start, snapshot.complete_snapshots(&prefix[start..])))
+        }
+        ":run" => FilenameCompleter::new().complete(line, pos, ctx),
+        ":xopt" => {
+            let start = command_token_start(prefix, argument_start);
+            Ok((start, snapshot.complete_xopts(&prefix[start..])))
+        }
+        ":show" => {
+            let start = command_token_start(prefix, argument_start);
+            Ok((start, snapshot.complete_handles(&prefix[start..])))
+        }
+        ":drop" | ":type" => {
+            let start = command_token_start(prefix, argument_start);
+            Ok((start, snapshot.complete_symbol(&prefix[start..])))
+        }
+        _ => Ok((0, Vec::new())),
+    }
+}
+
+fn replacement_command(line: &str, start: usize, pos: usize, replacement: &str) -> TabCompletion {
+    let current = &line[start..pos];
+    if current == replacement {
+        TabCompletion::Noop
+    } else if let Some(suffix) = replacement.strip_prefix(current) {
+        TabCompletion::Insert(suffix.to_owned())
+    } else {
+        TabCompletion::Replace {
+            delete: current
+                .chars()
+                .count()
+                .try_into()
+                .unwrap_or(RepeatCount::MAX),
+            replacement: replacement.to_owned(),
+        }
+    }
+}
+
+fn replace_range(line: &str, start: usize, end: usize, replacement: &str) -> String {
+    let mut updated = String::with_capacity(line.len() + replacement.len());
+    updated.push_str(&line[..start]);
+    updated.push_str(replacement);
+    updated.push_str(&line[end..]);
+    updated
+}
+
+fn render_menu_hint(candidates: &[Pair]) -> String {
+    let column_width = candidates
+        .iter()
+        .map(|candidate| candidate.display.chars().count())
+        .max()
+        .unwrap_or(0)
+        + MENU_COLUMN_PADDING;
+
+    let mut hint = String::from("\n");
+    let mut current_width = 0usize;
+
+    for candidate in candidates {
+        let text = candidate.display();
+        let text_width = text.chars().count();
+        let cell_width = column_width.max(text_width);
+
+        if current_width != 0 && current_width + cell_width > MENU_WRAP_COLUMNS {
+            hint.push('\n');
+            current_width = 0;
+        }
+
+        hint.push_str(text);
+        current_width += text_width;
+
+        let remaining_padding = cell_width.saturating_sub(text_width);
+        if remaining_padding != 0 {
+            hint.extend(std::iter::repeat_n(' ', remaining_padding));
+            current_width += remaining_padding;
+        }
+    }
+
+    while hint.ends_with(' ') {
+        hint.pop();
+    }
+
+    hint
 }

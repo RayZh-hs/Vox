@@ -2,7 +2,7 @@ use rustyline::{
     Cmd, ConditionalEventHandler, Config, Editor, Event, EventContext, EventHandler, KeyCode,
     KeyEvent, Modifiers, Movement, RepeatCount, history::DefaultHistory,
 };
-use vox_repl::{ReplHelper, ReplOutput, ReplSession};
+use vox_repl::{CompletionUi, ReplHelper, ReplOutput, ReplSession, TabCompletion};
 
 const PRIMARY_PROMPT: &str = ">>> ";
 const CONTINUATION_PROMPT: &str = "... ";
@@ -10,15 +10,24 @@ const INDENT: &str = "    ";
 
 fn main() -> rustyline::Result<()> {
     let config = Config::builder().build();
+    let completion_ui = CompletionUi::default();
     let mut editor = Editor::<ReplHelper, DefaultHistory>::with_config(config)?;
-    editor.set_helper(Some(ReplHelper::default()));
+    editor.set_helper(Some(ReplHelper::new(completion_ui.clone())));
     editor.bind_sequence(
         KeyEvent(KeyCode::Enter, Modifiers::NONE),
         EventHandler::Conditional(Box::new(EnterEventHandler)),
     );
     editor.bind_sequence(
         KeyEvent::from('\t'),
-        EventHandler::Conditional(Box::new(TabEventHandler)),
+        EventHandler::Conditional(Box::new(TabEventHandler {
+            completion_ui: completion_ui.clone(),
+        })),
+    );
+    editor.bind_sequence(
+        KeyEvent(KeyCode::Esc, Modifiers::NONE),
+        EventHandler::Conditional(Box::new(EscapeEventHandler {
+            completion_ui: completion_ui.clone(),
+        })),
     );
     editor.bind_sequence(
         KeyEvent::from('}'),
@@ -105,8 +114,10 @@ impl ConditionalEventHandler for EnterEventHandler {
     }
 }
 
-#[derive(Clone, Copy)]
-struct TabEventHandler;
+#[derive(Clone)]
+struct TabEventHandler {
+    completion_ui: CompletionUi,
+}
 
 impl ConditionalEventHandler for TabEventHandler {
     fn handle(&self, _: &Event, n: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
@@ -114,7 +125,34 @@ impl ConditionalEventHandler for TabEventHandler {
             .chars()
             .all(char::is_whitespace)
         {
-            Some(Cmd::Insert(n, INDENT.to_owned()))
+            return Some(Cmd::Insert(n, INDENT.to_owned()));
+        }
+
+        match self.completion_ui.prepare_tab(ctx.line(), ctx.pos()).ok()? {
+            TabCompletion::UseDefault => None,
+            TabCompletion::Noop => Some(Cmd::Noop),
+            TabCompletion::Repaint => Some(Cmd::Repaint),
+            TabCompletion::Insert(text) => Some(Cmd::Insert(1, text)),
+            TabCompletion::Replace {
+                delete,
+                replacement,
+            } => Some(Cmd::Replace(
+                Movement::BackwardChar(delete),
+                Some(replacement),
+            )),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EscapeEventHandler {
+    completion_ui: CompletionUi,
+}
+
+impl ConditionalEventHandler for EscapeEventHandler {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, _: &EventContext) -> Option<Cmd> {
+        if self.completion_ui.dismiss_menu() {
+            Some(Cmd::Repaint)
         } else {
             None
         }
