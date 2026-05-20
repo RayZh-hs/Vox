@@ -1,15 +1,15 @@
 use rustyline::{
     Context, Helper, Result as RustylineResult,
     completion::{Completer, FilenameCompleter, Pair},
-    highlight::Highlighter,
+    highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
     hint::Hinter,
-    validate::Validator,
+    validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator},
 };
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletionSnapshot {
     pub commands: Vec<String>,
-    pub command_args: Vec<String>,
+    pub snapshots: Vec<String>,
     pub xopts: Vec<String>,
     pub handles: Vec<String>,
     pub symbols: Vec<String>,
@@ -52,9 +52,9 @@ impl CompletionSnapshot {
         to_pairs(candidates)
     }
 
-    fn complete_handles(&self, prefix: &str) -> Vec<Pair> {
+    fn complete_snapshots(&self, prefix: &str) -> Vec<Pair> {
         let mut candidates = self
-            .handles
+            .snapshots
             .iter()
             .filter(|candidate| candidate.starts_with(prefix))
             .cloned()
@@ -64,9 +64,9 @@ impl CompletionSnapshot {
         to_pairs(candidates)
     }
 
-    fn complete_command_args(&self, prefix: &str) -> Vec<Pair> {
+    fn complete_handles(&self, prefix: &str) -> Vec<Pair> {
         let mut candidates = self
-            .command_args
+            .handles
             .iter()
             .filter(|candidate| candidate.starts_with(prefix))
             .cloned()
@@ -81,6 +81,8 @@ impl CompletionSnapshot {
 pub struct ReplHelper {
     snapshot: CompletionSnapshot,
     files: FilenameCompleter,
+    highlighter: MatchingBracketHighlighter,
+    validator: MatchingBracketValidator,
 }
 
 impl ReplHelper {
@@ -90,8 +92,25 @@ impl ReplHelper {
 }
 
 impl Helper for ReplHelper {}
-impl Validator for ReplHelper {}
-impl Highlighter for ReplHelper {}
+
+impl Validator for ReplHelper {
+    fn validate(&self, ctx: &mut ValidationContext) -> RustylineResult<ValidationResult> {
+        if ctx.input().trim_start().starts_with(':') {
+            return Ok(ValidationResult::Valid(None));
+        }
+        self.validator.validate(ctx)
+    }
+}
+
+impl Highlighter for ReplHelper {
+    fn highlight<'l>(&self, line: &'l str, pos: usize) -> std::borrow::Cow<'l, str> {
+        self.highlighter.highlight(line, pos)
+    }
+
+    fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
+        self.highlighter.highlight_char(line, pos, kind)
+    }
+}
 
 impl Hinter for ReplHelper {
     type Hint = String;
@@ -137,7 +156,11 @@ impl ReplHelper {
                 .count();
 
         match command {
-            ":load" => self.files.complete(line, pos, ctx),
+            ":snapshot" | ":restore" => {
+                let start = command_token_start(prefix, argument_start);
+                Ok((start, self.snapshot.complete_snapshots(&prefix[start..])))
+            }
+            ":run" => self.files.complete(line, pos, ctx),
             ":xopt" => {
                 let start = command_token_start(prefix, argument_start);
                 Ok((start, self.snapshot.complete_xopts(&prefix[start..])))
@@ -146,18 +169,9 @@ impl ReplHelper {
                 let start = command_token_start(prefix, argument_start);
                 Ok((start, self.snapshot.complete_handles(&prefix[start..])))
             }
-            ":drop" | ":type" | ":purity" => {
+            ":drop" | ":type" => {
                 let start = command_token_start(prefix, argument_start);
                 Ok((start, self.snapshot.complete_symbol(&prefix[start..])))
-            }
-            ":run" => {
-                let start = command_token_start(prefix, argument_start);
-                let token = &prefix[start..];
-                let mut candidates = self.snapshot.complete_symbol(token);
-                candidates.extend(self.snapshot.complete_command_args(token));
-                candidates.sort_by(|left, right| left.replacement.cmp(&right.replacement));
-                candidates.dedup_by(|left, right| left.replacement == right.replacement);
-                Ok((start, candidates))
             }
             _ => Ok((0, Vec::new())),
         }

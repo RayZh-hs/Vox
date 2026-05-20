@@ -58,6 +58,7 @@ Rules:
 - `T?` denotes the nullable form of `T`;
 - `()` is the unit type;
 - `Unit` is equivalent to the zero-element tuple type `()`;
+- `{}` is also equivalent to `Unit` in type positions;
 - `(A, B) -> C` denotes a function that takes `A` and `B` and returns `C`;
 - function types are right-associative;
 - record types are structural and anonymous;

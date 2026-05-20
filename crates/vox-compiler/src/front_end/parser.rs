@@ -269,6 +269,7 @@ impl Parser {
         } else {
             self.parse_block_expr_required()?
         };
+        let end = self.previous().span.end;
 
         Ok(FunctionDecl {
             docs,
@@ -278,7 +279,7 @@ impl Parser {
             generic_parameters,
             parameters,
             return_type,
-            span: TextSpan::new(start, body.span.end),
+            span: TextSpan::new(start, end),
             body,
         })
     }
@@ -483,8 +484,12 @@ impl Parser {
             let mut parameters = Vec::new();
             if !self.at(TokenKind::RParen) {
                 loop {
+                    let TokenKind::Identifier(name) = self.current().kind.clone() else {
+                        self.index = checkpoint;
+                        return Ok(None);
+                    };
                     let param_start = self.current().span.start;
-                    let (name, _) = self.expect_identifier("expected lambda parameter name")?;
+                    self.index += 1;
                     let ty = if self.consume(TokenKind::Colon) {
                         Some(self.parse_type()?)
                     } else {
@@ -909,7 +914,7 @@ impl Parser {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::When => self.parse_when_expr(),
             TokenKind::Econ => self.parse_econ_expr(),
-            _ => self.error_here("expected expression"),
+            _ => self.error_here(self.expected_expression_message()),
         }
     }
 
@@ -1011,7 +1016,7 @@ impl Parser {
         self.expect_simple(TokenKind::LBrace, "expected `{`")?;
         if self.consume(TokenKind::RBrace) {
             return Ok(Some(Expr {
-                kind: ExprKind::Record(Vec::new()),
+                kind: ExprKind::Tuple(Vec::new()),
                 span: TextSpan::new(start, self.previous().span.end),
             }));
         }
@@ -1537,7 +1542,36 @@ impl Parser {
         &self.tokens[self.index - 1]
     }
 
+    fn expected_expression_message(&self) -> String {
+        self.index
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .and_then(|token| expression_context(token.kind.clone()))
+            .map(|context| format!("expected expression after {context}"))
+            .unwrap_or_else(|| "expected expression".to_owned())
+    }
+
     fn error_here<T>(&self, message: impl Into<String>) -> Result<T, DiagnosticBag> {
         Err(vec![Diagnostic::error(message).with_span(self.current().span.clone())].into())
+    }
+}
+
+fn expression_context(kind: TokenKind) -> Option<&'static str> {
+    match kind {
+        TokenKind::Assign => Some("`=`"),
+        TokenKind::Arrow => Some("`->`"),
+        TokenKind::Colon => Some("`:`"),
+        TokenKind::Comma => Some("`,`"),
+        TokenKind::FatArrow => Some("`=>`"),
+        TokenKind::LParen => Some("`(`"),
+        TokenKind::LBracket => Some("`[`"),
+        TokenKind::Minus => Some("`-`"),
+        TokenKind::Percent => Some("`%`"),
+        TokenKind::Plus => Some("`+`"),
+        TokenKind::QuestionColon => Some("`?:`"),
+        TokenKind::Return => Some("`return`"),
+        TokenKind::Slash => Some("`/`"),
+        TokenKind::Star => Some("`*`"),
+        _ => None,
     }
 }

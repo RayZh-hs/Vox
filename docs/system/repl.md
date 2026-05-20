@@ -38,24 +38,39 @@ Everything that does not start with `:` is treated as Vox input.
 
 The REPL should support a small command set:
 
+### General Commands
+
 - `:help`: show available commands.
 - `:quit`: exit the REPL.
+
+### Environment Manipulation
+
 - `:reset`: clear interactive state.
-- `:list`: show visible imports, bindings, and functions.
-- `:type <expr>`: show the inferred type of an expression.
-- `:purity <expr>`: show whether an expression is pure or `evil`.
-- `:load <file>`: load a Vox file into the current state, checking for conflicts ahead of time to prevent partial state updates.
-- `:reload`: reload the last loaded file.
-- `:run [name] [args...]`: run the current script or a named script with arguments.
-- `:handles`: list live handles visible to the REPL session.
-- `:show <handle | handle-id>`: show lightweight metadata for a handle.
+- `:clear`: clear the screen.
+- `:env`: show visible imports, bindings, and functions.
+- `:snapshot <name>`: save the current state under a name for later retrieval, overwriting existing snapshots if exists. snapshots are stored under `/tmp/vox-repl/snapshots` on Unix-like machines, and `%APPDATA%\\vox-repl\\snapshots` on Windows by default.
+- `:restore <name>`: restore a previously saved snapshot by name, replacing the current state. if the snapshot does not exist, an error message is shown.
 - `:drop <name>`: remove a binding or definition from interactive state.
+
+### Running Scripts
+
+- `:run <file>`: run a script file in the current state.
+
+### Inspection
+
+- `:show <handle | handle-id>`: show lightweight metadata for a handle.
+- `:type <expr>`: show the inferred type of an expression.
+- `:handles`: list live handles visible to the REPL session.
 
 ## Shorthands
 
 The REPL supports the following shorthands:
 
 - `$`: Shorthand for the last evaluated object.
+- Arrow keys: navigate command history.
+- Tab: auto-complete commands and identifiers.
+- Ctrl+C: interrupt long-running evaluations.
+- Ctrl+D: exit the REPL.
 
 ## Example
 
@@ -66,12 +81,6 @@ The REPL supports the following shorthands:
 2.0
 >>> :type $
 Float
->>> :xopt SOpt
->>> :load demo.vox
->>> :run
-<image.Image handle=12>
->>> :show 12
-image.Image 1920x1080
 ```
 
 ## Behavior

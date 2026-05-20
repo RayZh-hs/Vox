@@ -590,6 +590,12 @@ impl EvalContext {
     ) -> Result<Value, EvalError> {
         match (left, right, operator) {
             (Value::Int(left), Value::Int(right), "*") => Ok(Value::Int(left * right)),
+            (Value::Int(_), Value::Int(0), "/") => {
+                Err(EvalError::Message("integer division by zero".to_owned()))
+            }
+            (Value::Int(_), Value::Int(0), "%") => {
+                Err(EvalError::Message("integer remainder by zero".to_owned()))
+            }
             (Value::Int(left), Value::Int(right), "/") => Ok(Value::Int(left / right)),
             (Value::Int(left), Value::Int(right), "%") => Ok(Value::Int(left % right)),
             (Value::Int(left), Value::Int(right), "-") => Ok(Value::Int(left - right)),
@@ -884,20 +890,26 @@ impl EvalContext {
                 }
                 _ => Ok(false),
             },
-            TypeKind::Record(fields) => match value {
-                Value::Record(values) => {
-                    for field in fields {
-                        let Some(value) = values.get(&field.name) else {
-                            return Ok(false);
-                        };
-                        if !self.matches_type(value, &field.ty)? {
-                            return Ok(false);
-                        }
-                    }
-                    Ok(true)
+            TypeKind::Record(fields) => {
+                if fields.is_empty() {
+                    return Ok(matches!(value, Value::Tuple(items) if items.is_empty()));
                 }
-                _ => Ok(false),
-            },
+
+                match value {
+                    Value::Record(values) => {
+                        for field in fields {
+                            let Some(value) = values.get(&field.name) else {
+                                return Ok(false);
+                            };
+                            if !self.matches_type(value, &field.ty)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Ok(false),
+                }
+            }
             TypeKind::Function { .. } => Ok(matches!(value, Value::Function(_))),
         }
     }
