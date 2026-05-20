@@ -194,10 +194,7 @@ impl ReplSession {
 
     fn execute(&mut self, command: ReplCommand) -> ReplOutput {
         match command {
-            ReplCommand::Help => ReplOutput::message(
-                ":help :quit :reset :clear :env :snapshot <name> :restore <name> :run <file> :show <handle> :type <expr> :handles :drop <name> :xopt <mode>"
-                    .to_owned(),
-            ),
+            ReplCommand::Help => ReplOutput::message(render_help()),
             ReplCommand::Quit => ReplOutput::Exit,
             ReplCommand::Reset => {
                 self.items.clear();
@@ -223,9 +220,7 @@ impl ReplSession {
                     "IOpt" => OptimizationLevel::IOpt,
                     "SOpt" => OptimizationLevel::SOpt,
                     _ => {
-                        return ReplOutput::error(format!(
-                            "unknown optimization mode `{mode}`"
-                        ));
+                        return ReplOutput::error(format!("unknown optimization mode `{mode}`"));
                     }
                 };
                 self.runtime.set_default_xopt(xopt);
@@ -557,6 +552,25 @@ impl ReplSession {
         self.next_source_revision += 1;
         self.next_source_revision
     }
+}
+
+fn render_help() -> String {
+    [
+        ":help              - show a brief description of each REPL command",
+        ":quit              - exit the REPL",
+        ":reset             - clear interactive state",
+        ":clear             - clear the screen",
+        ":env               - show visible imports, bindings, and functions",
+        ":snapshot <name>   - save the current state as a named snapshot",
+        ":restore <name>    - restore a previously saved snapshot",
+        ":run <file>        - run a script file in the current state",
+        ":show <handle>     - show lightweight metadata for a handle",
+        ":type <expr>       - show the inferred type of an expression",
+        ":handles           - list live handles visible to this session",
+        ":drop <name>       - remove a binding or definition from interactive state",
+        ":xopt <mode>       - set the default optimization mode (NOpt, IOpt, SOpt)",
+    ]
+    .join("\n")
 }
 
 fn parse_submission(raw: &str) -> Result<ParsedSubmission, String> {
