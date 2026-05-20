@@ -1,5 +1,6 @@
 mod artifact_store;
 mod handles;
+mod interpreter;
 
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler};
@@ -14,6 +15,7 @@ use vox_core::{
 
 pub use artifact_store::ArtifactStore;
 pub use handles::HandleStore;
+use interpreter::Interpreter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedLibrary {
@@ -37,6 +39,8 @@ pub enum RuntimeError {
     NotAScript(ArtifactId),
     #[error("artifact {0:?} has no executable plan yet")]
     ExecutionNotImplemented(ArtifactId),
+    #[error("script execution failed: {0}")]
+    ExecutionFailed(String),
 }
 
 #[derive(Debug, Default)]
@@ -81,8 +85,9 @@ impl Runtime {
         let artifact = result
             .artifact
             .expect("successful compilation should produce an artifact");
+        let treewalk = result.treewalk;
         let id = artifact.id;
-        self.artifacts.insert(artifact);
+        self.artifacts.insert(artifact, treewalk);
         Ok(id)
     }
 
@@ -112,7 +117,7 @@ impl Runtime {
             .artifact
             .expect("successful compilation should produce an artifact");
         artifact.id = artifact_id;
-        self.artifacts.insert(artifact);
+        self.artifacts.insert(artifact, result.treewalk);
         Ok(())
     }
 
@@ -121,20 +126,29 @@ impl Runtime {
     }
 
     pub fn run_script(
-        &self,
+        &mut self,
         artifact_id: ArtifactId,
-        _arguments: &[RuntimeValue],
+        arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RuntimeError> {
         let artifact = self
             .artifacts
             .get(artifact_id)
+            .cloned()
             .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
 
         if !matches!(artifact.kind, ModuleKind::Script { .. }) {
             return Err(RuntimeError::NotAScript(artifact_id));
         }
 
-        Err(RuntimeError::ExecutionNotImplemented(artifact_id))
+        let treewalk = self
+            .artifacts
+            .treewalk(artifact_id)
+            .ok_or(RuntimeError::ExecutionNotImplemented(artifact_id))?
+            .clone();
+
+        Interpreter::new(self)
+            .run_script(&treewalk, &artifact, arguments)
+            .map_err(RuntimeError::ExecutionFailed)
     }
 
     pub fn allocate_handle(&mut self, summary: HandleSummary) -> HandleId {
@@ -147,6 +161,14 @@ impl Runtime {
 
     pub fn release_handle(&mut self, handle: HandleId) -> bool {
         self.handles.release(handle)
+    }
+
+    pub fn live_handles(&self) -> Vec<HandleId> {
+        self.handles.ids()
+    }
+
+    pub fn package_manifests(&self) -> Vec<PackageManifest> {
+        self.host.packages().cloned().collect()
     }
 
     pub fn set_default_xopt(&mut self, xopt: OptimizationLevel) {

@@ -224,6 +224,7 @@ name = "vox-repl"
 version = "0.1.0"
 dependencies = [
  "rustyline",
+ "vox-compiler",
  "vox-core",
  "vox-runtime",
 ]

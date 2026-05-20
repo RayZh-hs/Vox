@@ -1,11 +1,16 @@
-use rustyline::DefaultEditor;
-use vox_repl::{ReplOutput, ReplSession};
+use rustyline::{Editor, history::DefaultHistory};
+use vox_repl::{ReplHelper, ReplOutput, ReplSession};
 
 fn main() -> rustyline::Result<()> {
-    let mut editor = DefaultEditor::new()?;
+    let mut editor = Editor::<ReplHelper, DefaultHistory>::new()?;
+    editor.set_helper(Some(ReplHelper::default()));
     let mut session = ReplSession::default();
 
     loop {
+        if let Some(helper) = editor.helper_mut() {
+            helper.set_snapshot(session.completion_snapshot());
+        }
+
         match editor.readline(">>> ") {
             Ok(line) => {
                 editor.add_history_entry(line.as_str())?;

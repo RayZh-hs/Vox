@@ -52,4 +52,8 @@ impl HandleStore {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn ids(&self) -> Vec<HandleId> {
+        self.entries.keys().copied().collect()
+    }
 }

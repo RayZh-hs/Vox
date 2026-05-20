@@ -10,6 +10,7 @@ use vox_core::{
 };
 
 use crate::front_end::{FrontEndUnit, analyze_source};
+use crate::treewalk::TreewalkScript;
 
 #[derive(Debug, Clone)]
 pub struct CompileRequest {
@@ -22,6 +23,7 @@ pub struct CompileRequest {
 pub struct CompileResult {
     pub artifact: Option<CompiledArtifact>,
     pub front_end: Option<FrontEndUnit>,
+    pub treewalk: Option<TreewalkScript>,
     pub diagnostics: DiagnosticBag,
 }
 
@@ -34,6 +36,7 @@ impl Compiler {
     pub fn compile(&self, request: CompileRequest) -> CompileResult {
         match analyze_source(&request.source) {
             Ok(front_end) => {
+                let treewalk = TreewalkScript::lower(&front_end).ok();
                 let artifact = CompiledArtifact {
                     id: ArtifactId(self.next_artifact_id.fetch_add(1, Ordering::Relaxed) + 1),
                     module: front_end.header.module.clone(),
@@ -63,12 +66,14 @@ impl Compiler {
                 CompileResult {
                     artifact: Some(artifact),
                     front_end: Some(front_end),
+                    treewalk,
                     diagnostics: DiagnosticBag::default(),
                 }
             }
             Err(diagnostics) => CompileResult {
                 artifact: None,
                 front_end: None,
+                treewalk: None,
                 diagnostics,
             },
         }

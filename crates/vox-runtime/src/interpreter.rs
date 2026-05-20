@@ -1,0 +1,1351 @@
+use std::{
+    cell::RefCell,
+    collections::BTreeMap,
+    fmt::{self, Write},
+    rc::Rc,
+};
+
+use vox_compiler::{
+    TreewalkScript,
+    front_end::ast::{
+        Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, Expr, ExprKind,
+        FunctionDecl, LambdaParameter, Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr,
+        RecordFieldInit, StringLiteral, StringPart, TypeKind, TypeSyntax, UnaryOp, ValueDecl,
+    },
+};
+use vox_core::{
+    plan::CompiledArtifact,
+    value::{HandleSummary, InlineValue, RuntimeValue},
+};
+
+use crate::Runtime;
+
+pub struct Interpreter<'a> {
+    runtime: &'a mut Runtime,
+}
+
+impl<'a> Interpreter<'a> {
+    pub fn new(runtime: &'a mut Runtime) -> Self {
+        Self { runtime }
+    }
+
+    pub fn run_script(
+        &mut self,
+        script: &TreewalkScript,
+        artifact: &CompiledArtifact,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, String> {
+        let module = Rc::new(ModuleState::new(script, artifact));
+        let parameter_values = self.bind_script_parameters(module.clone(), arguments)?;
+        module.initialize_parameters(parameter_values);
+        module.reset_cached_values();
+
+        let mut context = EvalContext::new(module.clone());
+        let value = match context.eval_script_result()? {
+            Ok(value) => value,
+            Err(EvalError::Return(_)) => {
+                return Err("`return` may only be used inside a function body".to_owned());
+            }
+            Err(EvalError::Message(message)) => return Err(message),
+        };
+
+        self.into_runtime_value(value)
+    }
+
+    fn bind_script_parameters(
+        &mut self,
+        module: Rc<ModuleState>,
+        arguments: &[RuntimeValue],
+    ) -> Result<BTreeMap<String, Value>, String> {
+        if arguments.len() > module.parameters.len() {
+            return Err(format!(
+                "script expects at most {} argument(s), but received {}",
+                module.parameters.len(),
+                arguments.len()
+            ));
+        }
+
+        let mut values = BTreeMap::new();
+        for (index, parameter) in module.parameters.iter().enumerate() {
+            let value = if let Some(argument) = arguments.get(index) {
+                self.from_runtime_value(argument)?
+            } else if let Some(default) = &parameter.default {
+                module.initialize_parameters(values.clone());
+                let mut context = EvalContext::new(module.clone());
+                if !values.is_empty() {
+                    context.push_scope(Scope::from_values(values.clone()));
+                }
+                match context.eval_expr(default) {
+                    Ok(value) => value,
+                    Err(EvalError::Return(_)) => {
+                        return Err(format!(
+                            "default value for parameter `{}` attempted to return from a function",
+                            parameter.name
+                        ));
+                    }
+                    Err(EvalError::Message(message)) => return Err(message),
+                }
+            } else {
+                return Err(format!(
+                    "missing required script parameter `{}`",
+                    parameter.name
+                ));
+            };
+
+            values.insert(parameter.name.clone(), value);
+        }
+
+        Ok(values)
+    }
+
+    fn from_runtime_value(&self, value: &RuntimeValue) -> Result<Value, String> {
+        match value {
+            RuntimeValue::Inline(value) => Ok(Value::from_inline(value.clone())),
+            RuntimeValue::Handle(handle) => Err(format!(
+                "handle arguments are not supported by the NOpt interpreter yet: {}",
+                handle.0
+            )),
+        }
+    }
+
+    fn into_runtime_value(&mut self, value: Value) -> Result<RuntimeValue, String> {
+        if let Some(inline) = value.to_inline() {
+            return Ok(RuntimeValue::Inline(inline));
+        }
+
+        let summary = value.summary();
+        let handle = self.runtime.allocate_handle(summary);
+        Ok(RuntimeValue::Handle(handle))
+    }
+}
+
+#[derive(Clone)]
+struct ModuleState {
+    name: String,
+    parameters: Vec<ParamDecl>,
+    result: Option<Expr>,
+    values: BTreeMap<String, ValueDecl>,
+    functions: BTreeMap<String, FunctionDecl>,
+    parameter_values: RefCell<BTreeMap<String, Value>>,
+    cached_values: RefCell<BTreeMap<String, CachedTopLevelValue>>,
+}
+
+impl ModuleState {
+    fn new(script: &TreewalkScript, artifact: &CompiledArtifact) -> Self {
+        let values = script
+            .values
+            .iter()
+            .cloned()
+            .map(|value| (value.name.clone(), value))
+            .collect::<BTreeMap<_, _>>();
+        let functions = script
+            .functions
+            .iter()
+            .cloned()
+            .map(|function| (function.name.clone(), function))
+            .collect::<BTreeMap<_, _>>();
+
+        Self {
+            name: artifact.module.as_str(),
+            parameters: script.parameters.clone(),
+            result: script.syntax.result.clone(),
+            values,
+            functions,
+            parameter_values: RefCell::new(BTreeMap::new()),
+            cached_values: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    fn initialize_parameters(&self, values: BTreeMap<String, Value>) {
+        *self.parameter_values.borrow_mut() = values;
+    }
+
+    fn reset_cached_values(&self) {
+        self.cached_values.borrow_mut().clear();
+    }
+
+    fn parameter(&self, name: &str) -> Option<Value> {
+        self.parameter_values.borrow().get(name).cloned()
+    }
+
+    fn resolve_qualified_local_name(&self, name: &QualifiedName) -> Option<String> {
+        if name.segments.len() == 1 {
+            return Some(name.segments[0].clone());
+        }
+
+        let local = name.segments.last()?;
+        let module_segments = self.name.split('.').collect::<Vec<_>>();
+        if module_segments.len() + 1 != name.segments.len() {
+            return None;
+        }
+
+        for (expected, actual) in module_segments.iter().zip(name.segments.iter()) {
+            if expected != actual {
+                return None;
+            }
+        }
+
+        Some(local.clone())
+    }
+
+    fn resolve_function(self: &Rc<Self>, name: &str) -> Option<UserFunction> {
+        self.functions.get(name).cloned().map(|decl| UserFunction {
+            name: Some(decl.name.clone()),
+            module: self.clone(),
+            parameters: decl
+                .parameters
+                .into_iter()
+                .map(CallableParameter::from_parameter)
+                .collect(),
+            body: decl.body,
+            captured: BTreeMap::new(),
+        })
+    }
+
+    fn top_level_value(
+        self: &Rc<Self>,
+        name: &str,
+        context: &mut EvalContext,
+    ) -> Result<Value, EvalError> {
+        let Some(decl) = self.values.get(name).cloned() else {
+            return Err(EvalError::Message(format!("unknown name `{name}`")));
+        };
+
+        if let Some(cached) = self.cached_values.borrow().get(name) {
+            return match cached {
+                CachedTopLevelValue::Ready(value) => Ok(value.clone()),
+                CachedTopLevelValue::Evaluating => Err(EvalError::Message(format!(
+                    "cyclic top-level value dependency while evaluating `{name}`"
+                ))),
+            };
+        }
+
+        self.cached_values
+            .borrow_mut()
+            .insert(name.to_owned(), CachedTopLevelValue::Evaluating);
+
+        let evaluated = match context.eval_expr(&decl.initializer) {
+            Ok(value) => value,
+            Err(error) => {
+                self.cached_values.borrow_mut().remove(name);
+                return Err(error);
+            }
+        };
+
+        self.cached_values.borrow_mut().insert(
+            name.to_owned(),
+            CachedTopLevelValue::Ready(evaluated.clone()),
+        );
+
+        Ok(evaluated)
+    }
+}
+
+#[derive(Clone)]
+enum CachedTopLevelValue {
+    Evaluating,
+    Ready(Value),
+}
+
+#[derive(Clone)]
+struct EvalContext {
+    module: Rc<ModuleState>,
+    scopes: Vec<Scope>,
+}
+
+impl EvalContext {
+    fn new(module: Rc<ModuleState>) -> Self {
+        Self {
+            module,
+            scopes: Vec::new(),
+        }
+    }
+
+    fn eval_script_result(&mut self) -> Result<Result<Value, EvalError>, String> {
+        let Some(result) = self.module.result.clone() else {
+            return Ok(Ok(Value::unit()));
+        };
+
+        Ok(self.eval_expr(&result))
+    }
+
+    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, EvalError> {
+        match &expr.kind {
+            ExprKind::Integer(raw) => {
+                raw.replace('_', "")
+                    .parse::<i64>()
+                    .map(Value::Int)
+                    .map_err(|error| {
+                        EvalError::Message(format!("invalid integer literal `{raw}`: {error}"))
+                    })
+            }
+            ExprKind::Float(raw) => raw
+                .replace('_', "")
+                .parse::<f64>()
+                .map(Value::Float)
+                .map_err(|error| {
+                    EvalError::Message(format!("invalid float literal `{raw}`: {error}"))
+                }),
+            ExprKind::Bool(value) => Ok(Value::Bool(*value)),
+            ExprKind::Null => Ok(Value::Null),
+            ExprKind::String(literal) => self.eval_string_literal(literal).map(Value::String),
+            ExprKind::List(items) => items
+                .iter()
+                .map(|item| self.eval_expr(item))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            ExprKind::Tuple(items) => items
+                .iter()
+                .map(|item| self.eval_expr(item))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Tuple),
+            ExprKind::Record(fields) => self.eval_record_literal(fields),
+            ExprKind::Name(name) => self.resolve_name(name),
+            ExprKind::Call { callee, arguments } => self.eval_call(callee, arguments),
+            ExprKind::Index { target, index } => self.eval_index(target, index),
+            ExprKind::Field { target, name } => {
+                let value = self.eval_expr(target)?;
+                self.eval_field(value, name)
+            }
+            ExprKind::SafeField { target, name } => {
+                let value = self.eval_expr(target)?;
+                if matches!(value, Value::Null) {
+                    Ok(Value::Null)
+                } else {
+                    self.eval_field(value, name)
+                }
+            }
+            ExprKind::NonNull { target } => {
+                let value = self.eval_expr(target)?;
+                if matches!(value, Value::Null) {
+                    Err(EvalError::Message(
+                        "non-null assertion failed on `null`".to_owned(),
+                    ))
+                } else {
+                    Ok(value)
+                }
+            }
+            ExprKind::ReceiverCall {
+                receiver,
+                callee,
+                arguments,
+            } => self.eval_receiver_call(receiver, callee, arguments),
+            ExprKind::Unary { op, expr } => {
+                let value = self.eval_expr(expr)?;
+                self.eval_unary(*op, value)
+            }
+            ExprKind::Binary { left, op, right } => self.eval_binary(left, *op, right),
+            ExprKind::Range(range) => self.eval_range(range),
+            ExprKind::If(expr) => self.eval_if(expr),
+            ExprKind::When(expr) => self.eval_when(expr),
+            ExprKind::Lambda(lambda) => Ok(Value::Function(Rc::new(UserFunction {
+                name: None,
+                module: self.module.clone(),
+                parameters: lambda
+                    .parameters
+                    .iter()
+                    .cloned()
+                    .map(CallableParameter::from_lambda_parameter)
+                    .collect(),
+                body: (*lambda.body).clone(),
+                captured: self.capture_visible_bindings(),
+            }))),
+            ExprKind::Block(block) => self.eval_block(block),
+            ExprKind::Econ { body, .. } => self
+                .eval_block(body)
+                .map(|value| Value::Econ(Box::new(value))),
+        }
+    }
+
+    fn eval_record_literal(&mut self, fields: &[RecordFieldInit]) -> Result<Value, EvalError> {
+        let mut record = BTreeMap::new();
+        for field in fields {
+            if record.contains_key(&field.name) {
+                return Err(EvalError::Message(format!(
+                    "duplicate record field `{}`",
+                    field.name
+                )));
+            }
+            record.insert(field.name.clone(), self.eval_expr(&field.value)?);
+        }
+        Ok(Value::Record(record))
+    }
+
+    fn eval_string_literal(&mut self, literal: &StringLiteral) -> Result<String, EvalError> {
+        let mut rendered = String::new();
+        for part in &literal.parts {
+            match part {
+                StringPart::Text(text) => rendered.push_str(text),
+                StringPart::Interpolation(expr) => {
+                    let value = self.eval_expr(expr)?;
+                    rendered.push_str(&value.render());
+                }
+            }
+        }
+        Ok(rendered)
+    }
+
+    fn resolve_name(&mut self, name: &QualifiedName) -> Result<Value, EvalError> {
+        let Some(local_name) = self.module.resolve_qualified_local_name(name) else {
+            return Err(EvalError::Message(format!(
+                "qualified host references are not supported by the NOpt interpreter yet: `{}`",
+                name.to_source_string()
+            )));
+        };
+
+        if let Some(value) = self.lookup_local(&local_name) {
+            return Ok(value);
+        }
+
+        if let Some(value) = self.module.parameter(&local_name) {
+            return Ok(value);
+        }
+
+        if let Some(function) = self.module.resolve_function(&local_name) {
+            return Ok(Value::Function(Rc::new(function)));
+        }
+
+        self.module.clone().top_level_value(&local_name, self)
+    }
+
+    fn eval_call(&mut self, callee: &Expr, arguments: &[Argument]) -> Result<Value, EvalError> {
+        let callee = self.eval_expr(callee)?;
+        let Value::Function(function) = callee else {
+            return Err(EvalError::Message(
+                "attempted to call a non-function value".to_owned(),
+            ));
+        };
+
+        let evaluated_args = arguments
+            .iter()
+            .map(|argument| match argument {
+                Argument::Positional(expr) => self.eval_expr(expr).map(CallArgument::Positional),
+                Argument::Named { name, value, .. } => self
+                    .eval_expr(value)
+                    .map(|value| CallArgument::Named(name.clone(), value)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        function.call(evaluated_args)
+    }
+
+    fn eval_receiver_call(
+        &mut self,
+        receiver: &Expr,
+        callee: &QualifiedName,
+        arguments: &[Argument],
+    ) -> Result<Value, EvalError> {
+        let receiver = self.eval_expr(receiver)?;
+        let callee_name = callee.to_source_string();
+        let callee = self.resolve_name(callee)?;
+        let Value::Function(function) = callee else {
+            return Err(EvalError::Message(format!(
+                "receiver target `{}` did not resolve to a callable function",
+                callee_name
+            )));
+        };
+
+        let mut evaluated_args = Vec::with_capacity(arguments.len() + 1);
+        evaluated_args.push(CallArgument::Positional(receiver));
+        for argument in arguments {
+            match argument {
+                Argument::Positional(expr) => {
+                    evaluated_args.push(CallArgument::Positional(self.eval_expr(expr)?));
+                }
+                Argument::Named { name, value, .. } => {
+                    evaluated_args.push(CallArgument::Named(name.clone(), self.eval_expr(value)?));
+                }
+            }
+        }
+
+        function.call(evaluated_args)
+    }
+
+    fn eval_index(&mut self, target: &Expr, index: &Expr) -> Result<Value, EvalError> {
+        let target = self.eval_expr(target)?;
+        let index = self.eval_expr(index)?;
+        let Value::Int(index) = index else {
+            return Err(EvalError::Message(
+                "index expressions require an `Int` index".to_owned(),
+            ));
+        };
+        let index = usize::try_from(index).map_err(|_| {
+            EvalError::Message("index expressions require a non-negative index".to_owned())
+        })?;
+
+        match target {
+            Value::List(items) => items
+                .get(index)
+                .cloned()
+                .ok_or_else(|| EvalError::Message(format!("list index {index} is out of bounds"))),
+            Value::Tuple(items) => items
+                .get(index)
+                .cloned()
+                .ok_or_else(|| EvalError::Message(format!("tuple index {index} is out of bounds"))),
+            other => Err(EvalError::Message(format!(
+                "indexing is not supported for {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_field(&self, value: Value, name: &str) -> Result<Value, EvalError> {
+        match value {
+            Value::Record(fields) => fields.get(name).cloned().ok_or_else(|| {
+                EvalError::Message(format!("record does not contain field `{name}`"))
+            }),
+            other => Err(EvalError::Message(format!(
+                "field access is not supported for {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_unary(&self, op: UnaryOp, value: Value) -> Result<Value, EvalError> {
+        match (op, value) {
+            (UnaryOp::Negate, Value::Int(value)) => Ok(Value::Int(-value)),
+            (UnaryOp::Negate, Value::Float(value)) => Ok(Value::Float(-value)),
+            (UnaryOp::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
+            (UnaryOp::Negate, other) => Err(EvalError::Message(format!(
+                "unary `-` is not defined for {}",
+                other.type_name()
+            ))),
+            (UnaryOp::Not, other) => Err(EvalError::Message(format!(
+                "unary `!` is not defined for {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn eval_binary(&mut self, left: &Expr, op: BinaryOp, right: &Expr) -> Result<Value, EvalError> {
+        if matches!(op, BinaryOp::And) {
+            let left = self.eval_expr(left)?;
+            let left = self.expect_bool(left, "left operand of `&&`")?;
+            if !left {
+                return Ok(Value::Bool(false));
+            }
+            let right = self.eval_expr(right)?;
+            let right = self.expect_bool(right, "right operand of `&&`")?;
+            return Ok(Value::Bool(right));
+        }
+
+        if matches!(op, BinaryOp::Or) {
+            let left = self.eval_expr(left)?;
+            let left = self.expect_bool(left, "left operand of `||`")?;
+            if left {
+                return Ok(Value::Bool(true));
+            }
+            let right = self.eval_expr(right)?;
+            let right = self.expect_bool(right, "right operand of `||`")?;
+            return Ok(Value::Bool(right));
+        }
+
+        if matches!(op, BinaryOp::Coalesce) {
+            let left = self.eval_expr(left)?;
+            if !matches!(left, Value::Null) {
+                return Ok(left);
+            }
+            return self.eval_expr(right);
+        }
+
+        let left = self.eval_expr(left)?;
+        let right = self.eval_expr(right)?;
+
+        match op {
+            BinaryOp::Multiply => self.eval_numeric_arithmetic(left, right, "*"),
+            BinaryOp::Divide => self.eval_numeric_arithmetic(left, right, "/"),
+            BinaryOp::Remainder => self.eval_numeric_arithmetic(left, right, "%"),
+            BinaryOp::Add => self.eval_addition(left, right),
+            BinaryOp::Subtract => self.eval_numeric_arithmetic(left, right, "-"),
+            BinaryOp::Less => self.eval_comparison(left, right, "<"),
+            BinaryOp::LessEqual => self.eval_comparison(left, right, "<="),
+            BinaryOp::Greater => self.eval_comparison(left, right, ">"),
+            BinaryOp::GreaterEqual => self.eval_comparison(left, right, ">="),
+            BinaryOp::Equal => Ok(Value::Bool(left.equals(&right))),
+            BinaryOp::NotEqual => Ok(Value::Bool(!left.equals(&right))),
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce => unreachable!(),
+        }
+    }
+
+    fn eval_addition(&self, left: Value, right: Value) -> Result<Value, EvalError> {
+        match (left, right) {
+            (Value::Int(left), Value::Int(right)) => Ok(Value::Int(left + right)),
+            (Value::Float(left), Value::Float(right)) => Ok(Value::Float(left + right)),
+            (Value::Int(left), Value::Float(right)) => Ok(Value::Float(left as f64 + right)),
+            (Value::Float(left), Value::Int(right)) => Ok(Value::Float(left + right as f64)),
+            (Value::String(left), Value::String(right)) => Ok(Value::String(left + &right)),
+            (left, right) => Err(EvalError::Message(format!(
+                "binary `+` is not defined for {} and {}",
+                left.type_name(),
+                right.type_name()
+            ))),
+        }
+    }
+
+    fn eval_numeric_arithmetic(
+        &self,
+        left: Value,
+        right: Value,
+        operator: &str,
+    ) -> Result<Value, EvalError> {
+        match (left, right, operator) {
+            (Value::Int(left), Value::Int(right), "*") => Ok(Value::Int(left * right)),
+            (Value::Int(left), Value::Int(right), "/") => Ok(Value::Int(left / right)),
+            (Value::Int(left), Value::Int(right), "%") => Ok(Value::Int(left % right)),
+            (Value::Int(left), Value::Int(right), "-") => Ok(Value::Int(left - right)),
+            (Value::Float(left), Value::Float(right), "*") => Ok(Value::Float(left * right)),
+            (Value::Float(left), Value::Float(right), "/") => Ok(Value::Float(left / right)),
+            (Value::Float(left), Value::Float(right), "%") => Ok(Value::Float(left % right)),
+            (Value::Float(left), Value::Float(right), "-") => Ok(Value::Float(left - right)),
+            (Value::Int(left), Value::Float(right), "*") => Ok(Value::Float(left as f64 * right)),
+            (Value::Int(left), Value::Float(right), "/") => Ok(Value::Float(left as f64 / right)),
+            (Value::Int(left), Value::Float(right), "%") => Ok(Value::Float(left as f64 % right)),
+            (Value::Int(left), Value::Float(right), "-") => Ok(Value::Float(left as f64 - right)),
+            (Value::Float(left), Value::Int(right), "*") => Ok(Value::Float(left * right as f64)),
+            (Value::Float(left), Value::Int(right), "/") => Ok(Value::Float(left / right as f64)),
+            (Value::Float(left), Value::Int(right), "%") => Ok(Value::Float(left % right as f64)),
+            (Value::Float(left), Value::Int(right), "-") => Ok(Value::Float(left - right as f64)),
+            (left, right, _) => Err(EvalError::Message(format!(
+                "binary `{operator}` is not defined for {} and {}",
+                left.type_name(),
+                right.type_name()
+            ))),
+        }
+    }
+
+    fn eval_comparison(
+        &self,
+        left: Value,
+        right: Value,
+        operator: &str,
+    ) -> Result<Value, EvalError> {
+        let result = match (&left, &right) {
+            (Value::Int(left), Value::Int(right)) => compare_i64(*left, *right, operator),
+            (Value::Float(left), Value::Float(right)) => compare_f64(*left, *right, operator),
+            (Value::Int(left), Value::Float(right)) => compare_f64(*left as f64, *right, operator),
+            (Value::Float(left), Value::Int(right)) => compare_f64(*left, *right as f64, operator),
+            (Value::String(left), Value::String(right)) => compare_ord(left, right, operator),
+            _ => {
+                return Err(EvalError::Message(format!(
+                    "binary `{operator}` is not defined for {} and {}",
+                    left.type_name(),
+                    right.type_name()
+                )));
+            }
+        };
+
+        Ok(Value::Bool(result))
+    }
+
+    fn eval_range(&mut self, range: &RangeExpr) -> Result<Value, EvalError> {
+        let start = range
+            .start
+            .as_ref()
+            .map(|expr| self.eval_expr(expr))
+            .transpose()?;
+        let end = range
+            .end
+            .as_ref()
+            .map(|expr| self.eval_expr(expr))
+            .transpose()?;
+
+        Ok(Value::Range(RangeValue {
+            start: start.map(Box::new),
+            end: end.map(Box::new),
+            inclusive_end: range.inclusive_end,
+        }))
+    }
+
+    fn eval_if(&mut self, expr: &vox_compiler::front_end::ast::IfExpr) -> Result<Value, EvalError> {
+        for branch in &expr.branches {
+            let condition = self.eval_expr(&branch.condition)?;
+            if self.expect_bool(condition, "if condition")? {
+                return self.eval_block(&branch.body);
+            }
+        }
+
+        if let Some(else_branch) = &expr.else_branch {
+            self.eval_block(else_branch)
+        } else {
+            Ok(Value::unit())
+        }
+    }
+
+    fn eval_when(
+        &mut self,
+        expr: &vox_compiler::front_end::ast::WhenExpr,
+    ) -> Result<Value, EvalError> {
+        let subject = self.eval_expr(&expr.subject)?;
+        for arm in &expr.arms {
+            if self.matches_type(&subject, &arm.ty)? {
+                self.push_scope(Scope::default());
+                if let Some(binding) = &arm.binding {
+                    self.define_local(binding.clone(), subject.clone(), false);
+                }
+                let result = self.eval_expr(&arm.body);
+                self.pop_scope();
+                return result;
+            }
+        }
+
+        if let Some(else_arm) = &expr.else_arm {
+            self.eval_expr(else_arm)
+        } else {
+            Err(EvalError::Message(
+                "`when` expression did not match any arm".to_owned(),
+            ))
+        }
+    }
+
+    fn eval_block(&mut self, block: &BlockExpr) -> Result<Value, EvalError> {
+        self.push_scope(Scope::default());
+        for item in &block.items {
+            match self.eval_block_item(item) {
+                Ok(()) => {}
+                Err(error) => {
+                    self.pop_scope();
+                    return Err(error);
+                }
+            }
+        }
+
+        let value = if let Some(trailing) = &block.trailing {
+            self.eval_expr(trailing)
+        } else {
+            Ok(Value::unit())
+        };
+        self.pop_scope();
+        value
+    }
+
+    fn eval_block_item(&mut self, item: &BlockItem) -> Result<(), EvalError> {
+        match item {
+            BlockItem::LocalValue(value) => {
+                let initializer = self.eval_expr(&value.initializer)?;
+                self.define_local(
+                    value.name.clone(),
+                    initializer,
+                    matches!(value.mutability, Mutability::Var),
+                );
+                Ok(())
+            }
+            BlockItem::Assignment(assignment) => {
+                let value = self.eval_expr(&assignment.value)?;
+                self.assign_local(&assignment.name, value)
+            }
+            BlockItem::CompoundAssignment(assignment) => {
+                let current = self.lookup_local_binding(&assignment.name)?;
+                if !current.mutable {
+                    return Err(EvalError::Message(format!(
+                        "cannot assign to immutable binding `{}`",
+                        assignment.name
+                    )));
+                }
+                let rhs = self.eval_expr(&assignment.value)?;
+                let next =
+                    self.eval_compound_assignment(current.value.clone(), rhs, assignment.op)?;
+                self.assign_local(&assignment.name, next)
+            }
+            BlockItem::For(statement) => self.eval_for(statement),
+            BlockItem::Return(statement) => Err(EvalError::Return(
+                statement
+                    .value
+                    .as_ref()
+                    .map(|value| self.eval_expr(value))
+                    .transpose()?
+                    .unwrap_or_else(Value::unit),
+            )),
+            BlockItem::Panic(statement) => Err(EvalError::Message(format!(
+                "panic: {}",
+                self.eval_string_literal(&statement.message)?
+            ))),
+            BlockItem::Expr(expr) => {
+                self.eval_expr(expr)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn eval_compound_assignment(
+        &self,
+        left: Value,
+        right: Value,
+        op: CompoundAssignmentOp,
+    ) -> Result<Value, EvalError> {
+        match op {
+            CompoundAssignmentOp::Add => self.eval_addition(left, right),
+            CompoundAssignmentOp::Subtract => self.eval_numeric_arithmetic(left, right, "-"),
+            CompoundAssignmentOp::Multiply => self.eval_numeric_arithmetic(left, right, "*"),
+            CompoundAssignmentOp::Divide => self.eval_numeric_arithmetic(left, right, "/"),
+            CompoundAssignmentOp::Remainder => self.eval_numeric_arithmetic(left, right, "%"),
+        }
+    }
+
+    fn eval_for(
+        &mut self,
+        statement: &vox_compiler::front_end::ast::ForStatement,
+    ) -> Result<(), EvalError> {
+        let iterable = self.eval_expr(&statement.iterable)?;
+        let items = self.expand_iterable(iterable)?;
+        for item in items {
+            self.push_scope(Scope::default());
+            self.define_local(statement.pattern.clone(), item, false);
+            let result = self.eval_block(&statement.body);
+            self.pop_scope();
+            match result {
+                Ok(_) => {}
+                Err(EvalError::Return(value)) => return Err(EvalError::Return(value)),
+                Err(EvalError::Message(message)) => return Err(EvalError::Message(message)),
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_iterable(&self, iterable: Value) -> Result<Vec<Value>, EvalError> {
+        match iterable {
+            Value::List(items) => Ok(items),
+            Value::Range(range) => {
+                let Some(start) = range.start else {
+                    return Err(EvalError::Message(
+                        "range iteration requires a lower bound".to_owned(),
+                    ));
+                };
+                let Some(end) = range.end else {
+                    return Err(EvalError::Message(
+                        "range iteration requires an upper bound".to_owned(),
+                    ));
+                };
+
+                let Value::Int(start) = *start else {
+                    return Err(EvalError::Message(
+                        "range iteration currently supports only `Int` bounds".to_owned(),
+                    ));
+                };
+                let Value::Int(end) = *end else {
+                    return Err(EvalError::Message(
+                        "range iteration currently supports only `Int` bounds".to_owned(),
+                    ));
+                };
+
+                let last = if range.inclusive_end { end + 1 } else { end };
+                Ok((start..last).map(Value::Int).collect())
+            }
+            other => Err(EvalError::Message(format!(
+                "for-loops require a list or finite int range, found {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn matches_type(&self, value: &Value, ty: &TypeSyntax) -> Result<bool, EvalError> {
+        match &ty.kind {
+            TypeKind::Nullable(inner) => {
+                if matches!(value, Value::Null) {
+                    Ok(true)
+                } else {
+                    self.matches_type(value, inner)
+                }
+            }
+            TypeKind::Named { name, arguments } => match name.to_source_string().as_str() {
+                "Int" => Ok(matches!(value, Value::Int(_))),
+                "Float" => Ok(matches!(value, Value::Float(_))),
+                "Bool" => Ok(matches!(value, Value::Bool(_))),
+                "String" => Ok(matches!(value, Value::String(_))),
+                "Unit" => Ok(matches!(value, Value::Tuple(items) if items.is_empty())),
+                "List" => match (value, arguments.as_slice()) {
+                    (Value::List(items), [item_ty]) => items
+                        .iter()
+                        .map(|item| self.matches_type(item, item_ty))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(|matches| matches.into_iter().all(|matched| matched)),
+                    (Value::List(_), _) => Ok(true),
+                    _ => Ok(false),
+                },
+                "Econ" => match (value, arguments.as_slice()) {
+                    (Value::Econ(inner), [inner_ty]) => self.matches_type(inner, inner_ty),
+                    (Value::Econ(_), _) => Ok(true),
+                    _ => Ok(false),
+                },
+                _ => Ok(false),
+            },
+            TypeKind::Dyn(_) => Ok(false),
+            TypeKind::Grouped(inner) => self.matches_type(value, inner),
+            TypeKind::Tuple(items) => match value {
+                Value::Tuple(values) => {
+                    if values.len() != items.len() {
+                        return Ok(false);
+                    }
+                    for (value, ty) in values.iter().zip(items) {
+                        if !self.matches_type(value, ty)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            TypeKind::Record(fields) => match value {
+                Value::Record(values) => {
+                    for field in fields {
+                        let Some(value) = values.get(&field.name) else {
+                            return Ok(false);
+                        };
+                        if !self.matches_type(value, &field.ty)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
+            },
+            TypeKind::Function { .. } => Ok(matches!(value, Value::Function(_))),
+        }
+    }
+
+    fn expect_bool(&self, value: Value, label: &str) -> Result<bool, EvalError> {
+        if let Value::Bool(value) = value {
+            Ok(value)
+        } else {
+            Err(EvalError::Message(format!(
+                "{label} must evaluate to `Bool`"
+            )))
+        }
+    }
+
+    fn push_scope(&mut self, scope: Scope) {
+        self.scopes.push(scope);
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn define_local(&mut self, name: String, value: Value, mutable: bool) {
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("define_local requires an active scope");
+        scope.bindings.insert(name, Binding { value, mutable });
+    }
+
+    fn lookup_local(&self, name: &str) -> Option<Value> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name))
+            .map(|binding| binding.value.clone())
+    }
+
+    fn lookup_local_binding(&self, name: &str) -> Result<Binding, EvalError> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.bindings.get(name))
+            .cloned()
+            .ok_or_else(|| EvalError::Message(format!("unknown local binding `{name}`")))
+    }
+
+    fn assign_local(&mut self, name: &str, value: Value) -> Result<(), EvalError> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(binding) = scope.bindings.get_mut(name) {
+                if !binding.mutable {
+                    return Err(EvalError::Message(format!(
+                        "cannot assign to immutable binding `{name}`"
+                    )));
+                }
+                binding.value = value;
+                return Ok(());
+            }
+        }
+
+        Err(EvalError::Message(format!(
+            "assignment requires a previously declared local `var`, but `{name}` was not found"
+        )))
+    }
+
+    fn capture_visible_bindings(&self) -> BTreeMap<String, Value> {
+        let mut captured = BTreeMap::new();
+        for scope in &self.scopes {
+            for (name, binding) in &scope.bindings {
+                captured.insert(name.clone(), binding.value.clone());
+            }
+        }
+        captured
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Scope {
+    bindings: BTreeMap<String, Binding>,
+}
+
+impl Scope {
+    fn from_values(values: BTreeMap<String, Value>) -> Self {
+        let bindings = values
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name,
+                    Binding {
+                        value,
+                        mutable: false,
+                    },
+                )
+            })
+            .collect();
+        Self { bindings }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Binding {
+    value: Value,
+    mutable: bool,
+}
+
+#[derive(Clone)]
+struct UserFunction {
+    name: Option<String>,
+    module: Rc<ModuleState>,
+    parameters: Vec<CallableParameter>,
+    body: Expr,
+    captured: BTreeMap<String, Value>,
+}
+
+impl UserFunction {
+    fn call(&self, arguments: Vec<CallArgument>) -> Result<Value, EvalError> {
+        let mut assigned = BTreeMap::new();
+        let mut next_positional = 0usize;
+
+        for argument in arguments {
+            match argument {
+                CallArgument::Positional(value) => {
+                    while next_positional < self.parameters.len()
+                        && assigned.contains_key(&self.parameters[next_positional].name)
+                    {
+                        next_positional += 1;
+                    }
+                    let Some(parameter) = self.parameters.get(next_positional) else {
+                        return Err(EvalError::Message(format!(
+                            "function `{}` received too many positional arguments",
+                            self.name.as_deref().unwrap_or("<lambda>")
+                        )));
+                    };
+                    assigned.insert(parameter.name.clone(), value);
+                    next_positional += 1;
+                }
+                CallArgument::Named(name, value) => {
+                    if !self
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.name == name)
+                    {
+                        return Err(EvalError::Message(format!(
+                            "function `{}` does not have a parameter named `{name}`",
+                            self.name.as_deref().unwrap_or("<lambda>")
+                        )));
+                    }
+                    if assigned.insert(name.clone(), value).is_some() {
+                        return Err(EvalError::Message(format!(
+                            "parameter `{name}` was provided more than once"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let mut context = EvalContext::new(self.module.clone());
+        if !self.captured.is_empty() {
+            context.push_scope(Scope::from_values(self.captured.clone()));
+        }
+        context.push_scope(Scope::default());
+        for parameter in &self.parameters {
+            if !assigned.contains_key(&parameter.name) {
+                let Some(default) = &parameter.default else {
+                    return Err(EvalError::Message(format!(
+                        "missing required parameter `{}` in function `{}`",
+                        parameter.name,
+                        self.name.as_deref().unwrap_or("<lambda>")
+                    )));
+                };
+                let value = context.eval_expr(default)?;
+                assigned.insert(parameter.name.clone(), value);
+            }
+
+            let value = assigned
+                .get(&parameter.name)
+                .cloned()
+                .expect("parameter should be assigned after default handling");
+            context.define_local(parameter.name.clone(), value, false);
+        }
+
+        match context.eval_expr(&self.body) {
+            Ok(value) => Ok(value),
+            Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Message(message)) => Err(EvalError::Message(message)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct CallableParameter {
+    name: String,
+    default: Option<Expr>,
+}
+
+impl CallableParameter {
+    fn from_parameter(parameter: Parameter) -> Self {
+        Self {
+            name: parameter.name,
+            default: parameter.default,
+        }
+    }
+
+    fn from_lambda_parameter(parameter: LambdaParameter) -> Self {
+        Self {
+            name: parameter.name,
+            default: None,
+        }
+    }
+}
+
+enum CallArgument {
+    Positional(Value),
+    Named(String, Value),
+}
+
+#[derive(Debug, Clone)]
+enum Value {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    String(String),
+    List(Vec<Value>),
+    Tuple(Vec<Value>),
+    Record(BTreeMap<String, Value>),
+    Range(RangeValue),
+    Function(Rc<UserFunction>),
+    Econ(Box<Value>),
+}
+
+impl Value {
+    fn unit() -> Self {
+        Self::Tuple(Vec::new())
+    }
+
+    fn from_inline(value: InlineValue) -> Self {
+        match value {
+            InlineValue::Int(value) => Self::Int(value),
+            InlineValue::Float(value) => Self::Float(value),
+            InlineValue::Bool(value) => Self::Bool(value),
+            InlineValue::String(value) => Self::String(value),
+            InlineValue::Tuple(values) => {
+                Self::Tuple(values.into_iter().map(Self::from_inline).collect())
+            }
+            InlineValue::Null => Self::Null,
+        }
+    }
+
+    fn to_inline(&self) -> Option<InlineValue> {
+        match self {
+            Self::Null => Some(InlineValue::Null),
+            Self::Bool(value) => Some(InlineValue::Bool(*value)),
+            Self::Int(value) => Some(InlineValue::Int(*value)),
+            Self::Float(value) => Some(InlineValue::Float(*value)),
+            Self::String(value) => Some(InlineValue::String(value.clone())),
+            Self::Tuple(values) => values
+                .iter()
+                .map(Value::to_inline)
+                .collect::<Option<Vec<_>>>()
+                .map(InlineValue::Tuple),
+            Self::List(_)
+            | Self::Record(_)
+            | Self::Range(_)
+            | Self::Function(_)
+            | Self::Econ(_) => None,
+        }
+    }
+
+    fn equals(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left == right,
+            (Self::Int(left), Self::Float(right)) => (*left as f64) == *right,
+            (Self::Float(left), Self::Int(right)) => *left == (*right as f64),
+            (Self::String(left), Self::String(right)) => left == right,
+            (Self::List(left), Self::List(right)) | (Self::Tuple(left), Self::Tuple(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right.iter())
+                        .all(|(left, right)| left.equals(right))
+            }
+            (Self::Record(left), Self::Record(right)) => {
+                left.len() == right.len()
+                    && left.iter().all(|(name, value)| {
+                        right
+                            .get(name)
+                            .map(|other| value.equals(other))
+                            .unwrap_or(false)
+                    })
+            }
+            (Self::Range(left), Self::Range(right)) => left.equals(right),
+            (Self::Econ(left), Self::Econ(right)) => left.equals(right),
+            (Self::Function(left), Self::Function(right)) => Rc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "Null",
+            Self::Bool(_) => "Bool",
+            Self::Int(_) => "Int",
+            Self::Float(_) => "Float",
+            Self::String(_) => "String",
+            Self::List(_) => "List",
+            Self::Tuple(_) => "Tuple",
+            Self::Record(_) => "Record",
+            Self::Range(_) => "Range",
+            Self::Function(_) => "Function",
+            Self::Econ(_) => "Econ",
+        }
+    }
+
+    fn render(&self) -> String {
+        match self {
+            Self::Null => "null".to_owned(),
+            Self::Bool(value) => value.to_string(),
+            Self::Int(value) => value.to_string(),
+            Self::Float(value) => value.to_string(),
+            Self::String(value) => value.clone(),
+            Self::List(values) => render_delimited("[", "]", values),
+            Self::Tuple(values) => match values.as_slice() {
+                [] => "()".to_owned(),
+                [single] => format!("({},)", single.render()),
+                _ => render_delimited("(", ")", values),
+            },
+            Self::Record(fields) => {
+                let entries = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name} = {}", value.render()))
+                    .collect::<Vec<_>>();
+                format!("{{{}}}", entries.join(", "))
+            }
+            Self::Range(range) => range.render(),
+            Self::Function(function) => format!(
+                "<function {}>",
+                function.name.as_deref().unwrap_or("<lambda>")
+            ),
+            Self::Econ(value) => format!("econ({})", value.render()),
+        }
+    }
+
+    fn summary(&self) -> HandleSummary {
+        HandleSummary {
+            type_name: self.type_name().to_owned(),
+            summary: self.render(),
+            bytes: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RangeValue {
+    start: Option<Box<Value>>,
+    end: Option<Box<Value>>,
+    inclusive_end: bool,
+}
+
+impl RangeValue {
+    fn equals(&self, other: &Self) -> bool {
+        self.inclusive_end == other.inclusive_end
+            && self
+                .start
+                .as_ref()
+                .map(|value| &**value)
+                .zip(other.start.as_ref().map(|value| &**value))
+                .map(|(left, right)| left.equals(right))
+                .unwrap_or(self.start.is_none() && other.start.is_none())
+            && self
+                .end
+                .as_ref()
+                .map(|value| &**value)
+                .zip(other.end.as_ref().map(|value| &**value))
+                .map(|(left, right)| left.equals(right))
+                .unwrap_or(self.end.is_none() && other.end.is_none())
+    }
+
+    fn render(&self) -> String {
+        let mut rendered = String::new();
+        if let Some(start) = &self.start {
+            rendered.push_str(&start.render());
+        }
+        rendered.push_str(if self.inclusive_end { "..=" } else { ".." });
+        if let Some(end) = &self.end {
+            rendered.push_str(&end.render());
+        }
+        rendered
+    }
+}
+
+#[derive(Debug, Clone)]
+enum EvalError {
+    Message(String),
+    Return(Value),
+}
+
+fn compare_i64(left: i64, right: i64, operator: &str) -> bool {
+    match operator {
+        "<" => left < right,
+        "<=" => left <= right,
+        ">" => left > right,
+        ">=" => left >= right,
+        _ => unreachable!(),
+    }
+}
+
+fn compare_f64(left: f64, right: f64, operator: &str) -> bool {
+    match operator {
+        "<" => left < right,
+        "<=" => left <= right,
+        ">" => left > right,
+        ">=" => left >= right,
+        _ => unreachable!(),
+    }
+}
+
+fn compare_ord(left: &str, right: &str, operator: &str) -> bool {
+    match operator {
+        "<" => left < right,
+        "<=" => left <= right,
+        ">" => left > right,
+        ">=" => left >= right,
+        _ => unreachable!(),
+    }
+}
+
+fn render_delimited(prefix: &str, suffix: &str, values: &[Value]) -> String {
+    let mut rendered = String::new();
+    rendered.push_str(prefix);
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            rendered.push_str(", ");
+        }
+        let _ = write!(rendered, "{}", value.render());
+    }
+    rendered.push_str(suffix);
+    rendered
+}
+
+impl fmt::Debug for UserFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserFunction")
+            .field("name", &self.name)
+            .field("parameters", &self.parameters.len())
+            .finish()
+    }
+}
