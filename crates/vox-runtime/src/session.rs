@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use thiserror::Error;
 use vox_compiler::front_end::{
     analyze_source,
-    ast::{CompilationUnit, Expr, TopLevelItem},
+    ast::{CompilationUnit, Expr, ExprKind, TopLevelItem},
 };
 use vox_core::{
     host::PackageManifest,
@@ -89,14 +91,22 @@ impl StoredItemKey {
 struct ParsedSubmission {
     items: Vec<StoredItem>,
     result_source: Option<String>,
+    identity_name: Option<String>,
     uses_last_value: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RetainedLastValue {
+    item: StoredItem,
+    value: Option<RuntimeValue>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InteractiveSession<R: RuntimeRunner> {
     runner: R,
     items: Vec<StoredItem>,
-    hidden_last: Option<StoredItem>,
+    binding_handles: BTreeMap<String, HandleId>,
+    hidden_last: Option<RetainedLastValue>,
     next_source_revision: u64,
     active_artifact: Option<ArtifactId>,
 }
@@ -106,6 +116,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         Self {
             runner,
             items: Vec::new(),
+            binding_handles: BTreeMap::new(),
             hidden_last: None,
             next_source_revision: 0,
             active_artifact: None,
@@ -161,10 +172,11 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         }
 
         let candidate_items = merge_items(&self.items, parsed.items.clone());
+        let items_changed = candidate_items != self.items;
         let source = self.synthetic_source(
             &candidate_items,
             if parsed.uses_last_value {
-                self.hidden_last.as_ref()
+                self.hidden_last_item()
             } else {
                 None
             },
@@ -182,11 +194,19 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
 
         let value = if parsed.result_source.is_some() {
             let value = self.evaluate_script_source(&source)?;
-            if let Some(result_source) = parsed.result_source.as_deref() {
-                self.hidden_last = Some(stored_last_value(result_source, &value));
+            if items_changed {
+                self.clear_binding_handles()?;
             }
+            let value = self.finalize_submission_result(
+                parsed.result_source.as_deref().unwrap_or_default(),
+                parsed.identity_name.as_deref(),
+                value,
+            )?;
             Some(value)
         } else {
+            if items_changed {
+                self.clear_binding_handles()?;
+            }
             None
         };
 
@@ -220,7 +240,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             &self.items,
             rewritten
                 .uses_last_value
-                .then_some(self.hidden_last.as_ref())
+                .then_some(self.hidden_last_item())
                 .flatten(),
             Some(&rewritten.source),
         );
@@ -244,22 +264,28 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         let before = self.items.len();
         self.items.retain(|item| !item.matches_drop(target));
         let removed_hidden = if target == LAST_VALUE_NAME {
-            self.hidden_last.take().is_some()
+            let had_hidden = self.hidden_last.is_some();
+            self.clear_hidden_last()?;
+            had_hidden
         } else {
             false
         };
+        if before != self.items.len() {
+            self.clear_binding_handles()?;
+        }
         Ok(before != self.items.len() || removed_hidden)
     }
 
     pub fn reset(&mut self) -> Result<(), SessionError> {
+        self.clear_binding_handles()?;
+        self.clear_hidden_last()?;
         self.items.clear();
-        self.hidden_last = None;
         self.unload_active_artifact()?;
         Ok(())
     }
 
     pub fn snapshot_source(&self) -> String {
-        self.synthetic_source(&self.items, self.hidden_last.as_ref(), None)
+        self.synthetic_source(&self.items, self.hidden_last_item(), None)
     }
 
     pub fn restore_snapshot_source(
@@ -277,12 +303,17 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         }
 
         self.validate_environment(&front_end.syntax)?;
+        self.clear_binding_handles()?;
+        self.clear_hidden_last()?;
 
         let restored = normalize_items(rebuild_items_from_unit(text, &front_end.syntax));
         let (hidden_last, items): (Vec<_>, Vec<_>) =
             restored.into_iter().partition(StoredItem::is_hidden_last);
         self.items = items;
-        self.hidden_last = hidden_last.into_iter().next();
+        self.hidden_last = hidden_last.into_iter().next().map(|item| RetainedLastValue {
+            item,
+            value: None,
+        });
         Ok(())
     }
 
@@ -293,7 +324,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         let source = self.synthetic_source(
             &self.items,
             if include_hidden_last {
-                self.hidden_last.as_ref()
+                self.hidden_last_item()
             } else {
                 None
             },
@@ -384,6 +415,100 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         self.next_source_revision += 1;
         self.next_source_revision
     }
+
+    fn hidden_last_item(&self) -> Option<&StoredItem> {
+        self.hidden_last.as_ref().map(|value| &value.item)
+    }
+
+    fn clear_binding_handles(&mut self) -> Result<(), SessionError> {
+        let handles = self.binding_handles.values().copied().collect::<Vec<_>>();
+        self.binding_handles.clear();
+        for handle in handles {
+            self.runner.release_handle(handle)?;
+        }
+        Ok(())
+    }
+
+    fn clear_hidden_last(&mut self) -> Result<(), SessionError> {
+        let Some(hidden_last) = self.hidden_last.take() else {
+            return Ok(());
+        };
+        if let Some(value) = hidden_last.value.as_ref() {
+            self.release_runtime_value(value)?;
+        }
+        Ok(())
+    }
+
+    fn finalize_submission_result(
+        &mut self,
+        result_source: &str,
+        identity_name: Option<&str>,
+        value: RuntimeValue,
+    ) -> Result<RuntimeValue, SessionError> {
+        let mut value = value;
+        let mut retain_for_hidden_last = false;
+
+        if let Some(name) = identity_name {
+            if name == LAST_VALUE_NAME {
+                if let Some(existing) = self
+                    .hidden_last
+                    .as_ref()
+                    .and_then(|hidden_last| hidden_last.value.clone())
+                {
+                    self.release_runtime_value(&value)?;
+                    value = existing;
+                    retain_for_hidden_last = true;
+                }
+            } else if let Some(&handle) = self.binding_handles.get(name) {
+                self.release_runtime_value(&value)?;
+                value = RuntimeValue::Handle(handle);
+                retain_for_hidden_last = true;
+            } else if let RuntimeValue::Handle(handle) = value {
+                self.binding_handles.insert(name.to_owned(), handle);
+                value = RuntimeValue::Handle(handle);
+                retain_for_hidden_last = true;
+            }
+        }
+
+        self.replace_hidden_last(result_source, value.clone(), retain_for_hidden_last)?;
+        Ok(value)
+    }
+
+    fn replace_hidden_last(
+        &mut self,
+        result_source: &str,
+        value: RuntimeValue,
+        retain_value: bool,
+    ) -> Result<(), SessionError> {
+        if retain_value {
+            self.retain_runtime_value(&value)?;
+        }
+
+        let previous = self.hidden_last.replace(RetainedLastValue {
+            item: stored_last_value(result_source, &value),
+            value: Some(value),
+        });
+        if let Some(previous) = previous {
+            if let Some(value) = previous.value.as_ref() {
+                self.release_runtime_value(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn retain_runtime_value(&self, value: &RuntimeValue) -> Result<(), SessionError> {
+        if let RuntimeValue::Handle(handle) = value {
+            self.runner.retain_handle(*handle)?;
+        }
+        Ok(())
+    }
+
+    fn release_runtime_value(&self, value: &RuntimeValue) -> Result<(), SessionError> {
+        if let RuntimeValue::Handle(handle) = value {
+            self.runner.release_handle(*handle)?;
+        }
+        Ok(())
+    }
 }
 
 fn parse_submission(raw: &str) -> Result<ParsedSubmission, SessionError> {
@@ -405,6 +530,11 @@ fn parse_external_script(path: &str, raw: &str) -> Result<ParsedSubmission, Sess
             .result
             .as_ref()
             .map(|expr| slice_source(raw, expr)),
+        identity_name: front_end
+            .syntax
+            .result
+            .as_ref()
+            .and_then(result_identity_name),
         uses_last_value: false,
     })
 }
@@ -421,8 +551,20 @@ fn parse_script_fragment(path: &str, raw: &str) -> Result<ParsedSubmission, Sess
             .result
             .as_ref()
             .map(|expr| slice_source(&wrapped, expr)),
+        identity_name: front_end
+            .syntax
+            .result
+            .as_ref()
+            .and_then(result_identity_name),
         uses_last_value: rewritten.uses_last_value,
     })
+}
+
+fn result_identity_name(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Name(name) if name.segments.len() == 1 => Some(name.segments[0].clone()),
+        _ => None,
+    }
 }
 
 fn rebuild_items_from_unit(source: &str, unit: &CompilationUnit) -> Vec<StoredItem> {

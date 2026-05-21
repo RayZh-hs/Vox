@@ -27,9 +27,17 @@ pub enum ReplType {
         parameters: Vec<ReplType>,
         result: Box<ReplType>,
     },
+    GenericFunction {
+        generic_parameters: Vec<GenericParameterSummary>,
+        parameters: Vec<ReplType>,
+        result: Box<ReplType>,
+    },
     Record(Vec<RecordFieldType>),
     Range(Box<ReplType>),
-    TypeParameter(String),
+    TypeParameter {
+        name: String,
+        bound: Option<String>,
+    },
     Unknown(String),
 }
 
@@ -49,9 +57,16 @@ pub struct BindingSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionSummary {
     pub name: String,
+    pub generic_parameters: Vec<GenericParameterSummary>,
     pub parameters: Vec<CallableParameterSummary>,
     pub return_type: ReplType,
     pub evil: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericParameterSummary {
+    pub name: String,
+    pub bound: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +139,24 @@ impl ReplType {
                     .join(", "),
                 result.render()
             ),
+            Self::GenericFunction {
+                generic_parameters,
+                parameters,
+                result,
+            } => format!(
+                "[{}] ({}) -> {}",
+                generic_parameters
+                    .iter()
+                    .map(|parameter| format!("{}: {}", parameter.name, parameter.bound))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                parameters
+                    .iter()
+                    .map(ReplType::render)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result.render()
+            ),
             Self::Record(fields) => format!(
                 "{{{}}}",
                 fields
@@ -133,7 +166,7 @@ impl ReplType {
                     .join(", ")
             ),
             Self::Range(item) => format!("Range[{}]", item.render()),
-            Self::TypeParameter(name) => name.clone(),
+            Self::TypeParameter { name, .. } => name.clone(),
             Self::Unknown(name) => name.clone(),
         }
     }
@@ -171,6 +204,26 @@ impl ReplType {
                     && left_result.is_assignable_to(right_result)
             }
             (
+                Self::GenericFunction {
+                    generic_parameters: left_generics,
+                    parameters: left_params,
+                    result: left_result,
+                },
+                Self::GenericFunction {
+                    generic_parameters: right_generics,
+                    parameters: right_params,
+                    result: right_result,
+                },
+            ) => {
+                left_generics == right_generics
+                    && left_params.len() == right_params.len()
+                    && left_params
+                        .iter()
+                        .zip(right_params.iter())
+                        .all(|(left, right)| left.is_assignable_to(right))
+                    && left_result.is_assignable_to(right_result)
+            }
+            (
                 Self::Named {
                     name: left_name,
                     arguments: left_args,
@@ -187,6 +240,7 @@ impl ReplType {
                         .zip(right_args.iter())
                         .all(|(left, right)| left.is_assignable_to(right))
             }
+            (_, Self::DynTrait(name)) if name == "Any" => true,
             (Self::Record(left), Self::Record(right)) => {
                 left.len() == right.len()
                     && left.iter().zip(right.iter()).all(|(left, right)| {
@@ -222,6 +276,16 @@ impl ReplType {
                 (**left_item).clone(),
                 (**right_item).clone(),
             ))),
+            (
+                Self::TypeParameter {
+                    name: left_name,
+                    bound: left_bound,
+                },
+                Self::TypeParameter {
+                    name: right_name,
+                    bound: right_bound,
+                },
+            ) if left_name == right_name && left_bound == right_bound => left,
             _ => Self::Unknown(format!("{} | {}", left.render(), right.render())),
         }
     }
@@ -329,19 +393,35 @@ impl<'a> TypeEngine<'a> {
                     FunctionInfo {
                         summary: FunctionSummary {
                             name: function.name.clone(),
+                            generic_parameters: function
+                                .generic_parameters
+                                .iter()
+                                .map(|parameter| GenericParameterSummary {
+                                    name: parameter.name.clone(),
+                                    bound: parameter.bound.clone(),
+                                })
+                                .collect(),
                             parameters: function
                                 .parameters
                                 .iter()
                                 .map(|parameter| CallableParameterSummary {
                                     name: parameter.name.clone(),
-                                    ty: from_type_syntax(&parameter.ty),
+                                    ty: from_type_syntax(
+                                        &parameter.ty,
+                                        &generic_parameter_scope(&function.generic_parameters),
+                                    ),
                                     has_default: parameter.default.is_some(),
                                 })
                                 .collect(),
                             return_type: function
                                 .return_type
                                 .as_ref()
-                                .map(from_type_syntax)
+                                .map(|ty| {
+                                    from_type_syntax(
+                                        ty,
+                                        &generic_parameter_scope(&function.generic_parameters),
+                                    )
+                                })
                                 .unwrap_or_else(|| {
                                     ReplType::Unknown(format!("{} return type", function.name))
                                 }),
@@ -363,7 +443,7 @@ impl<'a> TypeEngine<'a> {
                         ty: value
                             .ty
                             .as_ref()
-                            .map(from_type_syntax)
+                            .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
                             .unwrap_or_else(|| ReplType::Unknown(format!("{} type", value.name))),
                         mutable: matches!(value.mutability, Mutability::Var),
                     },
@@ -379,11 +459,12 @@ impl<'a> TypeEngine<'a> {
             };
 
             let mut scope = self.top_level_scope();
+            scope.generic_parameters = generic_parameter_scope(&function.generic_parameters);
             for parameter in &function.parameters {
                 scope.values.insert(
                     parameter.name.clone(),
                     LocalBinding {
-                        ty: from_type_syntax(&parameter.ty),
+                        ty: from_type_syntax(&parameter.ty, &scope.generic_parameters),
                         mutable: false,
                     },
                 );
@@ -391,7 +472,7 @@ impl<'a> TypeEngine<'a> {
 
             let inferred = self.infer_expr(&function.body, &mut scope)?;
             let return_type = if let Some(explicit) = &function.return_type {
-                let explicit = from_type_syntax(explicit);
+                let explicit = from_type_syntax(explicit, &scope.generic_parameters);
                 if !inferred.is_assignable_to(&explicit) {
                     return Err(format!(
                         "function `{}` returns `{}`, which is not assignable to `{}`",
@@ -422,7 +503,7 @@ impl<'a> TypeEngine<'a> {
             let mut scope = self.top_level_scope();
             let inferred = self.infer_expr(&value.initializer, &mut scope)?;
             let ty = if let Some(explicit) = &value.ty {
-                let explicit = from_type_syntax(explicit);
+                let explicit = from_type_syntax(explicit, &scope.generic_parameters);
                 if !inferred.is_assignable_to(&explicit) {
                     return Err(format!(
                         "value `{}` has initializer type `{}`, which is not assignable to `{}`",
@@ -587,7 +668,7 @@ impl<'a> TypeEngine<'a> {
                         nested.values.insert(
                             binding.clone(),
                             LocalBinding {
-                                ty: from_type_syntax(&arm.ty),
+                                ty: from_type_syntax(&arm.ty, &nested.generic_parameters),
                                 mutable: false,
                             },
                         );
@@ -606,7 +687,7 @@ impl<'a> TypeEngine<'a> {
                     let ty = parameter
                         .ty
                         .as_ref()
-                        .map(from_type_syntax)
+                        .map(|ty| from_type_syntax(ty, &nested.generic_parameters))
                         .unwrap_or_else(|| ReplType::Unknown(parameter.name.clone()));
                     nested.values.insert(
                         parameter.name.clone(),
@@ -626,7 +707,7 @@ impl<'a> TypeEngine<'a> {
             ExprKind::Block(block) => self.infer_block(block, scope),
             ExprKind::Econ { ty, .. } => Ok(ReplType::Named {
                 name: "Econ".to_owned(),
-                arguments: vec![from_type_syntax(ty)],
+                arguments: vec![from_type_syntax(ty, &scope.generic_parameters)],
             }),
         }
     }
@@ -723,7 +804,7 @@ impl<'a> TypeEngine<'a> {
     ) -> Result<(), String> {
         let inferred = self.infer_expr(&value.initializer, scope)?;
         let ty = if let Some(explicit) = &value.ty {
-            let explicit = from_type_syntax(explicit);
+            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
             if !inferred.is_assignable_to(&explicit) {
                 return Err(format!(
                     "local `{}` has initializer type `{}`, which is not assignable to `{}`",
@@ -756,18 +837,13 @@ impl<'a> TypeEngine<'a> {
         let left = self.infer_expr(left, scope)?;
         let right = self.infer_expr(right, scope)?;
         match op {
-            BinaryOp::Add => match (&left, &right) {
-                (ReplType::Int, ReplType::Int) => Ok(ReplType::Int),
-                (ReplType::Float, ReplType::Float)
-                | (ReplType::Int, ReplType::Float)
-                | (ReplType::Float, ReplType::Int) => Ok(ReplType::Float),
-                (ReplType::String, ReplType::String) => Ok(ReplType::String),
-                _ => Err(format!(
+            BinaryOp::Add => addition_result(&left, &right).ok_or_else(|| {
+                format!(
                     "operator `+` is not defined for `{}` and `{}`",
                     left.render(),
                     right.render()
-                )),
-            },
+                )
+            }),
             BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide | BinaryOp::Remainder => {
                 numeric_result(&left, &right)
             }
@@ -832,17 +908,13 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn infer_compound_add(&self, left: &ReplType, right: &ReplType) -> Result<(), String> {
-        match (left, right) {
-            (ReplType::Int, ReplType::Int)
-            | (ReplType::Float, ReplType::Float)
-            | (ReplType::Float, ReplType::Int)
-            | (ReplType::String, ReplType::String) => Ok(()),
-            _ => Err(format!(
+        addition_result(left, right).map(|_| ()).ok_or_else(|| {
+            format!(
                 "operator `+=` is not defined for `{}` and `{}`",
                 left.render(),
                 right.render()
-            )),
-        }
+            )
+        })
     }
 
     fn infer_call(
@@ -870,12 +942,19 @@ impl<'a> TypeEngine<'a> {
         callee_type: ReplType,
         arguments: Vec<CallArgumentType>,
     ) -> Result<ReplType, String> {
-        let ReplType::Function { parameters, result } = callee_type else {
-            return Err("attempted to call a non-function expression".to_owned());
+        let (generic_parameters, parameters, result) = match callee_type {
+            ReplType::Function { parameters, result } => (Vec::new(), parameters, result),
+            ReplType::GenericFunction {
+                generic_parameters,
+                parameters,
+                result,
+            } => (generic_parameters, parameters, result),
+            _ => return Err("attempted to call a non-function expression".to_owned()),
         };
 
         let mut assigned = vec![false; parameters.len()];
         let mut next_positional = 0usize;
+        let mut substitutions = BTreeMap::new();
 
         for argument in arguments {
             match argument {
@@ -886,7 +965,12 @@ impl<'a> TypeEngine<'a> {
                     let Some(parameter) = parameters.get(next_positional) else {
                         return Err("too many positional arguments".to_owned());
                     };
-                    if !ty.is_assignable_to(parameter) {
+                    if !self.argument_matches_parameter(
+                        parameter,
+                        &ty,
+                        &mut substitutions,
+                        !generic_parameters.is_empty(),
+                    )? {
                         return Err(format!(
                             "argument of type `{}` is not assignable to `{}`",
                             ty.render(),
@@ -902,7 +986,12 @@ impl<'a> TypeEngine<'a> {
                         .enumerate()
                         .find(|(index, _)| !assigned[*index])
                     {
-                        if !ty.is_assignable_to(parameter) {
+                        if !self.argument_matches_parameter(
+                            parameter,
+                            &ty,
+                            &mut substitutions,
+                            !generic_parameters.is_empty(),
+                        )? {
                             return Err(format!(
                                 "argument of type `{}` is not assignable to `{}`",
                                 ty.render(),
@@ -915,7 +1004,44 @@ impl<'a> TypeEngine<'a> {
             }
         }
 
-        Ok(*result)
+        if generic_parameters.is_empty() {
+            return Ok(*result);
+        }
+
+        let mut resolved = BTreeMap::new();
+        for parameter in &generic_parameters {
+            let Some(ty) = substitutions.get(&parameter.name).cloned() else {
+                return Err(format!(
+                    "could not infer a concrete type for generic parameter `{}`",
+                    parameter.name
+                ));
+            };
+            if !type_satisfies_bound(&ty, &parameter.bound) {
+                return Err(format!(
+                    "argument type `{}` does not satisfy bound `{}` for `{}`",
+                    ty.render(),
+                    parameter.bound,
+                    parameter.name
+                ));
+            }
+            resolved.insert(parameter.name.clone(), ty);
+        }
+
+        Ok(substitute_repl_type(&result, &resolved))
+    }
+
+    fn argument_matches_parameter(
+        &self,
+        parameter: &ReplType,
+        argument: &ReplType,
+        substitutions: &mut BTreeMap<String, ReplType>,
+        allow_generic_inference: bool,
+    ) -> Result<bool, String> {
+        if !allow_generic_inference {
+            return Ok(argument.is_assignable_to(parameter));
+        }
+
+        match_generic_parameter(parameter, argument, substitutions)
     }
 
     fn resolve_name_type(
@@ -929,15 +1055,7 @@ impl<'a> TypeEngine<'a> {
                 return Ok(binding.ty.clone());
             }
             if let Some(function) = self.functions.get(local) {
-                return Ok(ReplType::Function {
-                    parameters: function
-                        .summary
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.ty.clone())
-                        .collect(),
-                    result: Box::new(function.summary.return_type.clone()),
-                });
+                return Ok(self.function_repl_type(&function.summary));
             }
             return Err(format!("unknown name `{local}`"));
         }
@@ -947,15 +1065,7 @@ impl<'a> TypeEngine<'a> {
                 return Ok(binding.ty.clone());
             }
             if let Some(function) = self.functions.get(&local) {
-                return Ok(ReplType::Function {
-                    parameters: function
-                        .summary
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.ty.clone())
-                        .collect(),
-                    result: Box::new(function.summary.return_type.clone()),
-                });
+                return Ok(self.function_repl_type(&function.summary));
             }
         }
 
@@ -1015,11 +1125,30 @@ impl<'a> TypeEngine<'a> {
             name.to_source_string()
         ))
     }
+
+    fn function_repl_type(&self, summary: &FunctionSummary) -> ReplType {
+        let parameters = summary
+            .parameters
+            .iter()
+            .map(|parameter| parameter.ty.clone())
+            .collect();
+        let result = Box::new(summary.return_type.clone());
+        if summary.generic_parameters.is_empty() {
+            ReplType::Function { parameters, result }
+        } else {
+            ReplType::GenericFunction {
+                generic_parameters: summary.generic_parameters.clone(),
+                parameters,
+                result,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 struct TypeScope {
     values: BTreeMap<String, LocalBinding>,
+    generic_parameters: BTreeMap<String, GenericParameterSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -1033,12 +1162,49 @@ enum CallArgumentType {
     Named(ReplType),
 }
 
+fn addition_result(left: &ReplType, right: &ReplType) -> Option<ReplType> {
+    match (left, right) {
+        (ReplType::Int, ReplType::Int) => Some(ReplType::Int),
+        (ReplType::Float, ReplType::Float)
+        | (ReplType::Float, ReplType::Int)
+        | (ReplType::Int, ReplType::Float) => Some(ReplType::Float),
+        (ReplType::String, ReplType::String) => Some(ReplType::String),
+        (
+            ReplType::TypeParameter {
+                name: left_name,
+                bound: Some(left_bound),
+            },
+            ReplType::TypeParameter {
+                name: right_name,
+                bound: Some(right_bound),
+            },
+        ) if left_name == right_name && left_bound == right_bound && bound_allows_numeric(left_bound) =>
+        {
+            Some(left.clone())
+        }
+        _ => None,
+    }
+}
+
 fn numeric_result(left: &ReplType, right: &ReplType) -> Result<ReplType, String> {
     match (left, right) {
         (ReplType::Int, ReplType::Int) => Ok(ReplType::Int),
         (ReplType::Float, ReplType::Float)
         | (ReplType::Float, ReplType::Int)
         | (ReplType::Int, ReplType::Float) => Ok(ReplType::Float),
+        (
+            ReplType::TypeParameter {
+                name: left_name,
+                bound: Some(left_bound),
+            },
+            ReplType::TypeParameter {
+                name: right_name,
+                bound: Some(right_bound),
+            },
+        ) if left_name == right_name && left_bound == right_bound && bound_allows_numeric(left_bound) =>
+        {
+            Ok(left.clone())
+        }
         _ => Err(format!(
             "numeric operator is not defined for `{}` and `{}`",
             left.render(),
@@ -1047,13 +1213,21 @@ fn numeric_result(left: &ReplType, right: &ReplType) -> Result<ReplType, String>
     }
 }
 
-fn from_type_syntax(ty: &TypeSyntax) -> ReplType {
+fn from_type_syntax(
+    ty: &TypeSyntax,
+    generic_parameters: &BTreeMap<String, GenericParameterSummary>,
+) -> ReplType {
     match &ty.kind {
         TypeKind::Function { parameters, result } => ReplType::Function {
-            parameters: parameters.iter().map(from_type_syntax).collect(),
-            result: Box::new(from_type_syntax(result)),
+            parameters: parameters
+                .iter()
+                .map(|parameter| from_type_syntax(parameter, generic_parameters))
+                .collect(),
+            result: Box::new(from_type_syntax(result, generic_parameters)),
         },
-        TypeKind::Nullable(inner) => ReplType::Nullable(Box::new(from_type_syntax(inner))),
+        TypeKind::Nullable(inner) => {
+            ReplType::Nullable(Box::new(from_type_syntax(inner, generic_parameters)))
+        }
         TypeKind::Named { name, arguments } => {
             let raw = name.to_source_string();
             match raw.as_str() {
@@ -1062,19 +1236,40 @@ fn from_type_syntax(ty: &TypeSyntax) -> ReplType {
                 "Bool" => ReplType::Bool,
                 "String" => ReplType::String,
                 "Unit" => ReplType::Unit,
+                "List" if arguments.len() == 1 => {
+                    ReplType::List(Box::new(from_type_syntax(&arguments[0], generic_parameters)))
+                }
+                _ if arguments.is_empty() => generic_parameters
+                    .get(&raw)
+                    .map(|parameter| ReplType::TypeParameter {
+                        name: parameter.name.clone(),
+                        bound: Some(parameter.bound.clone()),
+                    })
+                    .unwrap_or_else(|| ReplType::Named {
+                        name: raw,
+                        arguments: Vec::new(),
+                    }),
                 _ => ReplType::Named {
                     name: raw,
-                    arguments: arguments.iter().map(from_type_syntax).collect(),
+                    arguments: arguments
+                        .iter()
+                        .map(|argument| from_type_syntax(argument, generic_parameters))
+                        .collect(),
                 },
             }
         }
         TypeKind::Dyn(name) => ReplType::DynTrait(name.to_source_string()),
-        TypeKind::Grouped(inner) => from_type_syntax(inner),
+        TypeKind::Grouped(inner) => from_type_syntax(inner, generic_parameters),
         TypeKind::Tuple(items) => {
             if items.is_empty() {
                 ReplType::Unit
             } else {
-                ReplType::Tuple(items.iter().map(from_type_syntax).collect())
+                ReplType::Tuple(
+                    items
+                        .iter()
+                        .map(|item| from_type_syntax(item, generic_parameters))
+                        .collect(),
+                )
             }
         }
         TypeKind::Record(fields) => {
@@ -1086,7 +1281,7 @@ fn from_type_syntax(ty: &TypeSyntax) -> ReplType {
                         .iter()
                         .map(|field| RecordFieldType {
                             name: field.name.clone(),
-                            ty: from_type_syntax(&field.ty),
+                            ty: from_type_syntax(&field.ty, generic_parameters),
                         })
                         .collect(),
                 )
@@ -1119,8 +1314,198 @@ fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
             name: format!("{}.{}", name.module.as_str(), name.name),
             arguments: Vec::new(),
         },
-        vox_core::types::VoxType::TypeParameter(name) => ReplType::TypeParameter(name.clone()),
+        vox_core::types::VoxType::TypeParameter(name) => ReplType::TypeParameter {
+            name: name.clone(),
+            bound: None,
+        },
         vox_core::types::VoxType::OpaqueSurface(raw) => ReplType::Unknown(raw.clone()),
+    }
+}
+
+fn generic_parameter_scope(
+    parameters: &[vox_compiler::front_end::ast::GenericParameter],
+) -> BTreeMap<String, GenericParameterSummary> {
+    parameters
+        .iter()
+        .map(|parameter| {
+            (
+                parameter.name.clone(),
+                GenericParameterSummary {
+                    name: parameter.name.clone(),
+                    bound: parameter.bound.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn match_generic_parameter(
+    expected: &ReplType,
+    actual: &ReplType,
+    substitutions: &mut BTreeMap<String, ReplType>,
+) -> Result<bool, String> {
+    match expected {
+        ReplType::TypeParameter { name, bound } => {
+            if let Some(existing) = substitutions.get(name) {
+                return Ok(actual.is_assignable_to(existing) && existing.is_assignable_to(actual));
+            }
+            if let Some(bound) = bound {
+                if !type_satisfies_bound(actual, bound) {
+                    return Ok(false);
+                }
+            }
+            substitutions.insert(name.clone(), actual.clone());
+            Ok(true)
+        }
+        ReplType::List(expected_item) => {
+            let ReplType::List(actual_item) = actual else {
+                return Ok(false);
+            };
+            match_generic_parameter(expected_item, actual_item, substitutions)
+        }
+        ReplType::Nullable(expected_inner) => {
+            let ReplType::Nullable(actual_inner) = actual else {
+                return Ok(false);
+            };
+            match_generic_parameter(expected_inner, actual_inner, substitutions)
+        }
+        ReplType::Tuple(expected_items) => {
+            let ReplType::Tuple(actual_items) = actual else {
+                return Ok(false);
+            };
+            if expected_items.len() != actual_items.len() {
+                return Ok(false);
+            }
+            for (expected, actual) in expected_items.iter().zip(actual_items.iter()) {
+                if !match_generic_parameter(expected, actual, substitutions)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ReplType::Record(expected_fields) => {
+            let ReplType::Record(actual_fields) = actual else {
+                return Ok(false);
+            };
+            if expected_fields.len() != actual_fields.len() {
+                return Ok(false);
+            }
+            for (expected, actual) in expected_fields.iter().zip(actual_fields.iter()) {
+                if expected.name != actual.name
+                    || !match_generic_parameter(&expected.ty, &actual.ty, substitutions)?
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ReplType::Range(expected_item) => {
+            let ReplType::Range(actual_item) = actual else {
+                return Ok(false);
+            };
+            match_generic_parameter(expected_item, actual_item, substitutions)
+        }
+        ReplType::Named {
+            name: expected_name,
+            arguments: expected_arguments,
+        } => {
+            let ReplType::Named {
+                name: actual_name,
+                arguments: actual_arguments,
+            } = actual
+            else {
+                return Ok(false);
+            };
+            if expected_name != actual_name || expected_arguments.len() != actual_arguments.len() {
+                return Ok(false);
+            }
+            for (expected, actual) in expected_arguments.iter().zip(actual_arguments.iter()) {
+                if !match_generic_parameter(expected, actual, substitutions)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ReplType::Function { parameters, result } => {
+            let ReplType::Function {
+                parameters: actual_parameters,
+                result: actual_result,
+            } = actual
+            else {
+                return Ok(false);
+            };
+            if parameters.len() != actual_parameters.len() {
+                return Ok(false);
+            }
+            for (expected, actual) in parameters.iter().zip(actual_parameters.iter()) {
+                if !match_generic_parameter(expected, actual, substitutions)? {
+                    return Ok(false);
+                }
+            }
+            match_generic_parameter(result, actual_result, substitutions)
+        }
+        _ => Ok(actual.is_assignable_to(expected)),
+    }
+}
+
+fn substitute_repl_type(
+    ty: &ReplType,
+    substitutions: &BTreeMap<String, ReplType>,
+) -> ReplType {
+    match ty {
+        ReplType::List(item) => ReplType::List(Box::new(substitute_repl_type(item, substitutions))),
+        ReplType::Tuple(items) => ReplType::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_repl_type(item, substitutions))
+                .collect(),
+        ),
+        ReplType::Nullable(inner) => {
+            ReplType::Nullable(Box::new(substitute_repl_type(inner, substitutions)))
+        }
+        ReplType::Named { name, arguments } => ReplType::Named {
+            name: name.clone(),
+            arguments: arguments
+                .iter()
+                .map(|argument| substitute_repl_type(argument, substitutions))
+                .collect(),
+        },
+        ReplType::Function { parameters, result } => ReplType::Function {
+            parameters: parameters
+                .iter()
+                .map(|parameter| substitute_repl_type(parameter, substitutions))
+                .collect(),
+            result: Box::new(substitute_repl_type(result, substitutions)),
+        },
+        ReplType::Record(fields) => ReplType::Record(
+            fields
+                .iter()
+                .map(|field| RecordFieldType {
+                    name: field.name.clone(),
+                    ty: substitute_repl_type(&field.ty, substitutions),
+                })
+                .collect(),
+        ),
+        ReplType::Range(item) => {
+            ReplType::Range(Box::new(substitute_repl_type(item, substitutions)))
+        }
+        ReplType::TypeParameter { name, .. } => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        _ => ty.clone(),
+    }
+}
+
+fn bound_allows_numeric(bound: &str) -> bool {
+    matches!(bound, "Numeric")
+}
+
+fn type_satisfies_bound(ty: &ReplType, bound: &str) -> bool {
+    match bound {
+        "Any" => true,
+        "Numeric" => matches!(ty, ReplType::Int | ReplType::Float),
+        _ => true,
     }
 }
 

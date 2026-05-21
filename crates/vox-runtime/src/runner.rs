@@ -44,7 +44,11 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RunnerError>;
 
+    fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError>;
+
     fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, RunnerError>;
+
+    fn release_handle(&self, handle: HandleId) -> Result<bool, RunnerError>;
 
     fn live_handles(&self) -> Result<Vec<HandleId>, RunnerError>;
 
@@ -114,8 +118,16 @@ impl RuntimeRunner for EmbeddedRunner {
         self.with_runtime(|runtime| runtime.run_script(artifact_id, arguments).map_err(Into::into))
     }
 
+    fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {
+        self.with_runtime(|runtime| Ok(runtime.retain_handle(handle)))
+    }
+
     fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, RunnerError> {
-        self.with_runtime(|runtime| Ok(runtime.describe_handle(handle).cloned()))
+        self.with_runtime(|runtime| Ok(runtime.describe_handle(handle)))
+    }
+
+    fn release_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {
+        self.with_runtime(|runtime| Ok(runtime.release_handle(handle)))
     }
 
     fn live_handles(&self) -> Result<Vec<HandleId>, RunnerError> {

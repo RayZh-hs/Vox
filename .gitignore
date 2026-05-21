@@ -3,3 +3,6 @@
 .idea/
 .codex
 target/
+
+# Local files
+/dev

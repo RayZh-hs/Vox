@@ -364,8 +364,21 @@ fn render_environment(environment: &TypeEnvironment) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "  {head} {}({parameters}): {}",
+                "  {head} {}{}({parameters}): {}",
                 function.name,
+                if function.generic_parameters.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "[{}]",
+                        function
+                            .generic_parameters
+                            .iter()
+                            .map(|parameter| format!("{}: {}", parameter.name, parameter.bound))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
                 function.return_type.render()
             )
         }));

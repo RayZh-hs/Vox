@@ -18,10 +18,14 @@ use vox_core::{
 
 pub use artifact_store::ArtifactStore;
 pub use analysis::{
-    BindingSummary, CallableParameterSummary, FunctionSummary, RecordFieldType, ReplType,
-    TypeEnvironment, extend_manifest_symbols, infer_environment, language_keywords,
+    BindingSummary, CallableParameterSummary, FunctionSummary, GenericParameterSummary,
+    RecordFieldType, ReplType, TypeEnvironment, extend_manifest_symbols, infer_environment,
+    language_keywords,
 };
-pub use handles::HandleStore;
+pub use handles::{
+    GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary, HandleStore,
+    RealizationKey, RealizedFunctionHandleSummary,
+};
 use interpreter::Interpreter;
 pub use runner::{EmbeddedRunner, RunnerError, RuntimeRunner};
 pub use session::{InteractiveSession, SessionCompletion, SessionError};
@@ -58,9 +62,17 @@ pub struct Runtime {
     host: HostRegistry,
     artifacts: ArtifactStore,
     handles: HandleStore,
+    generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
     libraries: Vec<MountedLibrary>,
     next_library_id: u64,
     default_xopt: OptimizationLevel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedGenericFunction {
+    signature: GenericFunctionHandleSummary,
+    handle: Option<HandleId>,
+    realized: std::collections::BTreeMap<RealizationKey, HandleId>,
 }
 
 impl Runtime {
@@ -105,9 +117,10 @@ impl Runtime {
         artifact_id: ArtifactId,
         source: SourceText,
     ) -> Result<(), RuntimeError> {
-        if self.artifacts.get(artifact_id).is_none() {
+        let Some(previous_artifact) = self.artifacts.get(artifact_id).cloned() else {
             return Err(RuntimeError::MissingArtifact(artifact_id));
-        }
+        };
+        let previous_treewalk = self.artifacts.treewalk(artifact_id).cloned();
 
         let request = CompileRequest {
             source,
@@ -126,7 +139,14 @@ impl Runtime {
             .artifact
             .expect("successful compilation should produce an artifact");
         artifact.id = artifact_id;
+        let generic_signatures_changed = previous_artifact.module != artifact.module
+            || previous_artifact.optimization != artifact.optimization
+            || previous_treewalk.as_ref().map(|treewalk| &treewalk.functions)
+                != result.treewalk.as_ref().map(|treewalk| &treewalk.functions);
         self.artifacts.insert(artifact, result.treewalk);
+        if generic_signatures_changed {
+            self.clear_generic_handles(Some(artifact_id));
+        }
         Ok(())
     }
 
@@ -135,6 +155,7 @@ impl Runtime {
     }
 
     pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
+        self.clear_generic_handles(Some(artifact_id));
         self.artifacts.remove(artifact_id).is_some()
     }
 
@@ -159,16 +180,20 @@ impl Runtime {
             .ok_or(RuntimeError::ExecutionNotImplemented(artifact_id))?
             .clone();
 
-        Interpreter::new(self)
+        Interpreter::new(self, artifact.id)
             .run_script(&treewalk, &artifact, arguments)
             .map_err(RuntimeError::ExecutionFailed)
     }
 
     pub fn allocate_handle(&mut self, summary: HandleSummary) -> HandleId {
-        self.handles.allocate(summary)
+        self.handles.allocate_data(summary)
     }
 
-    pub fn describe_handle(&self, handle: HandleId) -> Option<&HandleSummary> {
+    pub fn retain_handle(&mut self, handle: HandleId) -> bool {
+        self.handles.retain(handle)
+    }
+
+    pub fn describe_handle(&self, handle: HandleId) -> Option<HandleSummary> {
         self.handles.describe(handle)
     }
 
@@ -197,6 +222,89 @@ impl Runtime {
 
     pub fn clear_artifacts(&mut self) {
         self.artifacts = ArtifactStore::default();
+        self.clear_generic_handles(None);
+    }
+
+    pub fn materialize_generic_handle(
+        &mut self,
+        key: GenericFunctionKey,
+        signature: GenericFunctionHandleSummary,
+    ) -> HandleId {
+        let cached = self
+            .generic_handles
+            .entry(key)
+            .or_insert_with(|| CachedGenericFunction {
+                signature: signature.clone(),
+                handle: None,
+                realized: std::collections::BTreeMap::new(),
+            });
+        cached.signature = signature.clone();
+
+        if let Some(handle) = cached.handle {
+            self.retain_handle(handle);
+            return handle;
+        }
+
+        let handle = self
+            .handles
+            .allocate_generic_function(signature, cached.realized.clone());
+        cached.handle = Some(handle);
+        self.retain_handle(handle);
+        handle
+    }
+
+    pub fn record_generic_realization(
+        &mut self,
+        key: GenericFunctionKey,
+        signature: GenericFunctionHandleSummary,
+        realization: RealizationKey,
+        realized_signature: RealizedFunctionHandleSummary,
+    ) {
+        let cached = self
+            .generic_handles
+            .entry(key)
+            .or_insert_with(|| CachedGenericFunction {
+                signature: signature.clone(),
+                handle: None,
+                realized: std::collections::BTreeMap::new(),
+            });
+        cached.signature = signature;
+
+        if cached.realized.contains_key(&realization) {
+            return;
+        }
+
+        let realized_handle = self.handles.allocate_realized_function(realized_signature);
+        cached
+            .realized
+            .insert(realization.clone(), realized_handle);
+        if let Some(folder_handle) = cached.handle {
+            self.handles.update_generic_function_realization(
+                folder_handle,
+                realization,
+                realized_handle,
+            );
+        }
+    }
+
+    pub fn clear_generic_handles(&mut self, artifact: Option<ArtifactId>) {
+        let keys = self
+            .generic_handles
+            .keys()
+            .filter(|key| artifact.is_none_or(|artifact_id| key.artifact == artifact_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for key in keys {
+            if let Some(cached) = self.generic_handles.remove(&key) {
+                if let Some(handle) = cached.handle {
+                    self.release_handle(handle);
+                }
+                for handle in cached.realized.into_values() {
+                    self.release_handle(handle);
+                }
+            }
+        }
     }
 }
 
