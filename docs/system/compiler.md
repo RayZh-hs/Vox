@@ -30,7 +30,7 @@ The compiler should stay simple and staged.
 3. Type-check and infer nullability and purity.
 4. Lower surface Vox into `Vox Core`.
 5. Optimize `Vox Core` according to `NOpt`, `IOpt`, or `SOpt`.
-6. Lower optimized `Vox Core` into a compact executable plan.
+6. Lower optimized `Vox Core` into a wasm-oriented executable plan.
 
 ## Vox Core
 
@@ -79,7 +79,16 @@ Mode-specific guidance:
 - `IOpt`: optimize for stable identities and fast rebuilds.
 - `SOpt`: spend more effort to produce a leaner execution plan.
 
-After `Vox Core` optimization, the compiler lowers the result into the executable plan consumed by `vox-runtime`.
+Sealed `SOpt` should also run:
+
+- last-use analysis to classify aggregate uses as borrow or consume;
+- backward demand analysis over tuple and record outputs;
+- split-product lowering so unused pure record fields are never emitted into the
+  executable plan;
+- update lowering that prefers in-place reuse only for consumed inputs.
+
+After `Vox Core` optimization, the compiler lowers the result into the
+wasm-oriented executable plan consumed by `vox-runtime`.
 
 Storage reuse itself is not primarily a compiler concern. The compiler may annotate liveness and last-use information, but the final reuse decision belongs to `vox-runtime`.
 

@@ -118,3 +118,6 @@ They may change implementation strategy, including:
 
 `SOpt` may reuse storage more aggressively than `IOpt`, but it must preserve
 the same observable behavior.
+
+For sealed functions, additional `SOpt` lowering rules are defined in
+[07 Sealed Lowering](./07-sealed-lowering.md).

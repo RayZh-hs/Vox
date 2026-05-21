@@ -30,7 +30,8 @@ The REPL is not the runtime protocol.
 
 Internally, the REPL may keep a growing synthetic script or module-like state and recompile it incrementally. That is a tool concern, not a runtime concern.
 
-These actions should map onto compiler or runtime library calls, not expand the runtime protocol.
+These actions should map onto runtime-owned session and runner calls, not expand
+the runtime protocol or reimplement parsing logic in the REPL.
 
 ## Commands
 
@@ -96,6 +97,7 @@ The REPL should:
 ## Design Rules
 
 - keep REPL concerns out of `vox-runtime`;
-- prefer library calls over protocol-only implementations;
+- keep parser, session, and artifact-lifetime mechanics in `vox-runtime`;
+- prefer one runtime API that works both in-process and over a future runner protocol;
 - do not make REPL state a protocol concept;
 - optimize for fast edit-check-run cycles.

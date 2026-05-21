@@ -26,6 +26,8 @@ This supports two deployment modes:
 
 - mounting libraries;
 - loading and reloading scripts;
+- exposing a uniform runner API for embedded and attached clients;
+- owning interactive session mechanics used by tools such as the REPL;
 - selecting `NOpt`, `IOpt`, or `SOpt`;
 - executing compiled plans with arguments;
 - memoizing pure evaluation;
@@ -35,9 +37,14 @@ This supports two deployment modes:
 - reporting lightweight handle metadata;
 - shutting down cleanly.
 
+Interactive sessions are client-local. The runtime process owns shared compiled
+artifacts, handles, and caches, while each attached tool owns its own synthetic
+script state and reloads only its own artifact slot.
+
 ## Execution Model
 
-`vox-runtime` does not interpret source code directly. It executes compiled plans produced by `vox-compiler`.
+`vox-runtime` does not interpret source code directly. It executes compiled
+plans produced by `vox-compiler`.
 
 The flow is:
 
@@ -63,7 +70,17 @@ Pure cache validity depends on:
 - `IOpt`: low latency, stable caches, minimal recompilation.
 - `SOpt`: sealed execution, more aggressive storage reuse and scheduling.
 
-Most optimization happens in `vox-compiler`. Runtime-specific reuse decisions, such as when a large value can be moved or storage can be recycled, happen inside `vox-runtime` and depend on the selected mode.
+Most optimization happens in `vox-compiler`. Runtime-specific reuse decisions,
+such as when a large value can be moved or storage can be recycled, happen
+inside `vox-runtime` and depend on the selected mode.
+
+The sealed `SOpt` plan is expected to be wasm-oriented:
+
+- scalars stay in wasm locals where possible;
+- large values travel as runtime handles;
+- aggregate uses are annotated as borrow or consume;
+- tuple and record fields may stay split until a full runtime value must be
+  materialized.
 
 ## Protocol
 
@@ -175,4 +192,6 @@ Shared objects are the preferred extension model when cross-language host suppor
 - large values keep value semantics through handles;
 - `evil` work is explicit;
 - `Econ` refresh invalidates dependent pure results;
+- unused pure fields of sealed record or tuple producers may be omitted from
+  execution entirely;
 - `SOpt` may change reuse and scheduling, but not semantics.

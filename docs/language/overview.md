@@ -337,4 +337,6 @@ Large values are still passed as immutable handles.
 
 When a function is no longer being edited, it may be compiled in SOpt mode. SOpt favors execution performance over editability. The compiler may use liveness analysis to internally move, consume, or reuse storage for values that are no longer needed. If a value is still needed later, the runtime must preserve value semantics by sharing immutable storage, copying only when necessary.
 
-Move semantics in SOpt are aggressively used in SOpt.
+For pure tuple and record outputs, SOpt may also track which fields are actually demanded so unused fields are never computed or materialized.
+
+Move-style reuse is applied aggressively in SOpt when it is safe.

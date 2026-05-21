@@ -1,6 +1,9 @@
 mod artifact_store;
+mod analysis;
 mod handles;
 mod interpreter;
+mod runner;
+mod session;
 
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler};
@@ -14,8 +17,14 @@ use vox_core::{
 };
 
 pub use artifact_store::ArtifactStore;
+pub use analysis::{
+    BindingSummary, CallableParameterSummary, FunctionSummary, RecordFieldType, ReplType,
+    TypeEnvironment, extend_manifest_symbols, infer_environment, language_keywords,
+};
 pub use handles::HandleStore;
 use interpreter::Interpreter;
+pub use runner::{EmbeddedRunner, RunnerError, RuntimeRunner};
+pub use session::{InteractiveSession, SessionCompletion, SessionError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedLibrary {
@@ -123,6 +132,10 @@ impl Runtime {
 
     pub fn artifact(&self, artifact_id: ArtifactId) -> Option<&CompiledArtifact> {
         self.artifacts.get(artifact_id)
+    }
+
+    pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
+        self.artifacts.remove(artifact_id).is_some()
     }
 
     pub fn run_script(

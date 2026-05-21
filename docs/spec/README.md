@@ -10,6 +10,7 @@ The specification is organized as follows:
 4. [04 Expressions](./04-expressions.md)
 5. [05 Statements and Control Flow](./05-statements-and-control-flow.md)
 6. [06 Effects and Execution](./06-effects-and-execution.md)
+7. [07 Sealed Lowering](./07-sealed-lowering.md)
 
 ## Status
 
@@ -22,7 +23,8 @@ It covers:
 - type syntax;
 - declarations;
 - expressions, statements, and control flow;
-- purity, `evil`, and `econ`.
+- purity, `evil`, and `econ`;
+- sealed-function lowering for `SOpt`.
 
 ## Notation
 

@@ -11,6 +11,7 @@
     - [Expressions](spec/04-expressions.md)
     - [Statements and Control Flow](spec/05-statements-and-control-flow.md)
     - [Effects and Execution](spec/06-effects-and-execution.md)
+    - [Sealed Lowering](spec/07-sealed-lowering.md)
 
 - [System](system/README.md)
   - [Compiler](system/compiler.md)

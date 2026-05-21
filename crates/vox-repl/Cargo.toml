@@ -6,6 +6,5 @@ license.workspace = true
 
 [dependencies]
 rustyline.workspace = true
-vox-compiler = { path = "../vox-compiler" }
 vox-core = { path = "../vox-core" }
 vox-runtime = { path = "../vox-runtime" }

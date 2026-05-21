@@ -4,26 +4,15 @@ use std::{
     str::FromStr,
 };
 
-use vox_compiler::front_end::{
-    analyze_source,
-    ast::{CompilationUnit, Expr, TopLevelItem},
-};
 use vox_core::{
-    host::PackageManifest,
     ids::HandleId,
     opt::OptimizationLevel,
-    source::{ModuleKind, SourceText},
-    value::RuntimeValue,
+    value::{InlineValue, RuntimeValue},
 };
-use vox_runtime::Runtime;
+use vox_runtime::{EmbeddedRunner, InteractiveSession, TypeEnvironment};
 
-use crate::{
-    CompletionSnapshot,
-    command::ReplCommand,
-    typing::{TypeEnvironment, infer_environment},
-};
+use crate::{CompletionSnapshot, command::ReplCommand};
 
-const REPL_MODULE: &str = "repl.session";
 const LAST_VALUE_NAME: &str = "__repl_last";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,71 +32,17 @@ impl ReplOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StoredItem {
-    key: StoredItemKey,
-    source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StoredItemKey {
-    Import { module: String },
-    Value { name: String },
-    Function { name: String },
-}
-
-impl StoredItem {
-    fn display_name(&self) -> &str {
-        match &self.key {
-            StoredItemKey::Import { module } => module,
-            StoredItemKey::Value { name } | StoredItemKey::Function { name } => name,
-        }
-    }
-
-    fn matches_drop(&self, raw: &str) -> bool {
-        match &self.key {
-            StoredItemKey::Import { module } => {
-                module == raw
-                    || module
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|segment| segment == raw)
-            }
-            StoredItemKey::Value { name } | StoredItemKey::Function { name } => name == raw,
-        }
-    }
-
-    fn is_hidden_last(&self) -> bool {
-        matches!(&self.key, StoredItemKey::Value { name } if name == LAST_VALUE_NAME)
-    }
-}
-
-impl StoredItemKey {
-    fn conflicts_with(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Import { module: left }, Self::Import { module: right }) => left == right,
-            (Self::Value { name: left }, Self::Value { name: right })
-            | (Self::Value { name: left }, Self::Function { name: right })
-            | (Self::Function { name: left }, Self::Value { name: right })
-            | (Self::Function { name: left }, Self::Function { name: right }) => left == right,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedSubmission {
-    items: Vec<StoredItem>,
-    result_source: Option<String>,
-    uses_last_value: bool,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct ReplSession {
-    runtime: Runtime,
-    items: Vec<StoredItem>,
-    hidden_last: Option<StoredItem>,
-    next_source_revision: u64,
+    runtime: InteractiveSession<EmbeddedRunner>,
+}
+
+impl Default for ReplSession {
+    fn default() -> Self {
+        Self {
+            runtime: InteractiveSession::new(EmbeddedRunner::default()),
+        }
+    }
 }
 
 impl ReplSession {
@@ -121,10 +56,20 @@ impl ReplSession {
             return self.handle_command(trimmed);
         }
 
-        self.evaluate_submission(line)
+        match self.runtime.evaluate_submission(line) {
+            Ok(Some(value)) => ReplOutput::message(self.render_runtime_value(&value)),
+            Ok(None) => ReplOutput::message(String::new()),
+            Err(error) => ReplOutput::error(error.to_string()),
+        }
     }
 
     pub fn completion_snapshot(&self) -> CompletionSnapshot {
+        let runtime = self.runtime.completion();
+        let (handles, symbols) = match runtime {
+            Ok(runtime) => (runtime.handles, runtime.symbols),
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+
         let mut snapshot = CompletionSnapshot {
             commands: vec![
                 ":help".to_owned(),
@@ -143,43 +88,10 @@ impl ReplSession {
             ],
             snapshots: available_snapshot_names(),
             xopts: vec!["NOpt".to_owned(), "IOpt".to_owned(), "SOpt".to_owned()],
-            handles: self
-                .runtime
-                .live_handles()
-                .into_iter()
-                .map(|handle| handle.0.to_string())
-                .collect(),
-            symbols: language_keywords(),
+            handles,
+            symbols,
         };
 
-        snapshot.symbols.push("$".to_owned());
-        for item in &self.items {
-            snapshot.symbols.push(item.display_name().to_owned());
-        }
-
-        for manifest in self.runtime.package_manifests() {
-            extend_manifest_symbols(&mut snapshot.symbols, &manifest);
-        }
-
-        if let Ok(environment) = self.current_environment(true) {
-            snapshot.symbols.extend(environment.imports);
-            snapshot.symbols.extend(
-                environment
-                    .bindings
-                    .into_iter()
-                    .filter(|binding| binding.name != LAST_VALUE_NAME)
-                    .map(|binding| binding.name),
-            );
-            snapshot.symbols.extend(
-                environment
-                    .functions
-                    .into_iter()
-                    .map(|function| function.name),
-            );
-        }
-
-        snapshot.symbols.sort();
-        snapshot.symbols.dedup();
         snapshot.snapshots.sort();
         snapshot.snapshots.dedup();
         snapshot
@@ -196,93 +108,54 @@ impl ReplSession {
         match command {
             ReplCommand::Help => ReplOutput::message(render_help()),
             ReplCommand::Quit => ReplOutput::Exit,
-            ReplCommand::Reset => {
-                self.items.clear();
-                self.hidden_last = None;
-                self.runtime.clear_artifacts();
-                ReplOutput::message("interactive state cleared".to_owned())
-            }
+            ReplCommand::Reset => match self.runtime.reset() {
+                Ok(()) => ReplOutput::message("interactive state cleared".to_owned()),
+                Err(error) => ReplOutput::error(error.to_string()),
+            },
             ReplCommand::Clear => ReplOutput::message("\x1b[2J\x1b[H".to_owned()),
-            ReplCommand::Env => match self.current_environment(true) {
+            ReplCommand::Env => match self.runtime.current_environment(true) {
                 Ok(environment) => ReplOutput::message(render_environment(&environment)),
-                Err(message) => ReplOutput::error(message),
+                Err(error) => ReplOutput::error(error.to_string()),
             },
             ReplCommand::Snapshot(name) => self.snapshot(&name),
             ReplCommand::Restore(name) => self.restore(&name),
-            ReplCommand::TypeOf(expr) => self.type_of(&expr),
+            ReplCommand::TypeOf(expr) => match self.runtime.type_of(&expr) {
+                Ok(ty) => ReplOutput::message(ty.render()),
+                Err(error) => ReplOutput::error(error.to_string()),
+            },
             ReplCommand::Run(path) => self.run_file(&path),
             ReplCommand::Handles => self.list_handles(),
             ReplCommand::Show(handle) => self.show_handle(&handle),
-            ReplCommand::Drop(name) => self.drop(&name),
+            ReplCommand::Drop(name) => match self.runtime.drop_item(&name) {
+                Ok(true) => ReplOutput::message(format!(
+                    "dropped interactive item(s) matching `{}`",
+                    name.trim()
+                )),
+                Ok(false) => ReplOutput::error(format!(
+                    "no interactive item matched `{}`",
+                    name.trim()
+                )),
+                Err(error) => ReplOutput::error(error.to_string()),
+            },
             ReplCommand::XOpt(mode) => {
                 let xopt = match mode.as_str() {
                     "NOpt" => OptimizationLevel::NOpt,
                     "IOpt" => OptimizationLevel::IOpt,
                     "SOpt" => OptimizationLevel::SOpt,
                     _ => {
-                        return ReplOutput::error(format!("unknown optimization mode `{mode}`"));
+                        return ReplOutput::error(format!(
+                            "unknown optimization mode `{mode}`"
+                        ));
                     }
                 };
-                self.runtime.set_default_xopt(xopt);
-                ReplOutput::message(format!("default optimization mode set to {mode}"))
-            }
-        }
-    }
-
-    fn evaluate_submission(&mut self, raw: &str) -> ReplOutput {
-        let parsed = match parse_submission(raw) {
-            Ok(parsed) => parsed,
-            Err(message) => return ReplOutput::error(message),
-        };
-
-        if parsed.items.is_empty() && parsed.result_source.is_none() {
-            return ReplOutput::message(String::new());
-        }
-
-        let candidate_items = merge_items(&self.items, parsed.items.clone());
-
-        let result_source = parsed.result_source.clone();
-        let source = self.synthetic_source(
-            &candidate_items,
-            if parsed.uses_last_value {
-                self.hidden_last.as_ref()
-            } else {
-                None
-            },
-            result_source.as_deref(),
-        );
-
-        let front_end = match analyze_source(&SourceText::new(
-            "<repl-submit>",
-            self.next_revision(),
-            &source,
-        )) {
-            Ok(front_end) => front_end,
-            Err(diagnostics) => return ReplOutput::error(diagnostics.to_string()),
-        };
-
-        if let Err(message) =
-            infer_environment(&front_end.syntax, &self.runtime.package_manifests())
-        {
-            return ReplOutput::error(message);
-        }
-
-        let output = if result_source.is_some() {
-            match self.evaluate_script_source(&source) {
-                Ok(value) => {
-                    if let Some(result_source) = parsed.result_source.as_deref() {
-                        self.hidden_last = Some(stored_last_value(result_source, &value));
+                match self.runtime.set_default_xopt(xopt) {
+                    Ok(()) => {
+                        ReplOutput::message(format!("default optimization mode set to {mode}"))
                     }
-                    self.render_runtime_value(&value)
+                    Err(error) => ReplOutput::error(error.to_string()),
                 }
-                Err(message) => return ReplOutput::error(message),
             }
-        } else {
-            String::new()
-        };
-
-        self.items = candidate_items;
-        ReplOutput::message(output)
+        }
     }
 
     fn run_file(&mut self, path: &str) -> ReplOutput {
@@ -295,99 +168,24 @@ impl ReplSession {
             Err(error) => return ReplOutput::error(error.to_string()),
         };
 
-        let parsed = match parse_external_script(path, &text) {
-            Ok(parsed) => parsed,
-            Err(message) => return ReplOutput::error(message),
-        };
-
-        let items = merge_items(&self.items, parsed.items);
-        let source = self.synthetic_source(&items, None, parsed.result_source.as_deref());
-
-        let front_end = match analyze_source(&SourceText::new(path, self.next_revision(), &source))
-        {
-            Ok(front_end) => front_end,
-            Err(diagnostics) => return ReplOutput::error(diagnostics.to_string()),
-        };
-
-        if let Err(message) =
-            infer_environment(&front_end.syntax, &self.runtime.package_manifests())
-        {
-            return ReplOutput::error(message);
-        }
-
-        match self.evaluate_script_source(&source) {
+        match self.runtime.run_script_text(path, &text) {
             Ok(value) => ReplOutput::message(self.render_runtime_value(&value)),
-            Err(message) => ReplOutput::error(message),
+            Err(error) => ReplOutput::error(error.to_string()),
         }
-    }
-
-    fn type_of(&self, raw_expr: &str) -> ReplOutput {
-        if raw_expr.trim().is_empty() {
-            return ReplOutput::error("`:type` requires an expression".to_owned());
-        }
-
-        let rewritten = rewrite_last_shorthand(raw_expr);
-        let source = self.synthetic_source(
-            &self.items,
-            rewritten
-                .uses_last_value
-                .then_some(self.hidden_last.as_ref())
-                .flatten(),
-            Some(&rewritten.source),
-        );
-        let front_end = match analyze_source(&SourceText::new("<repl-type>", 1, &source)) {
-            Ok(front_end) => front_end,
-            Err(diagnostics) => return ReplOutput::error(diagnostics.to_string()),
-        };
-
-        match infer_environment(&front_end.syntax, &self.runtime.package_manifests()) {
-            Ok(environment) => {
-                let ty = environment
-                    .result
-                    .map(|ty| ty.render())
-                    .unwrap_or_else(|| "Unit".to_owned());
-                ReplOutput::message(ty)
-            }
-            Err(message) => ReplOutput::error(message),
-        }
-    }
-
-    fn drop(&mut self, raw: &str) -> ReplOutput {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            return ReplOutput::error("`:drop` requires a name".to_owned());
-        }
-
-        let target = if trimmed == "$" {
-            LAST_VALUE_NAME
-        } else {
-            trimmed
-        };
-        let before = self.items.len();
-        self.items.retain(|item| !item.matches_drop(target));
-        let removed_hidden = if target == LAST_VALUE_NAME {
-            self.hidden_last.take().is_some()
-        } else {
-            false
-        };
-
-        if before == self.items.len() && !removed_hidden {
-            return ReplOutput::error(format!("no interactive item matched `{trimmed}`"));
-        }
-
-        self.runtime.clear_artifacts();
-        ReplOutput::message(format!("dropped interactive item(s) matching `{trimmed}`"))
     }
 
     fn list_handles(&self) -> ReplOutput {
-        let handles = self.runtime.live_handles();
+        let handles = match self.runtime.live_handles() {
+            Ok(handles) => handles,
+            Err(error) => return ReplOutput::error(error.to_string()),
+        };
         if handles.is_empty() {
             return ReplOutput::message("no live handles".to_owned());
         }
 
         let mut lines = Vec::new();
         for handle in handles {
-            if let Some(summary) = self.runtime.describe_handle(handle) {
+            if let Ok(Some(summary)) = self.runtime.describe_handle(handle) {
                 lines.push(format!(
                     "{} {} {}",
                     handle.0, summary.type_name, summary.summary
@@ -409,10 +207,11 @@ impl ReplSession {
         };
 
         match self.runtime.describe_handle(handle) {
-            Some(summary) => {
+            Ok(Some(summary)) => {
                 ReplOutput::message(format!("{} {}", summary.type_name, summary.summary))
             }
-            None => ReplOutput::error(format!("handle {} was not found", handle.0)),
+            Ok(None) => ReplOutput::error(format!("handle {} was not found", handle.0)),
+            Err(error) => ReplOutput::error(error.to_string()),
         }
     }
 
@@ -431,8 +230,7 @@ impl ReplSession {
         }
 
         let path = root.join(format!("{trimmed}.vox"));
-        let source = self.synthetic_source(&self.items, self.hidden_last.as_ref(), None);
-        match fs::write(&path, source) {
+        match fs::write(&path, self.runtime.snapshot_source()) {
             Ok(()) => ReplOutput::message(format!("saved snapshot `{trimmed}`")),
             Err(error) => ReplOutput::error(error.to_string()),
         }
@@ -456,101 +254,28 @@ impl ReplSession {
             }
         };
 
-        let front_end = match analyze_source(&SourceText::new(path_to_label(&path), 1, &text)) {
-            Ok(front_end) => front_end,
-            Err(diagnostics) => return ReplOutput::error(diagnostics.to_string()),
-        };
-
-        if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
-            return ReplOutput::error("snapshot must contain a script state".to_owned());
-        }
-
-        if let Err(message) =
-            infer_environment(&front_end.syntax, &self.runtime.package_manifests())
-        {
-            return ReplOutput::error(message);
-        }
-
-        let restored = normalize_items(rebuild_items_from_unit(&text, &front_end.syntax));
-        let (hidden_last, items): (Vec<_>, Vec<_>) =
-            restored.into_iter().partition(StoredItem::is_hidden_last);
-        self.items = items;
-        self.hidden_last = hidden_last.into_iter().next();
-        self.runtime.clear_artifacts();
-        ReplOutput::message(format!("restored snapshot `{trimmed}`"))
-    }
-
-    fn current_environment(&self, include_hidden_last: bool) -> Result<TypeEnvironment, String> {
-        let source = self.synthetic_source(
-            &self.items,
-            if include_hidden_last {
-                self.hidden_last.as_ref()
-            } else {
-                None
-            },
-            None,
-        );
-        let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
-            .map_err(|diagnostics| diagnostics.to_string())?;
-        infer_environment(&front_end.syntax, &self.runtime.package_manifests())
-    }
-
-    fn synthetic_source(
-        &self,
-        items: &[StoredItem],
-        hidden_last: Option<&StoredItem>,
-        result: Option<&str>,
-    ) -> String {
-        let mut source = format!("script {REPL_MODULE};\n");
-        for item in items {
-            source.push_str(&item.source);
-            if !item.source.ends_with('\n') {
-                source.push('\n');
-            }
-        }
-        if let Some(item) = hidden_last {
-            source.push_str(&item.source);
-            if !item.source.ends_with('\n') {
-                source.push('\n');
-            }
-        }
-        if let Some(result) = result {
-            source.push_str(result);
-            source.push('\n');
-        }
-        source
-    }
-
-    fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, String> {
-        let revision = self.next_revision();
-        self.runtime.clear_artifacts();
-        let artifact_id = self
+        match self
             .runtime
-            .load_script(SourceText::new("<repl-eval>", revision, source), None)
-            .map_err(|error| error.to_string())?;
-        self.runtime
-            .run_script(artifact_id, &[])
-            .map_err(|error| error.to_string())
+            .restore_snapshot_source(&path_to_label(&path), &text)
+        {
+            Ok(()) => ReplOutput::message(format!("restored snapshot `{trimmed}`")),
+            Err(error) => ReplOutput::error(error.to_string()),
+        }
     }
 
     fn render_runtime_value(&self, value: &RuntimeValue) -> String {
         match value {
             RuntimeValue::Inline(value) => render_inline_value(value),
             RuntimeValue::Handle(handle) => match self.runtime.describe_handle(*handle) {
-                Some(summary) => {
+                Ok(Some(summary)) => {
                     format!(
                         "<{} handle={}> {}",
                         summary.type_name, handle.0, summary.summary
                     )
                 }
-                None => format!("<handle {}>", handle.0),
+                Ok(None) | Err(_) => format!("<handle {}>", handle.0),
             },
         }
-    }
-
-    fn next_revision(&mut self) -> u64 {
-        self.next_source_revision += 1;
-        self.next_source_revision
     }
 }
 
@@ -573,171 +298,13 @@ fn render_help() -> String {
     .join("\n")
 }
 
-fn parse_submission(raw: &str) -> Result<ParsedSubmission, String> {
-    parse_script_fragment("<repl-submit>", raw)
-}
-
-fn parse_external_script(path: &str, raw: &str) -> Result<ParsedSubmission, String> {
-    let front_end = analyze_source(&SourceText::new(path, 1, raw)).map_err(|d| d.to_string())?;
-    if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
-        return Err("`:run` requires a script file".to_owned());
-    }
-    Ok(ParsedSubmission {
-        items: rebuild_items_from_unit(raw, &front_end.syntax),
-        result_source: front_end
-            .syntax
-            .result
-            .as_ref()
-            .map(|expr| slice_source(raw, expr)),
-        uses_last_value: false,
-    })
-}
-
-fn parse_script_fragment(path: &str, raw: &str) -> Result<ParsedSubmission, String> {
-    let rewritten = rewrite_last_shorthand(raw);
-    let wrapped = format!("script {REPL_MODULE};\n{}\n", rewritten.source);
-    let front_end = analyze_source(&SourceText::new(path, 1, &wrapped))
-        .map_err(|diagnostics| diagnostics.to_string())?;
-    Ok(ParsedSubmission {
-        items: rebuild_items_from_unit(&wrapped, &front_end.syntax),
-        result_source: front_end
-            .syntax
-            .result
-            .as_ref()
-            .map(|expr| slice_source(&wrapped, expr)),
-        uses_last_value: rewritten.uses_last_value,
-    })
-}
-
-fn rebuild_items_from_unit(source: &str, unit: &CompilationUnit) -> Vec<StoredItem> {
-    unit.items
-        .iter()
-        .map(|item| StoredItem {
-            key: item_key(item),
-            source: slice_item_source(source, item),
-        })
-        .collect()
-}
-
-fn normalize_items(items: Vec<StoredItem>) -> Vec<StoredItem> {
-    merge_items(&[], items)
-}
-
-fn merge_items(existing: &[StoredItem], incoming: Vec<StoredItem>) -> Vec<StoredItem> {
-    let mut merged = existing.to_vec();
-    for item in incoming {
-        merged.retain(|current| !current.key.conflicts_with(&item.key));
-        merged.push(item);
-    }
-    merged
-}
-
-fn item_key(item: &TopLevelItem) -> StoredItemKey {
-    match item {
-        TopLevelItem::Import(import) => StoredItemKey::Import {
-            module: import.module.to_source_string(),
-        },
-        TopLevelItem::Value(value) => StoredItemKey::Value {
-            name: value.name.clone(),
-        },
-        TopLevelItem::Function(function) => StoredItemKey::Function {
-            name: function.name.clone(),
-        },
-        TopLevelItem::Param(param) => StoredItemKey::Value {
-            name: param.name.clone(),
-        },
-    }
-}
-
-fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
-    let span = match item {
-        TopLevelItem::Import(import) => &import.span,
-        TopLevelItem::Param(param) => &param.span,
-        TopLevelItem::Value(value) => &value.span,
-        TopLevelItem::Function(function) => &function.span,
-    };
-    source[span.start..span.end].to_owned()
-}
-
-fn slice_source(source: &str, expr: &Expr) -> String {
-    source[expr.span.start..expr.span.end].to_owned()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RewrittenInput {
-    source: String,
-    uses_last_value: bool,
-}
-
-fn rewrite_last_shorthand(raw: &str) -> RewrittenInput {
-    let mut out = String::new();
-    let mut chars = raw.chars().peekable();
-    let mut in_string = false;
-    let mut escape = false;
-    let mut uses_last_value = false;
-
-    while let Some(ch) = chars.next() {
-        if in_string {
-            out.push(ch);
-            if escape {
-                escape = false;
-                continue;
-            }
-            if ch == '\\' {
-                escape = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-            continue;
-        }
-
-        if ch == '$' {
-            out.push_str(LAST_VALUE_NAME);
-            uses_last_value = true;
-            continue;
-        }
-
-        out.push(ch);
-    }
-
-    RewrittenInput {
-        source: out,
-        uses_last_value,
-    }
-}
-
-fn stored_last_value(result_source: &str, value: &RuntimeValue) -> StoredItem {
-    let source = match value {
-        RuntimeValue::Inline(value) => {
-            format!(
-                "val {LAST_VALUE_NAME} = {};",
-                render_inline_value_source(value)
-            )
-        }
-        RuntimeValue::Handle(_) => format!("val {LAST_VALUE_NAME} = {result_source};"),
-    };
-
-    StoredItem {
-        key: StoredItemKey::Value {
-            name: LAST_VALUE_NAME.to_owned(),
-        },
-        source,
-    }
-}
-
-fn render_inline_value(value: &vox_core::value::InlineValue) -> String {
+fn render_inline_value(value: &InlineValue) -> String {
     match value {
-        vox_core::value::InlineValue::Int(value) => value.to_string(),
-        vox_core::value::InlineValue::Float(value) => value.to_string(),
-        vox_core::value::InlineValue::Bool(value) => value.to_string(),
-        vox_core::value::InlineValue::String(value) => value.clone(),
-        vox_core::value::InlineValue::Tuple(values) => match values.as_slice() {
+        InlineValue::Int(value) => value.to_string(),
+        InlineValue::Float(value) => value.to_string(),
+        InlineValue::Bool(value) => value.to_string(),
+        InlineValue::String(value) => value.clone(),
+        InlineValue::Tuple(values) => match values.as_slice() {
             [] => "()".to_owned(),
             [single] => format!("({},)", render_inline_value(single)),
             _ => format!(
@@ -749,56 +316,8 @@ fn render_inline_value(value: &vox_core::value::InlineValue) -> String {
                     .join(", ")
             ),
         },
-        vox_core::value::InlineValue::Null => "null".to_owned(),
+        InlineValue::Null => "null".to_owned(),
     }
-}
-
-fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
-    match value {
-        vox_core::value::InlineValue::Int(value) => value.to_string(),
-        vox_core::value::InlineValue::Float(value) => render_float_literal(*value),
-        vox_core::value::InlineValue::Bool(value) => value.to_string(),
-        vox_core::value::InlineValue::String(value) => {
-            format!("\"{}\"", escape_string_literal(value))
-        }
-        vox_core::value::InlineValue::Tuple(values) => match values.as_slice() {
-            [] => "()".to_owned(),
-            [single] => format!("({},)", render_inline_value_source(single)),
-            _ => format!(
-                "({})",
-                values
-                    .iter()
-                    .map(render_inline_value_source)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        },
-        vox_core::value::InlineValue::Null => "null".to_owned(),
-    }
-}
-
-fn render_float_literal(value: f64) -> String {
-    let mut rendered = value.to_string();
-    if value.is_finite() && !rendered.contains(['.', 'e', 'E']) {
-        rendered.push_str(".0");
-    }
-    rendered
-}
-
-fn escape_string_literal(value: &str) -> String {
-    let mut escaped = String::new();
-    for ch in value.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            '$' => escaped.push_str("\\$"),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }
 
 fn render_environment(environment: &TypeEnvironment) -> String {
@@ -808,12 +327,7 @@ fn render_environment(environment: &TypeEnvironment) -> String {
     if environment.imports.is_empty() {
         lines.push("  <none>".to_owned());
     } else {
-        lines.extend(
-            environment
-                .imports
-                .iter()
-                .map(|import| format!("  {import}")),
-        );
+        lines.extend(environment.imports.iter().map(|import| format!("  {import}")));
     }
 
     lines.push("Bindings:".to_owned());
@@ -858,30 +372,6 @@ fn render_environment(environment: &TypeEnvironment) -> String {
     }
 
     lines.join("\n")
-}
-
-fn language_keywords() -> Vec<String> {
-    [
-        "as", "dyn", "econ", "else", "evil", "false", "for", "fun", "if", "import", "in", "is",
-        "null", "package", "panic", "param", "private", "public", "return", "script", "true",
-        "val", "var", "when",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
-}
-
-fn extend_manifest_symbols(symbols: &mut Vec<String>, manifest: &PackageManifest) {
-    let package = manifest.package.as_str();
-    symbols.push(package.clone());
-
-    for function in &manifest.functions {
-        symbols.push(format!("{package}.{}", function.name));
-    }
-
-    for ty in &manifest.types {
-        symbols.push(format!("{package}.{}", ty.name.name));
-    }
 }
 
 fn snapshot_root() -> Result<PathBuf, String> {
