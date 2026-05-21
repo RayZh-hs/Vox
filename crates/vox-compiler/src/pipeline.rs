@@ -4,12 +4,13 @@ use vox_core::{
     diagnostics::DiagnosticBag,
     host::{HostRegistry, Purity},
     ids::ArtifactId,
-    opt::OptimizationLevel,
+    opt::{OptimizationLevel, OptimizationSubject},
     plan::{CompiledArtifact, DependencyFingerprint, ExecutablePlan},
     source::SourceText,
 };
 
 use crate::front_end::{FrontEndUnit, analyze_source};
+use crate::optimization::derive_rankings;
 use crate::treewalk::TreewalkScript;
 
 #[derive(Debug, Clone)]
@@ -37,11 +38,20 @@ impl Compiler {
         match analyze_source(&request.source) {
             Ok(front_end) => {
                 let treewalk = TreewalkScript::lower(&front_end).ok();
+                let optimization_rankings = derive_rankings(&front_end, request.optimization);
+                let module_rank = optimization_rankings
+                    .iter()
+                    .find_map(|ranking| match &ranking.subject {
+                        OptimizationSubject::Module => Some(ranking.rank),
+                        OptimizationSubject::Function(_) => None,
+                    })
+                    .expect("module ranking should always be present");
                 let artifact = CompiledArtifact {
                     id: ArtifactId(self.next_artifact_id.fetch_add(1, Ordering::Relaxed) + 1),
                     module: front_end.header.module.clone(),
                     kind: front_end.header.kind,
                     optimization: request.optimization,
+                    optimization_rankings,
                     parameters: front_end
                         .parameters
                         .iter()
@@ -57,7 +67,7 @@ impl Compiler {
                     } else {
                         Purity::Pure
                     },
-                    plan: ExecutablePlan::deferred(),
+                    plan: ExecutablePlan::deferred(module_rank),
                     diagnostics: DiagnosticBag::default(),
                     dependencies: collect_dependencies(&request),
                     source_revision: request.source.origin.revision,

@@ -79,6 +79,10 @@ Mode-specific guidance:
 - `IOpt`: optimize for stable identities and fast rebuilds.
 - `SOpt`: spend more effort to produce a leaner execution plan.
 
+The compiler should also assign an optimization rank to each compiled body.
+Ranks capture how far lowering may proceed for that body, from baseline cleanup
+through sealed ownership, demand, and materialization-aware lowering.
+
 Sealed `SOpt` should also run:
 
 - last-use analysis to classify aggregate uses as borrow or consume;
@@ -113,6 +117,7 @@ A compiled script artifact should include:
 - parameter list;
 - result type;
 - purity summary;
+- optimization ranks for the module body and declared functions;
 - executable plan;
 - diagnostics;
 - dependency fingerprints needed for cache validation.

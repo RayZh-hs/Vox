@@ -30,11 +30,8 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         xopt: Option<OptimizationLevel>,
     ) -> Result<ArtifactId, RunnerError>;
 
-    fn reload_script(
-        &self,
-        artifact_id: ArtifactId,
-        source: SourceText,
-    ) -> Result<(), RunnerError>;
+    fn reload_script(&self, artifact_id: ArtifactId, source: SourceText)
+    -> Result<(), RunnerError>;
 
     fn unload_script(&self, artifact_id: ArtifactId) -> Result<bool, RunnerError>;
 
@@ -103,7 +100,11 @@ impl RuntimeRunner for EmbeddedRunner {
         artifact_id: ArtifactId,
         source: SourceText,
     ) -> Result<(), RunnerError> {
-        self.with_runtime(|runtime| runtime.reload_script(artifact_id, source).map_err(Into::into))
+        self.with_runtime(|runtime| {
+            runtime
+                .reload_script(artifact_id, source)
+                .map_err(Into::into)
+        })
     }
 
     fn unload_script(&self, artifact_id: ArtifactId) -> Result<bool, RunnerError> {
@@ -115,7 +116,11 @@ impl RuntimeRunner for EmbeddedRunner {
         artifact_id: ArtifactId,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RunnerError> {
-        self.with_runtime(|runtime| runtime.run_script(artifact_id, arguments).map_err(Into::into))
+        self.with_runtime(|runtime| {
+            runtime
+                .run_script(artifact_id, arguments)
+                .map_err(Into::into)
+        })
     }
 
     fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {

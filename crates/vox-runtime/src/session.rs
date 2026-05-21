@@ -14,7 +14,7 @@ use vox_core::{
 };
 
 use crate::{
-    ReplType, RuntimeRunner, RunnerError, TypeEnvironment, extend_manifest_symbols,
+    ReplType, RunnerError, RuntimeRunner, TypeEnvironment, extend_manifest_symbols,
     infer_environment, language_keywords,
 };
 
@@ -214,11 +214,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         Ok(value)
     }
 
-    pub fn run_script_text(
-        &mut self,
-        path: &str,
-        raw: &str,
-    ) -> Result<RuntimeValue, SessionError> {
+    pub fn run_script_text(&mut self, path: &str, raw: &str) -> Result<RuntimeValue, SessionError> {
         let parsed = parse_external_script(path, raw)?;
         let items = merge_items(&self.items, parsed.items);
         let source = self.synthetic_source(&items, None, parsed.result_source.as_deref());
@@ -232,7 +228,9 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
 
     pub fn type_of(&self, raw_expr: &str) -> Result<ReplType, SessionError> {
         if raw_expr.trim().is_empty() {
-            return Err(SessionError::Message("`:type` requires an expression".to_owned()));
+            return Err(SessionError::Message(
+                "`:type` requires an expression".to_owned(),
+            ));
         }
 
         let rewritten = rewrite_last_shorthand(raw_expr);
@@ -288,11 +286,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         self.synthetic_source(&self.items, self.hidden_last_item(), None)
     }
 
-    pub fn restore_snapshot_source(
-        &mut self,
-        label: &str,
-        text: &str,
-    ) -> Result<(), SessionError> {
+    pub fn restore_snapshot_source(&mut self, label: &str, text: &str) -> Result<(), SessionError> {
         let front_end = analyze_source(&SourceText::new(label, 1, text))
             .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
 
@@ -310,10 +304,10 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         let (hidden_last, items): (Vec<_>, Vec<_>) =
             restored.into_iter().partition(StoredItem::is_hidden_last);
         self.items = items;
-        self.hidden_last = hidden_last.into_iter().next().map(|item| RetainedLastValue {
-            item,
-            value: None,
-        });
+        self.hidden_last = hidden_last
+            .into_iter()
+            .next()
+            .map(|item| RetainedLastValue { item, value: None });
         Ok(())
     }
 
@@ -356,8 +350,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         &self,
         unit: &CompilationUnit,
     ) -> Result<TypeEnvironment, SessionError> {
-        infer_environment(unit, &self.runner.package_manifests()?)
-            .map_err(SessionError::Message)
+        infer_environment(unit, &self.runner.package_manifests()?).map_err(SessionError::Message)
     }
 
     fn synthetic_source(

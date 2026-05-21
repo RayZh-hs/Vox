@@ -20,8 +20,8 @@ use vox_core::{
 };
 
 use crate::{
-    GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary, RealizationKey,
-    RealizedFunctionHandleSummary, ReplType, Runtime,
+    GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary,
+    RealizationKey, RealizedFunctionHandleSummary, ReplType, Runtime,
 };
 
 pub struct Interpreter<'a> {
@@ -31,7 +31,10 @@ pub struct Interpreter<'a> {
 
 impl<'a> Interpreter<'a> {
     pub fn new(runtime: &'a mut Runtime, artifact_id: ArtifactId) -> Self {
-        Self { runtime, artifact_id }
+        Self {
+            runtime,
+            artifact_id,
+        }
     }
 
     pub fn run_script(
@@ -1083,7 +1086,11 @@ enum FunctionValue {
 }
 
 impl FunctionValue {
-    fn call(&self, runtime: &mut Runtime, arguments: Vec<CallArgument>) -> Result<Value, EvalError> {
+    fn call(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
         match self {
             Self::User(function) => function.call(runtime, arguments),
             Self::Generic(function) => function.call(runtime, arguments),
@@ -1093,7 +1100,11 @@ impl FunctionValue {
     fn runtime_type(&self) -> ReplType {
         match self {
             Self::User(function) => ReplType::Function {
-                parameters: function.parameters.iter().map(|parameter| parameter.ty.clone()).collect(),
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect(),
                 result: Box::new(function.return_type()),
             },
             Self::Generic(function) => ReplType::GenericFunction {
@@ -1105,13 +1116,14 @@ impl FunctionValue {
                         bound: parameter.bound.clone(),
                     })
                     .collect(),
-                parameters: function.parameters.iter().map(|parameter| parameter.ty.clone()).collect(),
-                result: Box::new(
-                    function
-                        .return_type
-                        .clone()
-                        .unwrap_or_else(|| ReplType::Unknown(format!("{} return type", function.name))),
-                ),
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect(),
+                result: Box::new(function.return_type.clone().unwrap_or_else(|| {
+                    ReplType::Unknown(format!("{} return type", function.name))
+                })),
             },
         }
     }
@@ -1127,7 +1139,11 @@ struct UserFunction {
 }
 
 impl UserFunction {
-    fn call(&self, runtime: &mut Runtime, arguments: Vec<CallArgument>) -> Result<Value, EvalError> {
+    fn call(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
         let mut assigned = assign_arguments(
             self.name.as_deref().unwrap_or("<lambda>"),
             &self.parameters,
@@ -1188,7 +1204,11 @@ struct GenericFunction {
 }
 
 impl GenericFunction {
-    fn call(&self, runtime: &mut Runtime, arguments: Vec<CallArgument>) -> Result<Value, EvalError> {
+    fn call(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
         let mut assigned = assign_arguments(&self.name, &self.parameters, arguments)?;
         let mut substitutions = BTreeMap::new();
         let mut context = EvalContext::new(runtime, self.module.clone());
@@ -1198,8 +1218,7 @@ impl GenericFunction {
                 let Some(default) = &parameter.default else {
                     return Err(EvalError::Message(format!(
                         "missing required parameter `{}` in function `{}`",
-                        parameter.name,
-                        self.name
+                        parameter.name, self.name
                     )));
                 };
                 let value = context.eval_expr(default)?;
@@ -1279,10 +1298,7 @@ struct CallableParameter {
 }
 
 impl CallableParameter {
-    fn from_parameter(
-        parameter: Parameter,
-        generic_parameters: &BTreeMap<String, String>,
-    ) -> Self {
+    fn from_parameter(parameter: Parameter, generic_parameters: &BTreeMap<String, String>) -> Self {
         Self {
             name: parameter.name,
             ty: runtime_type_from_syntax(&parameter.ty, generic_parameters),
@@ -1612,9 +1628,10 @@ fn runtime_type_from_syntax(
                 .collect(),
             result: Box::new(runtime_type_from_syntax(result, generic_parameters)),
         },
-        TypeKind::Nullable(inner) => {
-            ReplType::Nullable(Box::new(runtime_type_from_syntax(inner, generic_parameters)))
-        }
+        TypeKind::Nullable(inner) => ReplType::Nullable(Box::new(runtime_type_from_syntax(
+            inner,
+            generic_parameters,
+        ))),
         TypeKind::Named { name, arguments } => {
             let raw = name.to_source_string();
             match raw.as_str() {
@@ -1623,10 +1640,9 @@ fn runtime_type_from_syntax(
                 "Bool" => ReplType::Bool,
                 "String" => ReplType::String,
                 "Unit" => ReplType::Unit,
-                "List" if arguments.len() == 1 => ReplType::List(Box::new(runtime_type_from_syntax(
-                    &arguments[0],
-                    generic_parameters,
-                ))),
+                "List" if arguments.len() == 1 => ReplType::List(Box::new(
+                    runtime_type_from_syntax(&arguments[0], generic_parameters),
+                )),
                 _ if arguments.is_empty() => generic_parameters
                     .get(&raw)
                     .map(|bound| ReplType::TypeParameter {
@@ -1783,7 +1799,12 @@ fn infer_runtime_type_parameter(
             for (expected, actual) in expected_parameters.iter().zip(actual_parameters.iter()) {
                 infer_runtime_type_parameter(expected, actual, substitutions, function_name)?;
             }
-            infer_runtime_type_parameter(expected_result, actual_result, substitutions, function_name)
+            infer_runtime_type_parameter(
+                expected_result,
+                actual_result,
+                substitutions,
+                function_name,
+            )
         }
         _ => Ok(()),
     }
@@ -1837,7 +1858,9 @@ fn realized_handle_summary(
         name: name.to_owned(),
         parameters: parameters
             .iter()
-            .map(|parameter| render_runtime_type(&substitute_runtime_type(&parameter.ty, substitutions)))
+            .map(|parameter| {
+                render_runtime_type(&substitute_runtime_type(&parameter.ty, substitutions))
+            })
             .collect(),
         return_type: return_type
             .as_ref()
@@ -1848,7 +1871,9 @@ fn realized_handle_summary(
 
 fn substitute_runtime_type(ty: &ReplType, substitutions: &BTreeMap<String, ReplType>) -> ReplType {
     match ty {
-        ReplType::List(item) => ReplType::List(Box::new(substitute_runtime_type(item, substitutions))),
+        ReplType::List(item) => {
+            ReplType::List(Box::new(substitute_runtime_type(item, substitutions)))
+        }
         ReplType::Tuple(items) => ReplType::Tuple(
             items
                 .iter()

@@ -1,4 +1,5 @@
 pub mod front_end;
+mod optimization;
 mod pipeline;
 mod treewalk;
 

@@ -1,5 +1,5 @@
-mod artifact_store;
 mod analysis;
+mod artifact_store;
 mod handles;
 mod interpreter;
 mod runner;
@@ -16,12 +16,12 @@ use vox_core::{
     value::{HandleSummary, RuntimeValue},
 };
 
-pub use artifact_store::ArtifactStore;
 pub use analysis::{
     BindingSummary, CallableParameterSummary, FunctionSummary, GenericParameterSummary,
     RecordFieldType, ReplType, TypeEnvironment, extend_manifest_symbols, infer_environment,
     language_keywords,
 };
+pub use artifact_store::ArtifactStore;
 pub use handles::{
     GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary, HandleStore,
     RealizationKey, RealizedFunctionHandleSummary,
@@ -141,7 +141,9 @@ impl Runtime {
         artifact.id = artifact_id;
         let generic_signatures_changed = previous_artifact.module != artifact.module
             || previous_artifact.optimization != artifact.optimization
-            || previous_treewalk.as_ref().map(|treewalk| &treewalk.functions)
+            || previous_treewalk
+                .as_ref()
+                .map(|treewalk| &treewalk.functions)
                 != result.treewalk.as_ref().map(|treewalk| &treewalk.functions);
         self.artifacts.insert(artifact, result.treewalk);
         if generic_signatures_changed {
@@ -275,9 +277,7 @@ impl Runtime {
         }
 
         let realized_handle = self.handles.allocate_realized_function(realized_signature);
-        cached
-            .realized
-            .insert(realization.clone(), realized_handle);
+        cached.realized.insert(realization.clone(), realized_handle);
         if let Some(folder_handle) = cached.handle {
             self.handles.update_generic_function_realization(
                 folder_handle,

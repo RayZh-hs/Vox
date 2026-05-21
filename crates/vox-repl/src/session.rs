@@ -131,10 +131,9 @@ impl ReplSession {
                     "dropped interactive item(s) matching `{}`",
                     name.trim()
                 )),
-                Ok(false) => ReplOutput::error(format!(
-                    "no interactive item matched `{}`",
-                    name.trim()
-                )),
+                Ok(false) => {
+                    ReplOutput::error(format!("no interactive item matched `{}`", name.trim()))
+                }
                 Err(error) => ReplOutput::error(error.to_string()),
             },
             ReplCommand::XOpt(mode) => {
@@ -143,9 +142,7 @@ impl ReplSession {
                     "IOpt" => OptimizationLevel::IOpt,
                     "SOpt" => OptimizationLevel::SOpt,
                     _ => {
-                        return ReplOutput::error(format!(
-                            "unknown optimization mode `{mode}`"
-                        ));
+                        return ReplOutput::error(format!("unknown optimization mode `{mode}`"));
                     }
                 };
                 match self.runtime.set_default_xopt(xopt) {
@@ -327,7 +324,12 @@ fn render_environment(environment: &TypeEnvironment) -> String {
     if environment.imports.is_empty() {
         lines.push("  <none>".to_owned());
     } else {
-        lines.extend(environment.imports.iter().map(|import| format!("  {import}")));
+        lines.extend(
+            environment
+                .imports
+                .iter()
+                .map(|import| format!("  {import}")),
+        );
     }
 
     lines.push("Bindings:".to_owned());

@@ -1178,7 +1178,9 @@ fn addition_result(left: &ReplType, right: &ReplType) -> Option<ReplType> {
                 name: right_name,
                 bound: Some(right_bound),
             },
-        ) if left_name == right_name && left_bound == right_bound && bound_allows_numeric(left_bound) =>
+        ) if left_name == right_name
+            && left_bound == right_bound
+            && bound_allows_numeric(left_bound) =>
         {
             Some(left.clone())
         }
@@ -1201,7 +1203,9 @@ fn numeric_result(left: &ReplType, right: &ReplType) -> Result<ReplType, String>
                 name: right_name,
                 bound: Some(right_bound),
             },
-        ) if left_name == right_name && left_bound == right_bound && bound_allows_numeric(left_bound) =>
+        ) if left_name == right_name
+            && left_bound == right_bound
+            && bound_allows_numeric(left_bound) =>
         {
             Ok(left.clone())
         }
@@ -1236,9 +1240,10 @@ fn from_type_syntax(
                 "Bool" => ReplType::Bool,
                 "String" => ReplType::String,
                 "Unit" => ReplType::Unit,
-                "List" if arguments.len() == 1 => {
-                    ReplType::List(Box::new(from_type_syntax(&arguments[0], generic_parameters)))
-                }
+                "List" if arguments.len() == 1 => ReplType::List(Box::new(from_type_syntax(
+                    &arguments[0],
+                    generic_parameters,
+                ))),
                 _ if arguments.is_empty() => generic_parameters
                     .get(&raw)
                     .map(|parameter| ReplType::TypeParameter {
@@ -1448,10 +1453,7 @@ fn match_generic_parameter(
     }
 }
 
-fn substitute_repl_type(
-    ty: &ReplType,
-    substitutions: &BTreeMap<String, ReplType>,
-) -> ReplType {
+fn substitute_repl_type(ty: &ReplType, substitutions: &BTreeMap<String, ReplType>) -> ReplType {
     match ty {
         ReplType::List(item) => ReplType::List(Box::new(substitute_repl_type(item, substitutions))),
         ReplType::Tuple(items) => ReplType::Tuple(
