@@ -19,7 +19,7 @@ use vox_runtime::{EmbeddedRunner, InteractiveSession, RuntimeRunner};
 let runner = EmbeddedRunner::default();
 runner.mount_library(manifest)?;
 
-let mut session = InteractiveSession::new(runner.clone());
+let mut session = InteractiveSession::new(runner.clone())?;
 session.evaluate_submission("import geometry;")?;
 ```
 

@@ -46,7 +46,8 @@ impl Default for ReplSession<EmbeddedRunner> {
 impl<R: RuntimeRunner> ReplSession<R> {
     pub fn with_runner(runner: R) -> Self {
         Self {
-            runtime: InteractiveSession::new(runner),
+            runtime: InteractiveSession::new(runner)
+                .expect("interactive session should open"),
         }
     }
 
@@ -231,8 +232,11 @@ impl<R: RuntimeRunner> ReplSession<R> {
         }
 
         let path = root.join(format!("{trimmed}.vox"));
-        match fs::write(&path, self.runtime.snapshot_source()) {
-            Ok(()) => ReplOutput::message(format!("saved snapshot `{trimmed}`")),
+        match self.runtime.snapshot_source() {
+            Ok(snapshot) => match fs::write(&path, snapshot) {
+                Ok(()) => ReplOutput::message(format!("saved snapshot `{trimmed}`")),
+                Err(error) => ReplOutput::error(error.to_string()),
+            },
             Err(error) => ReplOutput::error(error.to_string()),
         }
     }

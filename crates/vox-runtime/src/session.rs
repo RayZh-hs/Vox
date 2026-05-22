@@ -7,7 +7,7 @@ use vox_compiler::front_end::{
 };
 use vox_core::{
     host::PackageManifest,
-    ids::{ArtifactId, HandleId},
+    ids::{ArtifactId, HandleId, SessionId},
     opt::OptimizationLevel,
     source::{ModuleKind, SourceText},
     value::{HandleSummary, RuntimeValue},
@@ -30,9 +30,18 @@ pub struct SessionCompletion {
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error(transparent)]
-    Runner(#[from] RunnerError),
+    Runner(RunnerError),
     #[error("{0}")]
     Message(String),
+}
+
+impl From<RunnerError> for SessionError {
+    fn from(error: RunnerError) -> Self {
+        match error {
+            RunnerError::Session(message) => Self::Message(message),
+            other => Self::Runner(other),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,16 +111,17 @@ struct RetainedLastValue {
 }
 
 #[derive(Debug, Clone)]
-pub struct InteractiveSession<R: RuntimeRunner> {
+pub(crate) struct SessionState<R: RuntimeRunner> {
     runner: R,
     items: Vec<StoredItem>,
     binding_handles: BTreeMap<String, HandleId>,
     hidden_last: Option<RetainedLastValue>,
     next_source_revision: u64,
     active_artifact: Option<ArtifactId>,
+    default_xopt: OptimizationLevel,
 }
 
-impl<R: RuntimeRunner> InteractiveSession<R> {
+impl<R: RuntimeRunner> SessionState<R> {
     pub fn new(runner: R) -> Self {
         Self {
             runner,
@@ -120,49 +130,8 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             hidden_last: None,
             next_source_revision: 0,
             active_artifact: None,
+            default_xopt: OptimizationLevel::IOpt,
         }
-    }
-
-    pub fn completion(&self) -> Result<SessionCompletion, SessionError> {
-        let mut completion = SessionCompletion {
-            handles: self
-                .runner
-                .live_handles()?
-                .into_iter()
-                .map(|handle| handle.0.to_string())
-                .collect(),
-            symbols: language_keywords(),
-        };
-
-        completion.symbols.push("$".to_owned());
-        for item in &self.items {
-            completion.symbols.push(item.display_name().to_owned());
-        }
-
-        for manifest in self.runner.package_manifests()? {
-            extend_manifest_symbols(&mut completion.symbols, &manifest);
-        }
-
-        if let Ok(environment) = self.current_environment(true) {
-            completion.symbols.extend(environment.imports);
-            completion.symbols.extend(
-                environment
-                    .bindings
-                    .into_iter()
-                    .filter(|binding| binding.name != LAST_VALUE_NAME)
-                    .map(|binding| binding.name),
-            );
-            completion.symbols.extend(
-                environment
-                    .functions
-                    .into_iter()
-                    .map(|function| function.name),
-            );
-        }
-
-        completion.symbols.sort();
-        completion.symbols.dedup();
-        Ok(completion)
     }
 
     pub fn evaluate_submission(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
@@ -224,28 +193,6 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         self.validate_environment(&front_end.syntax)?;
 
         self.evaluate_script_source(&source)
-    }
-
-    pub fn type_of(&self, raw_expr: &str) -> Result<ReplType, SessionError> {
-        if raw_expr.trim().is_empty() {
-            return Err(SessionError::Message(
-                "`:type` requires an expression".to_owned(),
-            ));
-        }
-
-        let rewritten = rewrite_last_shorthand(raw_expr);
-        let source = self.synthetic_source(
-            &self.items,
-            rewritten
-                .uses_last_value
-                .then_some(self.hidden_last_item())
-                .flatten(),
-            Some(&rewritten.source),
-        );
-        let front_end = analyze_source(&SourceText::new("<repl-type>", 1, &source))
-            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
-        let environment = self.validate_environment(&front_end.syntax)?;
-        Ok(environment.result.unwrap_or(ReplType::Unit))
     }
 
     pub fn drop_item(&mut self, raw: &str) -> Result<bool, SessionError> {
@@ -311,39 +258,10 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         Ok(())
     }
 
-    pub fn current_environment(
-        &self,
-        include_hidden_last: bool,
-    ) -> Result<TypeEnvironment, SessionError> {
-        let source = self.synthetic_source(
-            &self.items,
-            if include_hidden_last {
-                self.hidden_last_item()
-            } else {
-                None
-            },
-            None,
-        );
-        let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
-            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
-        self.validate_environment(&front_end.syntax)
-    }
-
-    pub fn set_default_xopt(&self, xopt: OptimizationLevel) -> Result<(), SessionError> {
-        self.runner.set_default_xopt(xopt)?;
+    pub fn set_default_xopt(&mut self, xopt: OptimizationLevel) -> Result<(), SessionError> {
+        self.default_xopt = xopt;
+        self.unload_active_artifact()?;
         Ok(())
-    }
-
-    pub fn live_handles(&self) -> Result<Vec<HandleId>, SessionError> {
-        Ok(self.runner.live_handles()?)
-    }
-
-    pub fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, SessionError> {
-        Ok(self.runner.describe_handle(handle)?)
-    }
-
-    pub fn package_manifests(&self) -> Result<Vec<PackageManifest>, SessionError> {
-        Ok(self.runner.package_manifests()?)
     }
 
     fn validate_environment(
@@ -359,24 +277,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         hidden_last: Option<&StoredItem>,
         result: Option<&str>,
     ) -> String {
-        let mut source = format!("script {REPL_MODULE};\n");
-        for item in items {
-            source.push_str(&item.source);
-            if !item.source.ends_with('\n') {
-                source.push('\n');
-            }
-        }
-        if let Some(item) = hidden_last {
-            source.push_str(&item.source);
-            if !item.source.ends_with('\n') {
-                source.push('\n');
-            }
-        }
-        if let Some(result) = result {
-            source.push_str(result);
-            source.push('\n');
-        }
-        source
+        render_session_source(items, hidden_last, result)
     }
 
     fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, SessionError> {
@@ -387,7 +288,9 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             self.runner.reload_script(artifact_id, compiled)?;
             artifact_id
         } else {
-            let artifact_id = self.runner.load_script(compiled, None)?;
+            let artifact_id = self
+                .runner
+                .load_script(compiled, Some(self.default_xopt))?;
             self.active_artifact = Some(artifact_id);
             artifact_id
         };
@@ -502,6 +405,227 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct InteractiveSession<R: RuntimeRunner> {
+    runner: R,
+    session_id: SessionId,
+}
+
+impl<R: RuntimeRunner> InteractiveSession<R> {
+    pub fn new(runner: R) -> Result<Self, SessionError> {
+        Self::open(runner, None)
+    }
+
+    pub fn named(runner: R, name: impl AsRef<str>) -> Result<Self, SessionError> {
+        Self::open(runner, Some(name.as_ref()))
+    }
+
+    fn open(runner: R, name: Option<&str>) -> Result<Self, SessionError> {
+        let session_id = runner.open_session(name).map_err(SessionError::from)?;
+        Ok(Self { runner, session_id })
+    }
+
+    pub fn completion(&self) -> Result<SessionCompletion, SessionError> {
+        completion_from_snapshot(&self.runner, &self.snapshot_source()?)
+    }
+
+    pub fn evaluate_submission(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
+        self.runner
+            .evaluate_session_submission(self.session_id, raw)
+            .map_err(SessionError::from)
+    }
+
+    pub fn run_script_text(&mut self, path: &str, raw: &str) -> Result<RuntimeValue, SessionError> {
+        self.runner
+            .run_session_script_text(self.session_id, path, raw)
+            .map_err(SessionError::from)
+    }
+
+    pub fn type_of(&self, raw_expr: &str) -> Result<ReplType, SessionError> {
+        if raw_expr.trim().is_empty() {
+            return Err(SessionError::Message(
+                "`:type` requires an expression".to_owned(),
+            ));
+        }
+
+        let rewritten = rewrite_last_shorthand(raw_expr);
+        let snapshot = self.snapshot_source()?;
+        let items = snapshot_items(&snapshot, true)?;
+        let source = render_session_source(
+            &items,
+            rewritten
+                .uses_last_value
+                .then(|| find_hidden_last(&items))
+                .flatten(),
+            Some(&rewritten.source),
+        );
+        let front_end = analyze_source(&SourceText::new("<repl-type>", 1, &source))
+            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        let environment =
+            infer_environment(&front_end.syntax, &self.runner.package_manifests()?)
+                .map_err(SessionError::Message)?;
+        Ok(environment.result.unwrap_or(ReplType::Unit))
+    }
+
+    pub fn drop_item(&mut self, raw: &str) -> Result<bool, SessionError> {
+        self.runner
+            .drop_session_item(self.session_id, raw)
+            .map_err(SessionError::from)
+    }
+
+    pub fn reset(&mut self) -> Result<(), SessionError> {
+        self.runner
+            .reset_session(self.session_id)
+            .map_err(SessionError::from)
+    }
+
+    pub fn snapshot_source(&self) -> Result<String, SessionError> {
+        self.runner
+            .snapshot_session_source(self.session_id)
+            .map_err(SessionError::from)
+    }
+
+    pub fn restore_snapshot_source(&mut self, label: &str, text: &str) -> Result<(), SessionError> {
+        self.runner
+            .restore_session_snapshot(self.session_id, label, text)
+            .map_err(SessionError::from)
+    }
+
+    pub fn current_environment(
+        &self,
+        include_hidden_last: bool,
+    ) -> Result<TypeEnvironment, SessionError> {
+        environment_from_snapshot(&self.runner, &self.snapshot_source()?, include_hidden_last)
+    }
+
+    pub fn set_default_xopt(&mut self, xopt: OptimizationLevel) -> Result<(), SessionError> {
+        self.runner
+            .set_session_default_xopt(self.session_id, xopt)
+            .map_err(SessionError::from)
+    }
+
+    pub fn live_handles(&self) -> Result<Vec<HandleId>, SessionError> {
+        Ok(self.runner.live_handles()?)
+    }
+
+    pub fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, SessionError> {
+        Ok(self.runner.describe_handle(handle)?)
+    }
+
+    pub fn package_manifests(&self) -> Result<Vec<PackageManifest>, SessionError> {
+        Ok(self.runner.package_manifests()?)
+    }
+}
+
+fn completion_from_snapshot<R: RuntimeRunner>(
+    runner: &R,
+    snapshot: &str,
+) -> Result<SessionCompletion, SessionError> {
+    let mut completion = SessionCompletion {
+        handles: runner
+            .live_handles()?
+            .into_iter()
+            .map(|handle| handle.0.to_string())
+            .collect(),
+        symbols: language_keywords(),
+    };
+
+    completion.symbols.push("$".to_owned());
+    let items = snapshot_items(snapshot, true)?;
+    for item in &items {
+        if !item.is_hidden_last() {
+            completion.symbols.push(item.display_name().to_owned());
+        }
+    }
+
+    for manifest in runner.package_manifests()? {
+        extend_manifest_symbols(&mut completion.symbols, &manifest);
+    }
+
+    if let Ok(environment) = environment_from_snapshot(runner, snapshot, true) {
+        completion.symbols.extend(environment.imports);
+        completion.symbols.extend(
+            environment
+                .bindings
+                .into_iter()
+                .filter(|binding| binding.name != LAST_VALUE_NAME)
+                .map(|binding| binding.name),
+        );
+        completion.symbols.extend(
+            environment
+                .functions
+                .into_iter()
+                .map(|function| function.name),
+        );
+    }
+
+    completion.symbols.sort();
+    completion.symbols.dedup();
+    Ok(completion)
+}
+
+fn environment_from_snapshot<R: RuntimeRunner>(
+    runner: &R,
+    snapshot: &str,
+    include_hidden_last: bool,
+) -> Result<TypeEnvironment, SessionError> {
+    let items = snapshot_items(snapshot, include_hidden_last)?;
+    let source = render_session_source(
+        &items,
+        if include_hidden_last {
+            find_hidden_last(&items)
+        } else {
+            None
+        },
+        None,
+    );
+    let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
+        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+    infer_environment(&front_end.syntax, &runner.package_manifests()?).map_err(SessionError::Message)
+}
+
+fn snapshot_items(snapshot: &str, include_hidden_last: bool) -> Result<Vec<StoredItem>, SessionError> {
+    let front_end = analyze_source(&SourceText::new("<repl-snapshot>", 1, snapshot))
+        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+    let mut items = normalize_items(rebuild_items_from_unit(snapshot, &front_end.syntax));
+    if !include_hidden_last {
+        items.retain(|item| !item.is_hidden_last());
+    }
+    Ok(items)
+}
+
+fn find_hidden_last(items: &[StoredItem]) -> Option<&StoredItem> {
+    items.iter().find(|item| item.is_hidden_last())
+}
+
+fn render_session_source(
+    items: &[StoredItem],
+    hidden_last: Option<&StoredItem>,
+    result: Option<&str>,
+) -> String {
+    let mut source = format!("script {REPL_MODULE};\n");
+    for item in items {
+        if item.is_hidden_last() {
+            continue;
+        }
+        source.push_str(&item.source);
+        if !item.source.ends_with('\n') {
+            source.push('\n');
+        }
+    }
+    if let Some(item) = hidden_last {
+        source.push_str(&item.source);
+        if !item.source.ends_with('\n') {
+            source.push('\n');
+        }
+    }
+    if let Some(result) = result {
+        source.push_str(result);
+        source.push('\n');
+    }
+    source
 }
 
 fn parse_submission(raw: &str) -> Result<ParsedSubmission, SessionError> {

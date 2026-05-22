@@ -33,16 +33,12 @@ other clients.
   lifetime of a shared interactive session;
 - concurrency: the client may pipeline requests and match responses by
   `request_id`;
-- isolation: script ids and mutable interactive bindings should ultimately be
-  scoped to a runtime session rather than ambiently shared across all clients;
+- isolation: interactive bindings are scoped to a runtime session rather than
+  ambiently shared across all clients;
 - sharing: library mounts, caches, `Econ` state, and handle storage are owned
   by the runtime and may be shared across connections;
 - disconnect: dropping the connection should release connection-owned
   references, but should not destroy a durable shared session by itself.
-
-Later protocol milestones should add explicit session lifecycle operations so
-shared interactive state is attached deliberately instead of being inferred from
-the socket.
 
 The first frame on every connection must be `HELLO`.
 
@@ -109,6 +105,14 @@ All other bits are reserved and must be sent as `0`.
 
 - `0x01`: `HELLO`
 - `0x02`: `PING`
+- `0x03`: `OPEN_SESSION`
+- `0x04`: `EVALUATE_SESSION`
+- `0x05`: `DROP_SESSION_ITEM`
+- `0x06`: `RESET_SESSION`
+- `0x07`: `SNAPSHOT_SESSION`
+- `0x08`: `RESTORE_SESSION`
+- `0x09`: `RUN_SESSION_SCRIPT`
+- `0x0a`: `SET_SESSION_XOPT`
 - `0x10`: `MOUNT_LIBRARY`
 - `0x11`: `UNMOUNT_LIBRARY`
 - `0x20`: `LOAD_SCRIPT`
@@ -244,6 +248,124 @@ Success response payload:
 ```text
 u64 runtime_uptime_ms
 ```
+
+### `OPEN_SESSION`
+
+`target_id` must be `0`.
+
+Request payload:
+
+```text
+u8 session_kind      // 0=anonymous durable session, 1=named durable session
+u8 reserved[3]
+string session_name  // present only when session_kind = 1
+```
+
+Success response payload:
+
+```text
+u32 session_id
+```
+
+Rules:
+
+- opening an anonymous session always creates a fresh runtime-managed session;
+- opening a named session reattaches to the existing session when the name is
+  already present, or creates it otherwise;
+- session ids are runtime-issued and may be reused on later requests across
+  multiple connections attached to the same runtime instance.
+
+### `EVALUATE_SESSION`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+string submission
+```
+
+Success response payload:
+
+- empty when the submission only changes session state and yields no result;
+- otherwise the same result encoding used by `RUN_SCRIPT`.
+
+### `DROP_SESSION_ITEM`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+string name
+```
+
+Success response payload:
+
+```text
+u8 removed           // 0=false, 1=true
+```
+
+### `RESET_SESSION`
+
+`target_id` is `session_id`.
+
+Request payload: empty.
+
+Success response payload: empty.
+
+### `SNAPSHOT_SESSION`
+
+`target_id` is `session_id`.
+
+Request payload: empty.
+
+Success response payload:
+
+```text
+string snapshot_source
+```
+
+### `RESTORE_SESSION`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+string label
+string snapshot_source
+```
+
+Success response payload: empty.
+
+### `RUN_SESSION_SCRIPT`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+string logical_path
+string source_text
+```
+
+Success response payload:
+
+- the same result encoding used by `RUN_SCRIPT`.
+
+### `SET_SESSION_XOPT`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+u8 default_xopt      // 0=NOpt, 1=IOpt, 2=SOpt
+u8 reserved[3]
+```
+
+Success response payload: empty.
 
 ### `MOUNT_LIBRARY`
 
@@ -506,4 +628,5 @@ Clients must ignore unknown event opcodes.
 - do not use JSON, text keys, or per-message schema negotiation;
 - prefer integer ids and handle passing over value copying;
 - allow request pipelining on one connection;
-- keep script ownership connection-local so disconnect cleanup is constant-time.
+- keep script artifacts connection-local while keeping durable interactive state
+  session-local.

@@ -9,7 +9,7 @@ use std::{
 
 use thiserror::Error;
 use vox_core::{
-    ids::{ArtifactId, HandleId, LibraryId},
+    ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
     source::SourceText,
     value::{InlineValue, RuntimeValue},
@@ -231,6 +231,14 @@ impl RuntimeConnection {
 
         let response = match opcode {
             Opcode::Ping => self.handle_ping(frame.header.request_id),
+            Opcode::OpenSession => self.handle_open_session(frame),
+            Opcode::EvaluateSession => self.handle_evaluate_session(frame),
+            Opcode::DropSessionItem => self.handle_drop_session_item(frame),
+            Opcode::ResetSession => self.handle_reset_session(frame),
+            Opcode::SnapshotSession => self.handle_snapshot_session(frame),
+            Opcode::RestoreSession => self.handle_restore_session(frame),
+            Opcode::RunSessionScript => self.handle_run_session_script(frame),
+            Opcode::SetSessionXOpt => self.handle_set_session_xopt(frame),
             Opcode::MountLibrary => self.handle_mount_library(frame),
             Opcode::UnmountLibrary => Err(WireFailure::recoverable(
                 ErrorCode::UnsupportedOpcode,
@@ -333,6 +341,196 @@ impl RuntimeConnection {
             0,
             0,
             payload.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_open_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let mut payload = PayloadReader::new(&frame.payload);
+        let session_kind = payload.read_u8().map_err(WireFailure::bad_argument)?;
+        self.read_reserved(&mut payload, 3)?;
+        let name = match session_kind {
+            0 => None,
+            1 => Some(payload.read_string().map_err(WireFailure::bad_argument)?),
+            _ => {
+                return Err(WireFailure::recoverable(
+                    ErrorCode::BadArgument,
+                    "invalid interactive session kind",
+                ));
+            }
+        };
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        let session_id = self
+            .runner
+            .open_session(name.as_deref())
+            .map_err(WireFailure::from_runner)?;
+        let session_wire_id = u32::try_from(session_id.0).map_err(|_| {
+            WireFailure::recoverable(
+                ErrorCode::RuntimeFailed,
+                "session id exceeds the 32-bit protocol range",
+            )
+        })?;
+
+        let mut response = PayloadWriter::new();
+        response.write_u32(session_wire_id);
+        success_frame(
+            self.protocol_version(),
+            Opcode::OpenSession,
+            frame.header.request_id,
+            session_wire_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_evaluate_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let raw = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        let result = self
+            .runner
+            .evaluate_session_submission(session_id, &raw)
+            .map_err(WireFailure::from_runner)?;
+        match result {
+            Some(value) => self.encode_value_result(
+                Opcode::EvaluateSession,
+                frame.header.request_id,
+                frame.header.target_id,
+                value,
+            ),
+            None => success_frame(
+                self.protocol_version(),
+                Opcode::EvaluateSession,
+                frame.header.request_id,
+                frame.header.target_id,
+                0,
+                Vec::new(),
+            )
+            .map_err(WireFailure::bad_argument),
+        }
+    }
+
+    fn handle_drop_session_item(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let raw = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        let removed = self
+            .runner
+            .drop_session_item(session_id, &raw)
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        response.write_u8(u8::from(removed));
+        success_frame(
+            self.protocol_version(),
+            Opcode::DropSessionItem,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_reset_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        self.runner
+            .reset_session(session_id)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::ResetSession,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_snapshot_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let snapshot = self
+            .runner
+            .snapshot_session_source(session_id)
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        response
+            .write_string(&snapshot)
+            .map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::SnapshotSession,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_restore_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let label = payload.read_string().map_err(WireFailure::bad_argument)?;
+        let text = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        self.runner
+            .restore_session_snapshot(session_id, &label, &text)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::RestoreSession,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_run_session_script(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let path = payload.read_string().map_err(WireFailure::bad_argument)?;
+        let raw = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        let value = self
+            .runner
+            .run_session_script_text(session_id, &path, &raw)
+            .map_err(WireFailure::from_runner)?;
+        self.encode_value_result(
+            Opcode::RunSessionScript,
+            frame.header.request_id,
+            frame.header.target_id,
+            value,
+        )
+    }
+
+    fn handle_set_session_xopt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let xopt = decode_optimization(&mut payload).map_err(WireFailure::bad_argument)?;
+        self.read_reserved(&mut payload, 3)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        self.runner
+            .set_session_default_xopt(session_id, xopt)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::SetSessionXOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
         )
         .map_err(WireFailure::bad_argument)
     }
@@ -512,7 +710,12 @@ impl RuntimeConnection {
             .runner
             .run_script(artifact_id, &arguments)
             .map_err(WireFailure::from_runner)?;
-        self.encode_run_result(frame.header.request_id, frame.header.target_id, result)
+        self.encode_value_result(
+            Opcode::RunScript,
+            frame.header.request_id,
+            frame.header.target_id,
+            result,
+        )
     }
 
     fn handle_retain_handle(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
@@ -754,8 +957,9 @@ impl RuntimeConnection {
         }
     }
 
-    fn encode_run_result(
+    fn encode_value_result(
         &mut self,
+        opcode: Opcode,
         request_id: u32,
         target_id: u32,
         value: RuntimeValue,
@@ -767,7 +971,7 @@ impl RuntimeConnection {
                     .map_err(WireFailure::bad_argument)?;
                 success_frame(
                     self.protocol_version(),
-                    Opcode::RunScript,
+                    opcode,
                     request_id,
                     target_id,
                     FLAG_INLINE_VALUE,
@@ -781,7 +985,7 @@ impl RuntimeConnection {
                 payload.write_u32(local_handle);
                 success_frame(
                     self.protocol_version(),
-                    Opcode::RunScript,
+                    opcode,
                     request_id,
                     target_id,
                     FLAG_HANDLE_RESULT,
@@ -832,6 +1036,16 @@ impl RuntimeConnection {
             .get(&local_id)
             .copied()
             .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownScript, "unknown script"))
+    }
+
+    fn resolve_session(&self, session_id: u32) -> Result<SessionId, WireFailure> {
+        if session_id == 0 {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "interactive session target_id must not be zero",
+            ));
+        }
+        Ok(SessionId(session_id as u64))
     }
 
     fn resolve_handle(&self, local_id: u32) -> Result<HandleId, WireFailure> {
@@ -907,6 +1121,107 @@ impl WireFailure {
             }
             RunnerError::Unavailable(message) => Self::fatal(ErrorCode::RuntimeFailed, message),
             RunnerError::Protocol(message) => Self::recoverable(ErrorCode::BadFrame, message),
+            RunnerError::Session(message) => Self::recoverable(ErrorCode::RuntimeFailed, message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::TcpListener,
+        sync::atomic::Ordering,
+        thread,
+        time::Instant,
+    };
+
+    use vox_core::value::{InlineValue, RuntimeValue};
+
+    use crate::{InteractiveSession, RemoteRunner, RuntimeServer};
+
+    use super::RuntimeConnection;
+
+    #[test]
+    fn remote_clients_share_named_sessions_across_connections() {
+        let (addr, server_thread) = spawn_test_server(3);
+
+        let shared_addr = addr.to_string();
+        let runner_one = RemoteRunner::connect(shared_addr.as_str()).expect("first client connects");
+        let mut first = InteractiveSession::named(runner_one, "shared")
+            .expect("shared session should open");
+        assert!(
+            first
+                .evaluate_submission("val numbers = [39, 41];")
+                .expect("first client should seed the session")
+                .is_none()
+        );
+        let closure = first
+            .evaluate_submission("() -> numbers[1] + 1")
+            .expect("first client should store a closure")
+            .expect("closure should produce a result");
+        assert!(
+            matches!(closure, RuntimeValue::Handle(_)),
+            "remote closures should cross the protocol as handles"
+        );
+        drop(first);
+
+        let runner_two = RemoteRunner::connect(shared_addr.as_str()).expect("second client connects");
+        let mut second = InteractiveSession::named(runner_two, "shared")
+            .expect("second client should attach to the same session");
+        assert_runtime_int(
+            second
+                .evaluate_submission("$()")
+                .expect("shared last value should survive reconnect")
+                .expect("closure call should return a value"),
+            42,
+        );
+        assert!(
+            second
+                .evaluate_submission("val answer = numbers[1] + 1;")
+                .expect("second client should mutate shared state")
+                .is_none()
+        );
+        drop(second);
+
+        let runner_three =
+            RemoteRunner::connect(shared_addr.as_str()).expect("third client connects");
+        let mut isolated = InteractiveSession::named(runner_three, "isolated")
+            .expect("isolated session should open");
+        let error = isolated
+            .evaluate_submission("answer")
+            .expect_err("separate sessions must not see each other's bindings");
+        assert!(
+            error.to_string().contains("answer"),
+            "unexpected isolated-session error: {error}"
+        );
+        drop(isolated);
+
+        server_thread.join().expect("test server should stop cleanly");
+    }
+
+    fn spawn_test_server(expected_connections: usize) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should expose an address");
+        let server = RuntimeServer::default();
+
+        let handle = thread::spawn(move || {
+            let started_at = Instant::now();
+            for _ in 0..expected_connections {
+                let (stream, _) = listener.accept().expect("connection should be accepted");
+                let instance_id = server.next_instance_id.fetch_add(1, Ordering::Relaxed);
+                let mut connection =
+                    RuntimeConnection::new(server.runner.clone(), instance_id, started_at);
+                connection.serve(stream).expect("connection should complete");
+            }
+        });
+
+        (addr, handle)
+    }
+
+    fn assert_runtime_int(value: RuntimeValue, expected: i64) {
+        match value {
+            RuntimeValue::Inline(InlineValue::Int(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected inline int {expected}, got {other:?}"),
         }
     }
 }

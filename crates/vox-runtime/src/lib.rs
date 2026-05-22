@@ -34,6 +34,7 @@ pub use protocol::CURRENT_PROTOCOL_VERSION;
 pub use remote::RemoteRunner;
 pub use runner::{EmbeddedRunner, RunnerError, RuntimeRunner};
 pub use server::{RuntimeServer, RuntimeServerError};
+pub(crate) use session::SessionState;
 pub use session::{InteractiveSession, SessionCompletion, SessionError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,8 +354,11 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
-    use vox_core::source::SourceText;
+    use super::{EmbeddedRunner, InteractiveSession, Runtime};
+    use vox_core::{
+        source::SourceText,
+        value::{InlineValue, RuntimeValue},
+    };
 
     #[test]
     fn loads_script_artifacts() {
@@ -364,5 +368,80 @@ mod tests {
             .load_script(source, None)
             .expect("script should load");
         assert!(runtime.artifact(artifact_id).is_some());
+    }
+
+    #[test]
+    fn named_embedded_sessions_persist_state_and_isolate_other_sessions() {
+        let runner = EmbeddedRunner::default();
+
+        let mut author = InteractiveSession::named(runner.clone(), "shared")
+            .expect("shared session should open");
+        assert!(
+            author
+                .evaluate_submission("val numbers = [40, 41, 42];")
+                .expect("binding should evaluate")
+                .is_none()
+        );
+
+        let closure = author
+            .evaluate_submission("() -> numbers[1] + 1")
+            .expect("closure should evaluate")
+            .expect("closure should produce a result");
+        assert!(
+            matches!(closure, RuntimeValue::Handle(_)),
+            "closures should remain handle-backed across the session boundary"
+        );
+
+        drop(author);
+
+        let mut collaborator = InteractiveSession::named(runner.clone(), "shared")
+            .expect("shared session should reopen");
+        assert_runtime_int(
+            collaborator
+                .evaluate_submission("$()")
+                .expect("last closure should remain available")
+                .expect("closure call should return a value"),
+            42,
+        );
+        assert_runtime_int(
+            collaborator
+                .evaluate_submission("numbers[0]")
+                .expect("binding should remain available")
+                .expect("binding lookup should return a value"),
+            40,
+        );
+        assert!(
+            collaborator
+                .evaluate_submission("val extra = numbers[2];")
+                .expect("second client should mutate the shared session")
+                .is_none()
+        );
+
+        let mut reopened = InteractiveSession::named(runner.clone(), "shared")
+            .expect("shared session should stay durable");
+        assert_runtime_int(
+            reopened
+                .evaluate_submission("extra")
+                .expect("shared mutation should persist")
+                .expect("shared mutation should return a value"),
+            42,
+        );
+
+        let mut isolated = InteractiveSession::named(runner, "isolated")
+            .expect("isolated session should open");
+        let error = isolated
+            .evaluate_submission("numbers[1]")
+            .expect_err("separate named sessions must not share bindings");
+        assert!(
+            error.to_string().contains("numbers"),
+            "unexpected isolation error: {error}"
+        );
+    }
+
+    fn assert_runtime_int(value: RuntimeValue, expected: i64) {
+        match value {
+            RuntimeValue::Inline(InlineValue::Int(actual)) => assert_eq!(actual, expected),
+            other => panic!("expected inline int {expected}, got {other:?}"),
+        }
     }
 }

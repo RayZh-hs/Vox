@@ -9,7 +9,7 @@ use std::{
 
 use vox_core::{
     host::PackageManifest,
-    ids::{ArtifactId, HandleId, LibraryId},
+    ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
     source::SourceText,
     value::{HandleSummary, RuntimeValue},
@@ -220,9 +220,145 @@ impl RemoteRunner {
             RunnerError::Protocol(format!("{subject} id {id} exceeds the 32-bit wire range"))
         })
     }
+
+    fn decode_runtime_result(&self, frame: Frame) -> Result<RuntimeValue, RunnerError> {
+        let mut response = PayloadReader::new(&frame.payload);
+        if frame.header.flags & FLAG_HANDLE_RESULT != 0 {
+            let handle_id = response.read_u32().map_err(protocol_to_runner)?;
+            response.finish().map_err(protocol_to_runner)?;
+            let handle = HandleId(handle_id as u64);
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+            state.known_handles.insert(handle);
+            Ok(RuntimeValue::Handle(handle))
+        } else if frame.header.flags & FLAG_INLINE_VALUE != 0 {
+            let value = decode_inline_value(&mut response).map_err(protocol_to_runner)?;
+            response.finish().map_err(protocol_to_runner)?;
+            Ok(RuntimeValue::Inline(value))
+        } else if frame.payload.is_empty() {
+            Err(RunnerError::Protocol(
+                "runtime returned a result frame without a value payload".to_owned(),
+            ))
+        } else {
+            Err(RunnerError::Protocol(
+                "runtime returned a malformed result payload".to_owned(),
+            ))
+        }
+    }
 }
 
 impl RuntimeRunner for RemoteRunner {
+    fn open_session(&self, name: Option<&str>) -> Result<SessionId, RunnerError> {
+        let mut payload = PayloadWriter::new();
+        match name {
+            Some(name) => {
+                payload.write_u8(1);
+                payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_string(name).map_err(protocol_to_runner)?;
+            }
+            None => {
+                payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_u8(0);
+            }
+        }
+        let frame = self.invoke(Opcode::OpenSession, 0, 0, payload.into_inner())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let session_id = response.read_u32().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(SessionId(session_id as u64))
+    }
+
+    fn evaluate_session_submission(
+        &self,
+        session: SessionId,
+        raw: &str,
+    ) -> Result<Option<RuntimeValue>, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_string(raw).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::EvaluateSession, target_id, 0, payload.into_inner())?;
+        if frame.header.flags == 0 && frame.payload.is_empty() {
+            return Ok(None);
+        }
+        self.decode_runtime_result(frame).map(Some)
+    }
+
+    fn run_session_script_text(
+        &self,
+        session: SessionId,
+        path: &str,
+        raw: &str,
+    ) -> Result<RuntimeValue, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_string(path).map_err(protocol_to_runner)?;
+        payload.write_string(raw).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::RunSessionScript, target_id, 0, payload.into_inner())?;
+        self.decode_runtime_result(frame)
+    }
+
+    fn drop_session_item(&self, session: SessionId, raw: &str) -> Result<bool, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_string(raw).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::DropSessionItem, target_id, 0, payload.into_inner())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let removed = response.read_u8().map_err(protocol_to_runner)? != 0;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(removed)
+    }
+
+    fn reset_session(&self, session: SessionId) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let _ = self.invoke(Opcode::ResetSession, target_id, 0, Vec::new())?;
+        Ok(())
+    }
+
+    fn snapshot_session_source(&self, session: SessionId) -> Result<String, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let frame = self.invoke(Opcode::SnapshotSession, target_id, 0, Vec::new())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let snapshot = response.read_string().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(snapshot)
+    }
+
+    fn restore_session_snapshot(
+        &self,
+        session: SessionId,
+        label: &str,
+        text: &str,
+    ) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_string(label).map_err(protocol_to_runner)?;
+        payload.write_string(text).map_err(protocol_to_runner)?;
+        let _ = self.invoke(Opcode::RestoreSession, target_id, 0, payload.into_inner())?;
+        Ok(())
+    }
+
+    fn set_session_default_xopt(
+        &self,
+        session: SessionId,
+        xopt: OptimizationLevel,
+    ) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        encode_optimization(&mut payload, xopt);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        let _ = self.invoke(Opcode::SetSessionXOpt, target_id, 0, payload.into_inner())?;
+        Ok(())
+    }
+
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError> {
         let mut manifest_payload = PayloadWriter::new();
         encode_manifest(&mut manifest_payload, &manifest).map_err(protocol_to_runner)?;
@@ -317,27 +453,7 @@ impl RuntimeRunner for RemoteRunner {
         }
 
         let frame = self.invoke(Opcode::RunScript, target_id, 0, payload.into_inner())?;
-        let mut response = PayloadReader::new(&frame.payload);
-        if frame.header.flags & FLAG_HANDLE_RESULT != 0 {
-            let handle_id = response.read_u32().map_err(protocol_to_runner)?;
-            response.finish().map_err(protocol_to_runner)?;
-            let handle = HandleId(handle_id as u64);
-            let mut state = self
-                .inner
-                .state
-                .lock()
-                .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
-            state.known_handles.insert(handle);
-            Ok(RuntimeValue::Handle(handle))
-        } else if frame.header.flags & FLAG_INLINE_VALUE != 0 {
-            let value = decode_inline_value(&mut response).map_err(protocol_to_runner)?;
-            response.finish().map_err(protocol_to_runner)?;
-            Ok(RuntimeValue::Inline(value))
-        } else {
-            Err(RunnerError::Protocol(
-                "runtime returned RUN_SCRIPT without a result payload flag".to_owned(),
-            ))
-        }
+        self.decode_runtime_result(frame)
     }
 
     fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {
@@ -467,7 +583,24 @@ fn protocol_to_runner(error: ProtocolError) -> RunnerError {
 fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
     let error = decode_error_frame(frame).map_err(protocol_to_runner)?;
     let message = error.message;
+    let session_opcode = matches!(
+        Opcode::from_u8(frame.header.opcode),
+        Some(
+            Opcode::OpenSession
+                | Opcode::EvaluateSession
+                | Opcode::DropSessionItem
+                | Opcode::ResetSession
+                | Opcode::SnapshotSession
+                | Opcode::RestoreSession
+                | Opcode::RunSessionScript
+                | Opcode::SetSessionXOpt
+        )
+    );
     Ok(match error.code {
+        ErrorCode::CompileFailed | ErrorCode::RuntimeFailed if session_opcode => {
+            RunnerError::Session(message)
+        }
+        ErrorCode::BadArgument if session_opcode => RunnerError::Session(message),
         ErrorCode::VersionMismatch
         | ErrorCode::BadFrame
         | ErrorCode::UnsupportedOpcode
