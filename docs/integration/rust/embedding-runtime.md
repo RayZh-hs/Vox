@@ -11,7 +11,7 @@ runtime usage.
 
 ## Programmatic Setup
 
-In-process setup should be one short path:
+In-process setup:
 
 ```rust
 use vox_runtime::{EmbeddedRunner, InteractiveSession, RuntimeRunner};
@@ -33,8 +33,8 @@ let session = ReplSession::with_runner(runner);
 
 ## Attached Setup
 
-When using a long-lived runtime daemon, clients should connect through a runner
-that implements the same `RuntimeRunner` trait.
+When using a long-lived runtime daemon, clients connect through a runner that
+implements the same `RuntimeRunner` trait.
 
 ```rust
 let runner = RemoteRunner::connect("127.0.0.1:4545")?;

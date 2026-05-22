@@ -1,8 +1,7 @@
 # Summary
 
-[Home](README.md)
-
-- [Language](language/README.md)
+- [About Vox](README.md)
+- [The Vox Language](language/README.md)
   - [Overview](language/overview.md)
   - [Specification](spec/README.md)
     - [Source Model](spec/source-model.md)
@@ -12,7 +11,7 @@
     - [Statements and Control Flow](spec/statements-and-control-flow.md)
     - [Effects and Execution](spec/effects-and-execution.md)
 
-- [System](system/README.md)
+- [The Vox Ecosystem](system/README.md)
   - [Compiler](system/compiler.md)
   - [Runtime](system/runtime/README.md)
     - [Protocol](system/runtime/protocol.md)
@@ -21,4 +20,4 @@
 - [Language Integration](integration/README.md)
   - [Rust](integration/rust/README.md)
     - [Embedding the Runtime](integration/rust/embedding-runtime.md)
-    - [Type Bindings](integration/rust/type-bindings.md)
+    - [External Library Creation](integration/rust/external-library-creation.md)

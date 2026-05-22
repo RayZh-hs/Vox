@@ -83,7 +83,7 @@ The sealed `SOpt` plan is expected to be wasm-oriented:
 
 ## Protocol
 
-When exposed as a daemon, `vox-runtime` should use a compact binary protocol.
+When exposed as a daemon, `vox-runtime` uses a compact binary protocol.
 The full wire contract is defined in [Protocol](./protocol.md).
 
 Design rules:
@@ -110,14 +110,18 @@ The runtime must not serialize large host values by default.
 
 Host libraries should provide:
 
-- type metadata;
+- type metadata, including exported fields;
+- trait metadata;
 - function signatures;
+- lowered method functions;
 - purity metadata;
 - a stable call boundary for execution.
 
-Shared objects are the preferred extension model when cross-language host support is needed. The plugin boundary should be a versioned C ABI.
+Shared objects are the preferred extension model when cross-language host
+support is needed. The plugin boundary is a versioned C ABI.
 
-`vox-runtime` should call compiled host functions through registered adapters. It should not require host libraries to ship LLVM IR.
+`vox-runtime` calls compiled host functions through registered adapters. Host
+libraries do not ship LLVM IR.
 
 ## Invariants
 
