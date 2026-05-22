@@ -11,6 +11,7 @@ the connection without an additional schema layer.
 The protocol exists to:
 
 - attach one client instance to a long-lived `vox-runtime`;
+- open or attach that client to a runtime-managed interactive session;
 - load, reload, run, and unload script artifacts for that instance;
 - move arguments and results across the boundary;
 - manage runtime-owned handles for large values;
@@ -19,21 +20,47 @@ The protocol exists to:
 The protocol does not model REPL history, completion menus, or client-side
 synthetic source assembly. Those stay in the client.
 
+The transport connection and the interactive session are distinct concepts. A
+connection is the ordered byte stream used by one attached client. A session is
+the durable shareable environment that may later be revisited or shared with
+other clients.
+
 ## Connection Model
 
 - transport: any ordered byte stream such as a Unix socket or TCP connection;
 - endianness: little-endian for all fixed-width integers and floats;
-- lifetime: one connection equals one attached instance;
+- lifetime: one connection equals one attached client instance, not the entire
+  lifetime of a shared interactive session;
 - concurrency: the client may pipeline requests and match responses by
   `request_id`;
-- isolation: script ids created on one connection are only valid on that
-  connection;
+- isolation: script ids and mutable interactive bindings should ultimately be
+  scoped to a runtime session rather than ambiently shared across all clients;
 - sharing: library mounts, caches, `Econ` state, and handle storage are owned
   by the runtime and may be shared across connections;
-- disconnect: dropping the connection implicitly unloads that instance's
-  scripts and releases its outstanding handle references.
+- disconnect: dropping the connection should release connection-owned
+  references, but should not destroy a durable shared session by itself.
+
+Later protocol milestones should add explicit session lifecycle operations so
+shared interactive state is attached deliberately instead of being inferred from
+the socket.
 
 The first frame on every connection must be `HELLO`.
+
+## IPC Model
+
+The runtime protocol is the IPC surface for Vox tools that share one runtime.
+
+Normal same-runtime transfer should use these methods:
+
+- inline copy for small serializable values;
+- handle passing for large or opaque runtime-owned values;
+- callable references for functions, compiled entry points, and retained
+  closures that the runtime can represent safely;
+- automatic runtime cache reuse instead of explicit client-to-client cache copy.
+
+Cross-runtime movement is different from same-runtime IPC. It should use
+explicit export/import operations and versioned bundles rather than raw handle
+reuse.
 
 ## Frame Format
 
@@ -139,8 +166,18 @@ Encoding rules:
 - a client may send a previously received `handle` value back as an argument;
 - when a result does not fit the inline limit, the runtime should prefer
   returning a `handle` over copying the value into the response.
+- inline values are copy-transferred, not shared by later mutation.
 
 The protocol deliberately avoids textual field names outside inline records.
+
+Function transfer rules:
+
+- functions should normally cross the process boundary as callable references,
+  not raw executable blobs;
+- top-level functions and compiled script entry points should be addressable by
+  runtime-issued callable ids or by symbol plus revision metadata;
+- closures may only be transferred when the runtime can retain their captured
+  environment safely as a runtime-owned callable object.
 
 ## Diagnostics
 

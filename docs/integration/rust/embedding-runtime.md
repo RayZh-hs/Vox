@@ -3,8 +3,8 @@
 Vox distinguishes between a runtime and a session.
 
 - the runtime owns libraries, compiled artifacts, caches, and handles;
-- a session owns interactive state such as imports, definitions, and the last
-  value shorthand.
+- a session owns interactive state such as imports, definitions, the last
+  value shorthand, and any handles retained by those bindings.
 
 This page covers the Rust-side setup path for both embedded and attached
 runtime usage.
@@ -46,7 +46,10 @@ The session API does not care whether the runner is embedded or attached.
 ## Session Semantics
 
 - multiple sessions may talk to one runtime;
-- sessions do not share interactive source state;
+- multiple clients may attach to one session and share that session's
+  interactive source state;
+- separate sessions do not share interactive source state;
 - sessions do share mounted libraries, runtime handles, and caches;
 - resetting one session does not destroy another session's definitions;
+- disconnecting one client does not by itself destroy a durable shared session;
 - releasing a handle affects runtime-owned lifetime, not session syntax state.

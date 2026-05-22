@@ -22,16 +22,21 @@ It should feel simple:
 - embedded mode: link compiler + runtime directly into one process;
 - client mode: attach to a `vox-runtime` daemon.
 
-Embedded mode is best for a self-contained binary. Client mode is best when multiple tools should share one runtime process and one cache.
+Embedded mode is best for a self-contained binary. Client mode is best when
+multiple tools should share one runtime process, one cache, and optionally one
+interactive session.
 
 ## Model
 
 The REPL is not the runtime protocol.
 
-Internally, the REPL may keep a growing synthetic script or module-like state and recompile it incrementally. That is a tool concern, not a runtime concern.
+The REPL may present the user with a growing synthetic script or module-like
+state, but the durable interactive environment should live in a runtime-managed
+session rather than only inside the REPL process.
 
-These actions should map onto runtime-owned session and runner calls, not expand
-the runtime protocol or reimplement parsing logic in the REPL.
+These actions should map onto runtime-owned session and runner calls, not
+expand the runtime protocol with REPL-only UI details or reimplement parsing
+logic in the REPL.
 
 ## Commands
 
@@ -92,6 +97,8 @@ The REPL should:
 - preserve prior successful state when a new input fails;
 - make `IOpt` the default interactive mode;
 - allow switching to `SOpt` for final execution checks;
+- reconnect cleanly to a named session when requested;
+- make session sharing explicit rather than ambient;
 - display large values through summaries and previews rather than full serialization.
 
 ## Design Rules
@@ -99,5 +106,7 @@ The REPL should:
 - keep REPL concerns out of `vox-runtime`;
 - keep parser, session, and artifact-lifetime mechanics in `vox-runtime`;
 - prefer one runtime API that works both in-process and over a future runner protocol;
-- do not make REPL state a protocol concept;
+- treat the runtime session, not the raw socket connection, as the shareable
+  unit of interactive state;
+- do not make REPL history, completion menus, or other UI state a protocol concept;
 - optimize for fast edit-check-run cycles.

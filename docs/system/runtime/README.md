@@ -26,6 +26,7 @@ This supports two deployment modes:
 `vox-runtime` is responsible for:
 
 - mounting libraries;
+- creating, opening, and closing interactive sessions;
 - loading and reloading scripts;
 - exposing a uniform runner API for embedded and attached clients;
 - selecting `NOpt`, `IOpt`, or `SOpt`;
@@ -37,8 +38,12 @@ This supports two deployment modes:
 - reporting lightweight handle metadata;
 - shutting down cleanly.
 
-Attached instances own their own client state. The runtime owns the shared
-compiled artifacts, caches, host library mounts, and handle table.
+The runtime owns shared compiled artifacts, caches, host library mounts,
+handles, and interactive sessions.
+
+An attached client owns only transport-local UI state such as history,
+completion menus, and viewport concerns. A runtime session owns shareable
+interactive definitions and retained results.
 
 ## Execution Model
 
@@ -88,12 +93,44 @@ The full wire contract is defined in [Protocol](./protocol.md).
 
 Design rules:
 
-- one connection represents one attached instance;
+- connections attach clients to the runtime, while sessions hold shareable
+  interactive state;
 - one request yields one response;
 - object ids on the wire are integers, not strings;
 - large values travel as handles rather than serialized payloads;
 - REPL history, completions, and synthetic cell assembly stay out of the
   runtime boundary.
+
+Session rules:
+
+- multiple clients may attach to one session and therefore share bindings,
+  definitions, and retained results;
+- separate sessions do not implicitly share mutable interactive state;
+- closing a client connection should not by itself destroy a durable session;
+- if a session binding refers to a large value handle, the session is
+  responsible for retaining that handle until the binding is dropped or the
+  session closes.
+
+## Interprocess Communication
+
+`vox-runtime` is the IPC hub for Vox tools.
+
+Different programs should collaborate by attaching to the same runtime and then
+using runtime sessions, handles, callable references, and published bindings to
+exchange data. Clients should not need direct peer-to-peer transfer logic for
+ordinary collaboration.
+
+Preferred IPC methods:
+
+- small pure values: copy inline through the protocol;
+- large or opaque values: pass runtime-owned handles;
+- functions: pass callable references backed by runtime metadata or compiled
+  artifacts;
+- caches: reuse runtime-owned entries automatically instead of copying cache
+  contents between clients.
+
+Cross-runtime movement is a separate concern. It should use explicit export and
+import bundles rather than pretending a live runtime handle can be portable.
 
 ## Handles
 
