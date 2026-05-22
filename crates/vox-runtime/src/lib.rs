@@ -2,7 +2,10 @@ mod analysis;
 mod artifact_store;
 mod handles;
 mod interpreter;
+mod protocol;
+mod remote;
 mod runner;
+mod server;
 mod session;
 
 use thiserror::Error;
@@ -24,22 +27,35 @@ pub use analysis::{
 pub use artifact_store::ArtifactStore;
 pub use handles::{
     GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary, HandleStore,
-    RealizationKey, RealizedFunctionHandleSummary,
+    HandleMetadata, RealizationKey, RealizedFunctionHandleSummary,
 };
 use interpreter::Interpreter;
+pub use protocol::CURRENT_PROTOCOL_VERSION;
+pub use remote::RemoteRunner;
 pub use runner::{EmbeddedRunner, RunnerError, RuntimeRunner};
+pub use server::{RuntimeServer, RuntimeServerError};
 pub use session::{InteractiveSession, SessionCompletion, SessionError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedLibrary {
     pub id: LibraryId,
+    pub revision: u64,
     pub manifest: PackageManifest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheStats {
     pub artifacts: usize,
+    pub pure_cache_entries: usize,
+    pub pure_cache_bytes: u64,
     pub handles: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheClearScope {
+    All,
+    Artifacts,
+    PureCache,
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +81,7 @@ pub struct Runtime {
     generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
     libraries: Vec<MountedLibrary>,
     next_library_id: u64,
+    next_library_revision: u64,
     default_xopt: OptimizationLevel,
 }
 
@@ -79,9 +96,14 @@ impl Runtime {
     pub fn mount_library(&mut self, manifest: PackageManifest) -> LibraryId {
         self.host.register_package(manifest.clone());
         self.next_library_id += 1;
+        self.next_library_revision += 1;
 
         let id = LibraryId(self.next_library_id);
-        self.libraries.push(MountedLibrary { id, manifest });
+        self.libraries.push(MountedLibrary {
+            id,
+            revision: self.next_library_revision,
+            manifest,
+        });
         id
     }
 
@@ -156,6 +178,10 @@ impl Runtime {
         self.artifacts.get(artifact_id)
     }
 
+    pub fn library(&self, library_id: LibraryId) -> Option<&MountedLibrary> {
+        self.libraries.iter().find(|library| library.id == library_id)
+    }
+
     pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
         self.clear_generic_handles(Some(artifact_id));
         self.artifacts.remove(artifact_id).is_some()
@@ -199,6 +225,10 @@ impl Runtime {
         self.handles.describe(handle)
     }
 
+    pub fn handle_metadata(&self, handle: HandleId) -> Option<HandleMetadata> {
+        self.handles.metadata(handle)
+    }
+
     pub fn release_handle(&mut self, handle: HandleId) -> bool {
         self.handles.release(handle)
     }
@@ -218,7 +248,20 @@ impl Runtime {
     pub fn cache_stats(&self) -> CacheStats {
         CacheStats {
             artifacts: self.artifacts.len(),
+            pure_cache_entries: 0,
+            pure_cache_bytes: 0,
             handles: self.handles.len(),
+        }
+    }
+
+    pub fn clear_cache(&mut self, scope: CacheClearScope) -> u64 {
+        match scope {
+            CacheClearScope::All | CacheClearScope::Artifacts => {
+                let cleared = self.artifacts.len() as u64;
+                self.clear_artifacts();
+                cleared
+            }
+            CacheClearScope::PureCache => 0,
         }
     }
 

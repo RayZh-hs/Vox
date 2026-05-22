@@ -17,9 +17,12 @@ This scaffold establishes the crate boundaries, core types, and a minimal end-to
 - extracting script parameters at the surface level;
 - compiling source into a typed artifact shell;
 - loading artifacts into a runtime;
-- driving that runtime from a REPL session model.
+- driving that runtime from a REPL session model;
+- attaching external clients to a long-lived runtime over the binary protocol.
 
-The full parser, type checker, `Vox Core` IR, evaluator, and daemon protocol are intentionally left for the next milestone rather than being filled with low-value placeholder code.
+The full parser, type checker, and the remaining `Vox Core` IR/runtime features
+are still intentionally incremental rather than being filled with low-value
+placeholder code.
 
 ## Documentation
 

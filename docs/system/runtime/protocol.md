@@ -283,7 +283,7 @@ Success response payload: empty.
 
 ### `SET_XOPT`
 
-`target_id` is `script_id`.
+`target_id` must be `0`.
 
 Request payload:
 
@@ -293,6 +293,13 @@ u8 reserved[3]
 ```
 
 Success response payload: empty.
+
+Current runtime behavior:
+
+- `SET_XOPT` updates the connection default used by later `LOAD_SCRIPT` and
+  `RELOAD_SCRIPT` requests;
+- `RUN_SCRIPT` currently supports only `xopt_override = 255`, because
+  execution uses the optimization mode compiled into the loaded artifact.
 
 ### `RUN_SCRIPT`
 
@@ -345,6 +352,7 @@ string type_name
 u64 approx_size_bytes
 u32 ref_count
 u32 handle_flags
+string summary
 ```
 
 `handle_flags` should currently use:

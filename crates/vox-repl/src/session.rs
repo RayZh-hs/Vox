@@ -9,7 +9,7 @@ use vox_core::{
     opt::OptimizationLevel,
     value::{InlineValue, RuntimeValue},
 };
-use vox_runtime::{EmbeddedRunner, InteractiveSession, TypeEnvironment};
+use vox_runtime::{EmbeddedRunner, InteractiveSession, RuntimeRunner, TypeEnvironment};
 
 use crate::{CompletionSnapshot, command::ReplCommand};
 
@@ -33,19 +33,23 @@ impl ReplOutput {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReplSession {
-    runtime: InteractiveSession<EmbeddedRunner>,
+pub struct ReplSession<R: RuntimeRunner = EmbeddedRunner> {
+    runtime: InteractiveSession<R>,
 }
 
-impl Default for ReplSession {
+impl Default for ReplSession<EmbeddedRunner> {
     fn default() -> Self {
-        Self {
-            runtime: InteractiveSession::new(EmbeddedRunner::default()),
-        }
+        Self::with_runner(EmbeddedRunner::default())
     }
 }
 
-impl ReplSession {
+impl<R: RuntimeRunner> ReplSession<R> {
+    pub fn with_runner(runner: R) -> Self {
+        Self {
+            runtime: InteractiveSession::new(runner),
+        }
+    }
+
     pub fn handle_line(&mut self, line: &str) -> ReplOutput {
         let trimmed = line.trim();
         if trimmed.is_empty() {

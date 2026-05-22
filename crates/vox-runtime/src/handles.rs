@@ -47,6 +47,13 @@ struct HandleEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleMetadata {
+    pub summary: HandleSummary,
+    pub ref_count: u32,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HandlePayload {
     Data(HandleSummary),
     GenericFunction(GenericFunctionHandle),
@@ -100,6 +107,14 @@ impl HandleStore {
         self.entries
             .get(&id)
             .map(|entry| handle_summary(&entry.payload))
+    }
+
+    pub fn metadata(&self, id: HandleId) -> Option<HandleMetadata> {
+        self.entries.get(&id).map(|entry| HandleMetadata {
+            summary: handle_summary(&entry.payload),
+            ref_count: entry.refs.min(u32::MAX as usize) as u32,
+            flags: 0,
+        })
     }
 
     pub fn retain(&mut self, id: HandleId) -> bool {

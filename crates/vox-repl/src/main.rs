@@ -1,14 +1,28 @@
+use std::{env, error::Error};
+
 use rustyline::{
     Cmd, ConditionalEventHandler, Config, Editor, Event, EventContext, EventHandler, KeyCode,
     KeyEvent, Modifiers, Movement, RepeatCount, history::DefaultHistory,
 };
 use vox_repl::{CompletionUi, ReplHelper, ReplOutput, ReplSession, TabCompletion};
+use vox_runtime::{EmbeddedRunner, RemoteRunner, RuntimeRunner};
 
 const PRIMARY_PROMPT: &str = ">>> ";
 const CONTINUATION_PROMPT: &str = "... ";
 const INDENT: &str = "    ";
 
-fn main() -> rustyline::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
+    let runner = match parse_connect_addr()? {
+        Some(addr) => RunnerChoice::Remote(RemoteRunner::connect(addr)?),
+        None => RunnerChoice::Embedded(EmbeddedRunner::default()),
+    };
+    match runner {
+        RunnerChoice::Embedded(runner) => run_repl(ReplSession::with_runner(runner)),
+        RunnerChoice::Remote(runner) => run_repl(ReplSession::with_runner(runner)),
+    }
+}
+
+fn run_repl<R: RuntimeRunner>(mut session: ReplSession<R>) -> Result<(), Box<dyn Error>> {
     let config = Config::builder().build();
     let completion_ui = CompletionUi::default();
     let mut editor = Editor::<ReplHelper, DefaultHistory>::with_config(config)?;
@@ -65,8 +79,6 @@ fn main() -> rustyline::Result<()> {
         KeyEvent::ctrl('U'),
         EventHandler::Conditional(Box::new(ProtectedPrefixHandler::kill_to_boundary())),
     );
-    let mut session = ReplSession::default();
-
     loop {
         if let Some(helper) = editor.helper_mut() {
             helper.set_snapshot(session.completion_snapshot());
@@ -88,11 +100,41 @@ fn main() -> rustyline::Result<()> {
             }
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(error) => return Err(error),
+            Err(error) => return Err(Box::new(error)),
         }
     }
 
     Ok(())
+}
+
+enum RunnerChoice {
+    Embedded(EmbeddedRunner),
+    Remote(RemoteRunner),
+}
+
+fn parse_connect_addr() -> Result<Option<String>, Box<dyn Error>> {
+    let mut args = env::args().skip(1);
+    let mut connect = None;
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--connect" => {
+                let Some(addr) = args.next() else {
+                    return Err("`--connect` requires an address".into());
+                };
+                connect = Some(addr);
+            }
+            "--help" | "-h" => {
+                println!("Usage: vox-repl [--connect host:port]");
+                std::process::exit(0);
+            }
+            other => {
+                return Err(format!("unrecognized argument `{other}`").into());
+            }
+        }
+    }
+
+    Ok(connect)
 }
 
 #[derive(Clone, Copy)]

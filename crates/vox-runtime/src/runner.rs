@@ -70,7 +70,7 @@ impl EmbeddedRunner {
         }
     }
 
-    fn with_runtime<T>(
+    pub(crate) fn with_runtime<T>(
         &self,
         action: impl FnOnce(&mut Runtime) -> Result<T, RunnerError>,
     ) -> Result<T, RunnerError> {
