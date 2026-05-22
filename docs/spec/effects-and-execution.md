@@ -1,4 +1,4 @@
-# 06 Effects and Execution
+# Effects and Execution
 
 This chapter defines purity, `evil`, `econ`, and the execution model visible
 from source code.
@@ -119,5 +119,6 @@ They may change implementation strategy, including:
 `SOpt` may reuse storage more aggressively than `IOpt`, but it must preserve
 the same observable behavior.
 
-For sealed functions, additional `SOpt` lowering rules are defined in
-[07 Sealed Lowering](./07-sealed-lowering.md).
+The source language does not define additional sealed-function syntax.
+`SOpt` lowering strategy is a compiler concern and is documented in the system
+design notes.

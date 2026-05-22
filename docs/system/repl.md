@@ -1,4 +1,4 @@
-# Vox REPL
+# REPL
 
 `vox-repl` is the human-facing interactive tool for Vox.
 

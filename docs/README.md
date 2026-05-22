@@ -2,11 +2,12 @@
 
 This book collects the language and system documentation for Vox.
 
-It is organized into three main areas:
+It is organized into four main areas:
 
 - the language overview, for the broad shape and goals of Vox;
 - the language specification, for the precise surface syntax and rules;
 - the system design notes, for the compiler, runtime, and REPL.
+- the language integration notes, for host-language embedding and bindings.
 
 The language specification is the normative source for Vox surface syntax.
 Higher-level overview documents are intended to help readers navigate the

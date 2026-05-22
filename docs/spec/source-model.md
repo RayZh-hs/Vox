@@ -1,4 +1,4 @@
-# 01 Source Model
+# Source Model
 
 This chapter defines Vox source files, modules, and top-level structure.
 

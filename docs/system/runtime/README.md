@@ -1,10 +1,11 @@
-# Vox Runtime
+# Runtime
 
 `vox-runtime` is the long-lived execution system for Vox.
 
-It loads compiled Vox plans, executes them, caches pure results, tracks `Econ` versions, and owns runtime handles for large host values.
+It loads compiled Vox plans, executes them, caches pure results, tracks `Econ`
+versions, and owns runtime handles for large host values.
 
-Language semantics are defined in [the language overview](../language/overview.md).
+Language semantics are defined in [the language overview](../../language/overview.md).
 
 ## Role
 
@@ -27,7 +28,6 @@ This supports two deployment modes:
 - mounting libraries;
 - loading and reloading scripts;
 - exposing a uniform runner API for embedded and attached clients;
-- owning interactive session mechanics used by tools such as the REPL;
 - selecting `NOpt`, `IOpt`, or `SOpt`;
 - executing compiled plans with arguments;
 - memoizing pure evaluation;
@@ -37,9 +37,8 @@ This supports two deployment modes:
 - reporting lightweight handle metadata;
 - shutting down cleanly.
 
-Interactive sessions are client-local. The runtime process owns shared compiled
-artifacts, handles, and caches, while each attached tool owns its own synthetic
-script state and reloads only its own artifact slot.
+Attached instances own their own client state. The runtime owns the shared
+compiled artifacts, caches, host library mounts, and handle table.
 
 ## Execution Model
 
@@ -85,82 +84,16 @@ The sealed `SOpt` plan is expected to be wasm-oriented:
 ## Protocol
 
 When exposed as a daemon, `vox-runtime` should use a compact binary protocol.
+The full wire contract is defined in [Protocol](./protocol.md).
 
-The protocol should stay small.
+Design rules:
 
-### Framing
-
-Each frame should contain:
-
-- magic;
-- protocol version;
-- opcode;
-- flags;
-- request id;
-- payload length;
-- payload bytes.
-
-Rules:
-
+- one connection represents one attached instance;
 - one request yields one response;
-- events are optional and never replace the response;
 - object ids on the wire are integers, not strings;
-- large values are always represented by handles.
-
-### Values
-
-Small values may be encoded inline:
-
-- `int`
-- `float`
-- `bool`
-- `string`
-- `tuple`
-- `null`
-
-Large values must be represented by `handle_id`.
-
-### Operations
-
-The runtime only needs these operations:
-
-- `hello`: handshake and version check.
-- `mount_library`: mount a library root or bundle.
-- `unmount_library`: remove a mounted library revision.
-- `load_script`: compile and store a script artifact.
-- `reload_script`: replace a script with a new revision.
-- `unload_script`: release a script artifact.
-- `set_xopt`: set default `NOpt`, `IOpt`, or `SOpt` for a script.
-- `run_script`: execute a compiled script with arguments.
-- `describe_handle`: return lightweight metadata for a handle.
-- `release_handle`: drop one handle reference.
-- `refresh_econ`: refresh an `Econ` snapshot and invalidate dependent cache entries.
-- `cache_stats`: report cache counts and size estimates.
-- `clear_cache`: clear cache entries by scope.
-- `shutdown`: stop the runtime cleanly.
-
-### Request Contents
-
-A request payload should contain only:
-
-- target object id, when required;
-- operation-specific arguments;
-- optional optimization override for `run_script`;
-- source path or source blob for load and reload;
-- typed argument values for script parameters.
-
-### Response Contents
-
-A response should contain only what the client needs:
-
-- success or failure;
-- created or updated object ids;
-- script revision ids;
-- inline result value or handle id;
-- diagnostics, when relevant;
-- lightweight metadata for inspect-style operations.
-
-Do not expose compiler IR, REPL cells, or graph editing state on this boundary.
+- large values travel as handles rather than serialized payloads;
+- REPL history, completions, and synthetic cell assembly stay out of the
+  runtime boundary.
 
 ## Handles
 

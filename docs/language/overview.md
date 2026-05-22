@@ -1,4 +1,4 @@
-# Vox
+# Overview
 
 A high-performance, data-flow compatible programming language, designed with modern syntax, optimized for vector processing and parallel execution. It is designed to be embeddable in other PLs, with rust as the first host language.
 

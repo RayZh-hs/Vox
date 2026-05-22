@@ -1,4 +1,4 @@
-# 03 Types and Declarations
+# Types and Declarations
 
 This chapter defines the Vox type system surface and the declaration forms that
 appear at top level.

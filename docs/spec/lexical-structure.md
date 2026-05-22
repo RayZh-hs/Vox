@@ -1,4 +1,4 @@
-# 02 Lexical Structure
+# Lexical Structure
 
 This chapter defines comments, identifiers, keywords, operators, and literals.
 

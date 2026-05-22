@@ -1,4 +1,4 @@
-# 04 Expressions
+# Expressions
 
 This chapter defines the expression language and its precedence.
 
