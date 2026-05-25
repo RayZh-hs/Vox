@@ -1309,6 +1309,15 @@ fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
                 ReplType::Tuple(items.iter().map(from_vox_host_type).collect())
             }
         }
+        vox_core::types::VoxType::Record(fields) => ReplType::Record(
+            fields
+                .iter()
+                .map(|field| RecordFieldType {
+                    name: field.name.clone(),
+                    ty: from_vox_host_type(&field.ty),
+                })
+                .collect(),
+        ),
         vox_core::types::VoxType::Nullable(inner) => {
             ReplType::Nullable(Box::new(from_vox_host_type(inner)))
         }

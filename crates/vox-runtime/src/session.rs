@@ -887,6 +887,14 @@ fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
                     .join(", ")
             ),
         },
+        vox_core::value::InlineValue::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", render_inline_value_source(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         vox_core::value::InlineValue::Null => "null".to_owned(),
     }
 }

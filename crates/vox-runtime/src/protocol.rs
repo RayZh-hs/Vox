@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::{collections::BTreeMap, io::{self, Read, Write}};
 
 use thiserror::Error;
 use vox_core::{
@@ -6,7 +6,7 @@ use vox_core::{
     host::{FunctionSpec, PackageManifest, ParameterSpec, Purity, TypeSpec},
     opt::OptimizationLevel,
     source::ModulePath,
-    types::{QualifiedTypeName, VoxType},
+    types::{QualifiedTypeName, RecordField, VoxType},
     value::InlineValue,
 };
 
@@ -499,6 +499,16 @@ pub fn encode_inline_value(
                 encode_inline_value(writer, value)?;
             }
         }
+        InlineValue::Record(fields) => {
+            writer.write_u8(0x06);
+            let len = u32::try_from(fields.len())
+                .map_err(|_| ProtocolError::message("record exceeds protocol size limit"))?;
+            writer.write_u32(len);
+            for (name, value) in fields {
+                writer.write_string(name)?;
+                encode_inline_value(writer, value)?;
+            }
+        }
     }
     Ok(())
 }
@@ -522,9 +532,18 @@ pub fn decode_inline_value(reader: &mut PayloadReader<'_>) -> Result<InlineValue
             }
             Ok(InlineValue::Tuple(values))
         }
-        0x06 => Err(ProtocolError::message(
-            "record values are not supported by the current runtime",
-        )),
+        0x06 => {
+            let count = reader.read_u32()? as usize;
+            let mut fields = BTreeMap::new();
+            for _ in 0..count {
+                let name = reader.read_string()?;
+                if fields.contains_key(&name) {
+                    return Err(ProtocolError::message("duplicate record field"));
+                }
+                fields.insert(name, decode_inline_value(reader)?);
+            }
+            Ok(InlineValue::Record(fields))
+        }
         0x07 => Err(ProtocolError::message(
             "handle values must be decoded by the connection layer",
         )),
@@ -659,6 +678,18 @@ fn encode_vox_type(writer: &mut PayloadWriter, ty: &VoxType) -> Result<(), Proto
                 encode_vox_type(writer, item)?;
             }
         }
+        VoxType::Record(fields) => {
+            writer.write_u8(0x0b);
+            writer.write_u32(
+                u32::try_from(fields.len()).map_err(|_| {
+                    ProtocolError::message("record type exceeds protocol size limit")
+                })?,
+            );
+            for field in fields {
+                writer.write_string(&field.name)?;
+                encode_vox_type(writer, &field.ty)?;
+            }
+        }
         VoxType::Nullable(inner) => {
             writer.write_u8(0x06);
             encode_vox_type(writer, inner)?;
@@ -697,6 +728,17 @@ fn decode_vox_type(reader: &mut PayloadReader<'_>) -> Result<VoxType, ProtocolEr
                 items.push(decode_vox_type(reader)?);
             }
             Ok(VoxType::Tuple(items))
+        }
+        0x0b => {
+            let count = reader.read_u32()? as usize;
+            let mut fields = Vec::with_capacity(count);
+            for _ in 0..count {
+                fields.push(RecordField {
+                    name: reader.read_string()?,
+                    ty: decode_vox_type(reader)?,
+                });
+            }
+            Ok(VoxType::Record(fields))
         }
         0x06 => Ok(VoxType::Nullable(Box::new(decode_vox_type(reader)?))),
         0x07 => Ok(VoxType::DynTrait(decode_qualified_type_name(reader)?)),

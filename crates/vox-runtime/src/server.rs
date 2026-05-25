@@ -1076,14 +1076,31 @@ impl RuntimeConnection {
                 }
                 Ok(RuntimeValue::Inline(InlineValue::Tuple(values)))
             }
+            0x06 => {
+                let count = payload.read_u32().map_err(WireFailure::bad_argument)? as usize;
+                let mut fields = BTreeMap::new();
+                for _ in 0..count {
+                    let name = payload.read_string().map_err(WireFailure::bad_argument)?;
+                    if fields.contains_key(&name) {
+                        return Err(WireFailure::recoverable(
+                            ErrorCode::BadArgument,
+                            "duplicate record field",
+                        ));
+                    }
+                    let RuntimeValue::Inline(value) = self.decode_runtime_value(payload)? else {
+                        return Err(WireFailure::recoverable(
+                            ErrorCode::BadArgument,
+                            "handle values are not supported inside records",
+                        ));
+                    };
+                    fields.insert(name, value);
+                }
+                Ok(RuntimeValue::Inline(InlineValue::Record(fields)))
+            }
             0x07 => {
                 let local_handle = payload.read_u32().map_err(WireFailure::bad_argument)?;
                 Ok(RuntimeValue::Handle(self.resolve_handle(local_handle)?))
             }
-            0x06 => Err(WireFailure::recoverable(
-                ErrorCode::BadArgument,
-                "record arguments are not supported by the current runtime",
-            )),
             _ => Err(WireFailure::recoverable(
                 ErrorCode::BadArgument,
                 "unknown value tag",

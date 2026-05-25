@@ -50,6 +50,9 @@ This marks `Image` as eligible for export. It does not export anything by
 itself yet. The type is pulled into the package automatically when an exported
 function or trait method uses it.
 
+The optional `name` override controls the public Vox name. If omitted, Vox uses
+the Rust struct name.
+
 ### 2. Mark exported traits once
 
 Rust traits cannot use `derive`, so Vox uses a trait attribute for the same
@@ -73,6 +76,9 @@ This contributes trait metadata:
 Like structs, traits are not registered manually with the `ExternalLibrary`
 builder.
 
+The optional trait `name` override controls the public Vox trait name. If
+omitted, Vox uses the Rust trait name.
+
 ### 3. Mark exported functions once
 
 Functions follow the same rule: mark them once on the Rust item and let the
@@ -91,6 +97,9 @@ fn filter_apply(filter: &dyn Filter, input: Image) -> Image {
 ```
 
 This marks each function as part of the Vox package surface.
+
+The optional function `name` override controls the public Vox function name. If
+omitted, Vox uses the Rust function name.
 
 ### 4. Build the package once
 
@@ -149,6 +158,45 @@ The user overhead is intentionally small:
 - one attribute per exported function;
 - one package name at the `ExternalLibrary` root.
 
+## Exported Names
+
+By default, Vox exports each declaration under its Rust name:
+
+- structs use the Rust struct name;
+- traits use the Rust trait name;
+- trait methods use the Rust method name;
+- functions use the Rust function name.
+
+When a public Vox name needs to differ from the Rust item name, use the same
+`name = "..."` override on each exported declaration kind:
+
+- structs via `#[vox(name = "...")]` next to `#[derive(VoxExport)]`;
+- traits via `#[vox_trait(name = "...")]`;
+- trait methods via `#[vox(name = "...", lowered_by = ...)]`;
+- functions via `#[vox_fn(name = "...")]`.
+
+For example:
+
+```rust
+#[derive(VoxExport)]
+#[vox(name = "Bitmap")]
+struct Image {
+    width: i64,
+    height: i64,
+}
+
+#[vox_trait(name = "PixelFilter")]
+trait Filter {
+    #[vox(name = "run", lowered_by = filter_apply, purity = "pure")]
+    fn apply(&self, input: Image) -> Image;
+}
+
+#[vox_fn(name = "gaussian_blur", purity = "pure")]
+fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
+    todo!()
+}
+```
+
 ## Automatic Inclusion Rules
 
 `ExternalLibrary` should include an exported Rust struct automatically when:
@@ -180,11 +228,18 @@ runtime entry points.
 
 For each exported trait method:
 
-- the method name stays visible in trait metadata;
+- the Vox method name defaults to the Rust method name and may be overridden
+  with `name = "..."`;
 - the runtime executes the lowered free function named by
   `#[vox(lowered_by = ...)]`;
 - that lowered function is included automatically when it is marked with
   `#[vox_fn(...)]`.
+
+The two method fields serve different roles:
+
+- `name` controls the public Vox method name;
+- `lowered_by` names the Rust free function that implements the runtime
+  boundary.
 
 This keeps the API simple:
 
@@ -209,12 +264,24 @@ Rust types map to Vox types automatically for the common cases:
 Most users should stay entirely in ordinary Rust signatures and let Vox infer
 the manifest types.
 
+When a host function needs to return multiple named values, prefer a record
+return type instead of inventing a temporary exported struct. Structs remain
+single named values in the Vox type system; records are the anonymous product
+type for "these named fields together".
+
+In low-level manifest code, represent such a return type with
+`VoxType::Record(...)`.
+
 ## API Summary
 
 - `ExternalLibrary::new(package)` starts one package export session.
 - `#[derive(VoxExport)]` marks a Rust struct as exportable metadata.
-- `#[vox_trait]` marks a Rust trait as exportable metadata.
-- `#[vox_fn(...)]` describes one exported function.
+- `#[vox(name = "...")]` optionally overrides the exported name of a struct or
+  trait method.
+- `#[vox_trait(...)]` marks a Rust trait as exportable metadata and may
+  override its exported name.
+- `#[vox_fn(...)]` describes one exported function and may override its
+  exported name.
 - `ExternalLibrary::build()` produces the package manifest consumed by the
   runtime.
 

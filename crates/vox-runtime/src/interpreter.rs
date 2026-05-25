@@ -1360,6 +1360,12 @@ impl Value {
             InlineValue::Tuple(values) => {
                 Self::Tuple(values.into_iter().map(Self::from_inline).collect())
             }
+            InlineValue::Record(fields) => Self::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| (name, Self::from_inline(value)))
+                    .collect(),
+            ),
             InlineValue::Null => Self::Null,
         }
     }
@@ -1376,8 +1382,12 @@ impl Value {
                 .map(Value::to_inline)
                 .collect::<Option<Vec<_>>>()
                 .map(InlineValue::Tuple),
+            Self::Record(fields) => fields
+                .iter()
+                .map(|(name, value)| Some((name.clone(), value.to_inline()?)))
+                .collect::<Option<BTreeMap<_, _>>>()
+                .map(InlineValue::Record),
             Self::List(_)
-            | Self::Record(_)
             | Self::Range(_)
             | Self::Function(_)
             | Self::Econ(_) => None,

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::ids::HandleId;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7,6 +9,7 @@ pub enum InlineValue {
     Bool(bool),
     String(String),
     Tuple(Vec<InlineValue>),
+    Record(BTreeMap<String, InlineValue>),
     Null,
 }
 

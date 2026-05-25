@@ -499,6 +499,14 @@ fn render_inline_value(value: &InlineValue) -> String {
                     .join(", ")
             ),
         },
+        InlineValue::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", render_inline_value(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         InlineValue::Null => "null".to_owned(),
     }
 }
