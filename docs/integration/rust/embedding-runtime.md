@@ -19,8 +19,8 @@ use vox_runtime::{EmbeddedRunner, InteractiveSession};
 let runner = EmbeddedRunner::default();
 let mut session = InteractiveSession::new(runner.clone())?;
 
-session.evaluate_submission("val answer = 42;")?;
-let value = session.evaluate_submission("answer")?;
+session.eval("val answer = 42;")?;
+let value = session.eval("answer")?;
 ```
 
 Use this when one program owns the runtime and does not need a separate server
@@ -49,7 +49,7 @@ use vox_runtime::{InteractiveSession, RemoteRunner, SessionSelector};
 let runner = RemoteRunner::connect("127.0.0.1:4545")?;
 let mut shared = InteractiveSession::named(runner, "shared")?;
 
-shared.evaluate_submission("val answer = 42;")?;
+shared.eval("val answer = 42;")?;
 ```
 
 If another client opens `"shared"` on the same runtime, it attaches to the same
@@ -87,6 +87,47 @@ Choose the sharing model based on what you need:
 - Shared interactive workspace: use one named session.
 - Isolated workspaces with copied source state: export session source with
   `snapshot_source()` and import it with `restore_snapshot_source()`.
+- Handle-backed large values: keep the handle, then fetch serializable data
+  later with `get_handle_data()` or stream it in chunks with
+  `read_handle_data()`.
 
 There is currently no higher-level API that copies a live binding directly from
 one session into another separate session.
+
+## Reading Handle-Backed Data
+
+Large serializable values may cross the runtime boundary as handles. You can
+materialize the value later without re-running the original submission.
+
+```rust
+use vox_core::value::HandleData;
+use vox_core::value::RuntimeValue;
+use vox_runtime::{EmbeddedRunner, InteractiveSession};
+
+let runner = EmbeddedRunner::default();
+let mut session = InteractiveSession::new(runner)?;
+
+let result = session.eval("[40, 41, 42]")?.expect("list result");
+let RuntimeValue::Handle(handle) = result else {
+    panic!("expected a handle-backed list");
+};
+
+let data = session.get_handle_data(handle)?;
+assert_eq!(
+    data,
+    HandleData::List(vec![
+        HandleData::Int(40),
+        HandleData::Int(41),
+        HandleData::Int(42),
+    ])
+);
+```
+
+For very large payloads, read incrementally:
+
+```rust
+let first_chunk = session.read_handle_data(handle, 0, 64 * 1024)?;
+```
+
+`get_handle_data()` is the eager convenience API. `read_handle_data()` is the
+chunked API that remote clients can use to stay within protocol payload limits.

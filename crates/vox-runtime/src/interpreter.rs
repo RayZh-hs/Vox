@@ -16,7 +16,7 @@ use vox_compiler::{
 use vox_core::{
     ids::ArtifactId,
     plan::CompiledArtifact,
-    value::{HandleSummary, InlineValue, RuntimeValue},
+    value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
 use crate::{
@@ -137,7 +137,11 @@ impl<'a> Interpreter<'a> {
         }
 
         let summary = value.summary();
-        let handle = self.runtime.allocate_handle(summary);
+        let handle = if let Some(data) = value.to_handle_data() {
+            self.runtime.allocate_serializable_handle(summary, data)
+        } else {
+            self.runtime.allocate_handle(summary)
+        };
         Ok(RuntimeValue::Handle(handle))
     }
 }
@@ -1391,6 +1395,32 @@ impl Value {
             | Self::Range(_)
             | Self::Function(_)
             | Self::Econ(_) => None,
+        }
+    }
+
+    fn to_handle_data(&self) -> Option<HandleData> {
+        match self {
+            Self::Null => Some(HandleData::Null),
+            Self::Bool(value) => Some(HandleData::Bool(*value)),
+            Self::Int(value) => Some(HandleData::Int(*value)),
+            Self::Float(value) => Some(HandleData::Float(*value)),
+            Self::String(value) => Some(HandleData::String(value.clone())),
+            Self::List(values) => values
+                .iter()
+                .map(Value::to_handle_data)
+                .collect::<Option<Vec<_>>>()
+                .map(HandleData::List),
+            Self::Tuple(values) => values
+                .iter()
+                .map(Value::to_handle_data)
+                .collect::<Option<Vec<_>>>()
+                .map(HandleData::Tuple),
+            Self::Record(fields) => fields
+                .iter()
+                .map(|(name, value)| Some((name.clone(), value.to_handle_data()?)))
+                .collect::<Option<BTreeMap<_, _>>>()
+                .map(HandleData::Record),
+            Self::Range(_) | Self::Function(_) | Self::Econ(_) => None,
         }
     }
 

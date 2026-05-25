@@ -7,7 +7,7 @@ use vox_core::{
     opt::OptimizationLevel,
     source::ModulePath,
     types::{QualifiedTypeName, RecordField, VoxType},
-    value::InlineValue,
+    value::{HandleData, InlineValue},
 };
 
 pub const MAGIC: u32 = 0x5658_5254;
@@ -66,6 +66,7 @@ pub enum Opcode {
     RetainHandle = 0x30,
     DescribeHandle = 0x31,
     ReleaseHandle = 0x32,
+    ReadHandleData = 0x33,
     RefreshEcon = 0x40,
     CacheStats = 0x41,
     ClearCache = 0x42,
@@ -98,6 +99,7 @@ impl Opcode {
             0x30 => Self::RetainHandle,
             0x31 => Self::DescribeHandle,
             0x32 => Self::ReleaseHandle,
+            0x33 => Self::ReadHandleData,
             0x40 => Self::RefreshEcon,
             0x41 => Self::CacheStats,
             0x42 => Self::ClearCache,
@@ -546,6 +548,106 @@ pub fn decode_inline_value(reader: &mut PayloadReader<'_>) -> Result<InlineValue
         }
         0x07 => Err(ProtocolError::message(
             "handle values must be decoded by the connection layer",
+        )),
+        _ => Err(ProtocolError::message("unknown value tag")),
+    }
+}
+
+pub fn encode_handle_data(
+    writer: &mut PayloadWriter,
+    value: &HandleData,
+) -> Result<(), ProtocolError> {
+    match value {
+        HandleData::Null => writer.write_u8(0x00),
+        HandleData::Bool(value) => {
+            writer.write_u8(0x01);
+            writer.write_u8(u8::from(*value));
+        }
+        HandleData::Int(value) => {
+            writer.write_u8(0x02);
+            writer.write_i64(*value);
+        }
+        HandleData::Float(value) => {
+            writer.write_u8(0x03);
+            writer.write_f64(*value);
+        }
+        HandleData::String(value) => {
+            writer.write_u8(0x04);
+            writer.write_string(value)?;
+        }
+        HandleData::Tuple(values) => {
+            writer.write_u8(0x05);
+            let len = u32::try_from(values.len())
+                .map_err(|_| ProtocolError::message("tuple exceeds protocol size limit"))?;
+            writer.write_u32(len);
+            for value in values {
+                encode_handle_data(writer, value)?;
+            }
+        }
+        HandleData::Record(fields) => {
+            writer.write_u8(0x06);
+            let len = u32::try_from(fields.len())
+                .map_err(|_| ProtocolError::message("record exceeds protocol size limit"))?;
+            writer.write_u32(len);
+            for (name, value) in fields {
+                writer.write_string(name)?;
+                encode_handle_data(writer, value)?;
+            }
+        }
+        HandleData::List(values) => {
+            writer.write_u8(0x08);
+            let len = u32::try_from(values.len())
+                .map_err(|_| ProtocolError::message("list exceeds protocol size limit"))?;
+            writer.write_u32(len);
+            for value in values {
+                encode_handle_data(writer, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn decode_handle_data(reader: &mut PayloadReader<'_>) -> Result<HandleData, ProtocolError> {
+    match reader.read_u8()? {
+        0x00 => Ok(HandleData::Null),
+        0x01 => Ok(HandleData::Bool(match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(ProtocolError::message("invalid boolean payload")),
+        })),
+        0x02 => Ok(HandleData::Int(reader.read_i64()?)),
+        0x03 => Ok(HandleData::Float(reader.read_f64()?)),
+        0x04 => Ok(HandleData::String(reader.read_string()?)),
+        0x05 => {
+            let count = reader.read_u32()? as usize;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_handle_data(reader)?);
+            }
+            Ok(HandleData::Tuple(values))
+        }
+        0x06 => {
+            let count = reader.read_u32()? as usize;
+            let mut fields = BTreeMap::new();
+            for _ in 0..count {
+                let name = reader.read_string()?;
+                if fields.contains_key(&name) {
+                    return Err(ProtocolError::message("duplicate record field"));
+                }
+                fields.insert(name, decode_handle_data(reader)?);
+            }
+            Ok(HandleData::Record(fields))
+        }
+        0x08 => {
+            let count = reader.read_u32()? as usize;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_handle_data(reader)?);
+            }
+            Ok(HandleData::List(values))
+        }
+        0x07 => Err(ProtocolError::message(
+            "handle values are not valid inside serialized handle data",
         )),
         _ => Err(ProtocolError::message("unknown value tag")),
     }

@@ -89,7 +89,7 @@ use vox_runtime::{EmbeddedRunner, InteractiveSession};
 
 let runner = EmbeddedRunner::default();
 let mut session = InteractiveSession::new(runner)?;
-session.evaluate_submission("val answer = 42;")?;
+session.eval("val answer = 42;")?;
 ```
 
 Remote use with a shared named session:
@@ -99,7 +99,7 @@ use vox_runtime::{InteractiveSession, RemoteRunner};
 
 let runner = RemoteRunner::connect("127.0.0.1:4545")?;
 let mut session = InteractiveSession::named(runner, "shared")?;
-session.evaluate_submission("val answer = 42;")?;
+session.eval("val answer = 42;")?;
 ```
 
 If another client opens `"shared"` on the same runtime, it sees the same
@@ -151,9 +151,12 @@ Clients can:
 
 - receive a handle as an evaluation result;
 - inspect a handle summary;
+- fetch serializable handle data eagerly with `get_handle_data()`;
+- fetch serializable handle data in chunks with `read_handle_data()`;
 - retain or release a handle through the runner API.
 
-The runtime owns actual handle lifetime and storage.
+Only pure-serializable handles support data fetches. Opaque handles such as
+functions still require handle-based use.
 
 ## Session Management
 

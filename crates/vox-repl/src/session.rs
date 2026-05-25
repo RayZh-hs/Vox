@@ -77,7 +77,7 @@ impl<R: RuntimeRunner> ReplSession<R> {
             return self.handle_command(trimmed);
         }
 
-        match self.runtime.evaluate_submission(line) {
+        match self.runtime.eval(line) {
             Ok(Some(value)) => ReplOutput::message(self.render_runtime_value(&value)),
             Ok(None) => ReplOutput::message(String::new()),
             Err(error) => ReplOutput::error(error.to_string()),

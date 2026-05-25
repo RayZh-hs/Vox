@@ -128,6 +128,7 @@ All other bits are reserved and must be sent as `0`.
 - `0x30`: `RETAIN_HANDLE`
 - `0x31`: `DESCRIBE_HANDLE`
 - `0x32`: `RELEASE_HANDLE`
+- `0x33`: `READ_HANDLE_DATA`
 - `0x40`: `REFRESH_ECON`
 - `0x41`: `CACHE_STATS`
 - `0x42`: `CLEAR_CACHE`
@@ -178,6 +179,29 @@ Encoding rules:
 - inline values are copy-transferred, not shared by later mutation.
 
 The protocol deliberately avoids textual field names outside inline records.
+
+## Serialized Handle Data Encoding
+
+When a handle exposes pure-serializable data, `READ_HANDLE_DATA` returns bytes
+encoded with the same primitive style as `Value`, but with one extra tag for
+lists and without nested handles.
+
+Tags:
+
+- `0x00`: `null`
+- `0x01`: `bool`
+- `0x02`: `int`
+- `0x03`: `float`
+- `0x04`: `string`
+- `0x05`: `tuple`
+- `0x06`: `record`
+- `0x08`: `list`
+
+Rules:
+
+- nested `handle` values are not valid inside serialized handle data;
+- opaque handles such as functions must reject `READ_HANDLE_DATA`;
+- clients may fetch the full byte stream eagerly or page it in chunks.
 
 Function transfer rules:
 
@@ -595,6 +619,29 @@ Success response payload:
 ```text
 u32 remaining_refs
 ```
+
+### `READ_HANDLE_DATA`
+
+`target_id` is `handle_id`.
+
+This operation is valid only for pure-serializable handles.
+
+Request payload:
+
+```text
+u64 offset
+u32 max_bytes
+```
+
+Success response payload:
+
+```text
+u64 total_bytes
+bytes chunk
+```
+
+`chunk` contains a slice of the serialized handle-data byte stream beginning at
+`offset`.
 
 ### `REFRESH_ECON`
 

@@ -8,3 +8,7 @@ license.workspace = true
 thiserror.workspace = true
 vox-compiler = { path = "../vox-compiler" }
 vox-core = { path = "../vox-core" }
+
+[[bin]]
+name = "dev-mounted-library-example"
+path = "../../dev/mounted_library_runner.rs"

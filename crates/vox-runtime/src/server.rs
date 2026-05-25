@@ -258,6 +258,7 @@ impl RuntimeConnection {
             Opcode::RetainHandle => self.handle_retain_handle(frame),
             Opcode::DescribeHandle => self.handle_describe_handle(frame),
             Opcode::ReleaseHandle => self.handle_release_handle(frame),
+            Opcode::ReadHandleData => self.handle_read_handle_data(frame),
             Opcode::RefreshEcon => Err(WireFailure::recoverable(
                 ErrorCode::UnsupportedOpcode,
                 "REFRESH_ECON is not implemented yet",
@@ -952,6 +953,58 @@ impl RuntimeConnection {
         .map_err(WireFailure::bad_argument)
     }
 
+    fn handle_read_handle_data(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let local_id = frame.header.target_id;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let offset = payload.read_u64().map_err(WireFailure::bad_argument)?;
+        let max_bytes = payload.read_u32().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+        if max_bytes == 0 {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "handle data chunk size must be greater than zero",
+            ));
+        }
+
+        let actual = self.resolve_handle(local_id)?;
+        let (total_bytes, bytes) = self
+            .runner
+            .with_runtime(|runtime| {
+                let Some(_metadata) = runtime.handle_metadata(actual) else {
+                    return Err(RunnerError::Protocol("unknown handle".to_owned()));
+                };
+                let Some(bytes) = runtime.handle_data(actual) else {
+                    return Err(RunnerError::Protocol(format!(
+                        "handle {} does not expose serializable data",
+                        actual.0
+                    )));
+                };
+                let total_bytes = bytes.len() as u64;
+                if offset > total_bytes {
+                    return Err(RunnerError::Protocol(format!(
+                        "handle {} offset {} exceeds total bytes {}",
+                        actual.0, offset, total_bytes
+                    )));
+                }
+                let end = offset.saturating_add(max_bytes as u64).min(total_bytes) as usize;
+                Ok((total_bytes, bytes[offset as usize..end].to_vec()))
+            })
+            .map_err(WireFailure::from_runner)?;
+
+        let mut response = PayloadWriter::new();
+        response.write_u64(total_bytes);
+        response.write_bytes(&bytes).map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::ReadHandleData,
+            frame.header.request_id,
+            local_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
     fn handle_cache_stats(&self, request_id: u32) -> Result<Frame, WireFailure> {
         let stats = self
             .runner
@@ -1315,12 +1368,12 @@ mod tests {
             InteractiveSession::named(runner_one, "shared").expect("shared session should open");
         assert!(
             first
-                .evaluate_submission("val numbers = [39, 41];")
+                .eval("val numbers = [39, 41];")
                 .expect("first client should seed the session")
                 .is_none()
         );
         let closure = first
-            .evaluate_submission("() -> numbers[1] + 1")
+            .eval("() -> numbers[1] + 1")
             .expect("first client should store a closure")
             .expect("closure should produce a result");
         assert!(
@@ -1338,14 +1391,14 @@ mod tests {
             .expect("second client should attach to the same session");
         assert_runtime_int(
             second
-                .evaluate_submission("$()")
+                .eval("$()")
                 .expect("shared last value should survive reconnect")
                 .expect("closure call should return a value"),
             42,
         );
         assert!(
             second
-                .evaluate_submission("val answer = numbers[1] + 1;")
+                .eval("val answer = numbers[1] + 1;")
                 .expect("second client should mutate shared state")
                 .is_none()
         );
@@ -1356,7 +1409,7 @@ mod tests {
         let mut isolated = InteractiveSession::named(runner_three, "isolated")
             .expect("isolated session should open");
         let error = isolated
-            .evaluate_submission("answer")
+            .eval("answer")
             .expect_err("separate sessions must not see each other's bindings");
         assert!(
             error.to_string().contains("answer"),

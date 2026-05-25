@@ -9,10 +9,10 @@ use vox_core::{
     ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
     source::SourceText,
-    value::{HandleSummary, RuntimeValue},
+    value::{HandleData, HandleSummary, RuntimeValue},
 };
 
-use crate::{CacheStats, Runtime, RuntimeError, SessionState};
+use crate::{CacheStats, HandleDataChunk, Runtime, RuntimeError, SessionState};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -116,6 +116,15 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
     fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError>;
 
     fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, RunnerError>;
+
+    fn read_handle_data(
+        &self,
+        handle: HandleId,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<HandleDataChunk, RunnerError>;
+
+    fn get_handle_data(&self, handle: HandleId) -> Result<HandleData, RunnerError>;
 
     fn release_handle(&self, handle: HandleId) -> Result<bool, RunnerError>;
 
@@ -363,10 +372,7 @@ impl RuntimeRunner for EmbeddedRunner {
         raw: &str,
     ) -> Result<Option<RuntimeValue>, RunnerError> {
         self.with_session(session, |state| {
-            state
-                .state
-                .evaluate_submission(raw)
-                .map_err(map_session_error)
+            state.state.eval(raw).map_err(map_session_error)
         })
     }
 
@@ -475,6 +481,68 @@ impl RuntimeRunner for EmbeddedRunner {
         self.with_runtime(|runtime| Ok(runtime.describe_handle(handle)))
     }
 
+    fn read_handle_data(
+        &self,
+        handle: HandleId,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<HandleDataChunk, RunnerError> {
+        if max_bytes == 0 {
+            return Err(RunnerError::Protocol(
+                "handle data chunk size must be greater than zero".to_owned(),
+            ));
+        }
+        self.with_runtime(|runtime| {
+            let Some(_metadata) = runtime.handle_metadata(handle) else {
+                return Err(RunnerError::Protocol(format!(
+                    "unknown handle {}",
+                    handle.0
+                )));
+            };
+            let Some(bytes) = runtime.handle_data(handle) else {
+                return Err(RunnerError::Protocol(format!(
+                    "handle {} does not expose serializable data",
+                    handle.0
+                )));
+            };
+            let total_bytes = bytes.len() as u64;
+            if offset > total_bytes {
+                return Err(RunnerError::Protocol(format!(
+                    "handle {} offset {} exceeds total bytes {}",
+                    handle.0, offset, total_bytes
+                )));
+            }
+
+            let end = offset
+                .saturating_add(max_bytes as u64)
+                .min(total_bytes) as usize;
+            Ok(HandleDataChunk {
+                offset,
+                total_bytes,
+                bytes: bytes[offset as usize..end].to_vec(),
+            })
+        })
+    }
+
+    fn get_handle_data(&self, handle: HandleId) -> Result<HandleData, RunnerError> {
+        let bytes = self.with_runtime(|runtime| {
+            let Some(_metadata) = runtime.handle_metadata(handle) else {
+                return Err(RunnerError::Protocol(format!(
+                    "unknown handle {}",
+                    handle.0
+                )));
+            };
+            let Some(bytes) = runtime.handle_data(handle) else {
+                return Err(RunnerError::Protocol(format!(
+                    "handle {} does not expose serializable data",
+                    handle.0
+                )));
+            };
+            Ok(bytes.to_vec())
+        })?;
+        decode_handle_data_bytes(&bytes)
+    }
+
     fn release_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {
         self.with_runtime(|runtime| Ok(runtime.release_handle(handle)))
     }
@@ -511,4 +579,14 @@ fn map_session_error(error: crate::SessionError) -> RunnerError {
         crate::SessionError::Runner(error) => error,
         crate::SessionError::Message(message) => RunnerError::Session(message),
     }
+}
+
+fn decode_handle_data_bytes(bytes: &[u8]) -> Result<HandleData, RunnerError> {
+    let mut reader = crate::protocol::PayloadReader::new(bytes);
+    let value = crate::protocol::decode_handle_data(&mut reader)
+        .map_err(|error| RunnerError::Protocol(error.to_string()))?;
+    reader
+        .finish()
+        .map_err(|error| RunnerError::Protocol(error.to_string()))?;
+    Ok(value)
 }

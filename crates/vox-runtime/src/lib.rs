@@ -16,7 +16,7 @@ use vox_core::{
     opt::OptimizationLevel,
     plan::CompiledArtifact,
     source::{ModuleKind, SourceText},
-    value::{HandleSummary, RuntimeValue},
+    value::{HandleData, HandleSummary, RuntimeValue},
 };
 
 pub use analysis::{
@@ -53,6 +53,13 @@ pub struct CacheStats {
     pub pure_cache_entries: usize,
     pub pure_cache_bytes: u64,
     pub handles: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleDataChunk {
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +230,20 @@ impl Runtime {
         self.handles.allocate_data(summary)
     }
 
+    pub fn allocate_serializable_handle(
+        &mut self,
+        mut summary: HandleSummary,
+        data: HandleData,
+    ) -> HandleId {
+        let mut payload = crate::protocol::PayloadWriter::new();
+        crate::protocol::encode_handle_data(&mut payload, &data)
+            .expect("serializable handle data should fit into memory");
+        let payload = payload.into_inner();
+        summary.bytes = Some(summary.bytes.unwrap_or(payload.len() as u64));
+        self.handles
+            .allocate_serializable_data(summary, payload)
+    }
+
     pub fn retain_handle(&mut self, handle: HandleId) -> bool {
         self.handles.retain(handle)
     }
@@ -233,6 +254,10 @@ impl Runtime {
 
     pub fn handle_metadata(&self, handle: HandleId) -> Option<HandleMetadata> {
         self.handles.metadata(handle)
+    }
+
+    pub fn handle_data(&self, handle: HandleId) -> Option<&[u8]> {
+        self.handles.serialized_data(handle)
     }
 
     pub fn release_handle(&mut self, handle: HandleId) -> bool {
@@ -383,13 +408,13 @@ mod tests {
             .expect("shared session should open");
         assert!(
             author
-                .evaluate_submission("val numbers = [40, 41, 42];")
+                .eval("val numbers = [40, 41, 42];")
                 .expect("binding should evaluate")
                 .is_none()
         );
 
         let closure = author
-            .evaluate_submission("() -> numbers[1] + 1")
+            .eval("() -> numbers[1] + 1")
             .expect("closure should evaluate")
             .expect("closure should produce a result");
         assert!(
@@ -406,21 +431,21 @@ mod tests {
             .expect("shared session should reopen");
         assert_runtime_int(
             collaborator
-                .evaluate_submission("$()")
+                .eval("$()")
                 .expect("last closure should remain available")
                 .expect("closure call should return a value"),
             42,
         );
         assert_runtime_int(
             collaborator
-                .evaluate_submission("numbers[0]")
+                .eval("numbers[0]")
                 .expect("binding should remain available")
                 .expect("binding lookup should return a value"),
             40,
         );
         assert!(
             collaborator
-                .evaluate_submission("val extra = numbers[2];")
+                .eval("val extra = numbers[2];")
                 .expect("second client should mutate the shared session")
                 .is_none()
         );
@@ -429,7 +454,7 @@ mod tests {
             .expect("shared session should stay durable");
         assert_runtime_int(
             reopened
-                .evaluate_submission("extra")
+                .eval("extra")
                 .expect("shared mutation should persist")
                 .expect("shared mutation should return a value"),
             42,
@@ -438,7 +463,7 @@ mod tests {
         let mut isolated =
             InteractiveSession::named(runner, "isolated").expect("isolated session should open");
         let error = isolated
-            .evaluate_submission("numbers[1]")
+            .eval("numbers[1]")
             .expect_err("separate named sessions must not share bindings");
         assert!(
             error.to_string().contains("numbers"),

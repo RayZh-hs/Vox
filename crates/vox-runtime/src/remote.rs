@@ -12,17 +12,17 @@ use vox_core::{
     ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
     source::SourceText,
-    value::{HandleSummary, RuntimeValue},
+    value::{HandleData, HandleSummary, RuntimeValue},
 };
 
 use crate::{
-    CacheStats, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest, SessionSelector,
-    SessionSummary,
+    CacheStats, HandleDataChunk, RunnerError, RuntimeRunner, SessionOpenMode,
+    SessionOpenRequest, SessionSelector, SessionSummary,
     protocol::{
         CURRENT_PROTOCOL_VERSION, DEFAULT_INLINE_VALUE_BYTES, ErrorCode, FLAG_HANDLE_RESULT,
         FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter, ProtocolError,
-        decode_error_frame, decode_inline_value, encode_inline_value, encode_manifest,
-        encode_optimization, read_frame, success_frame, write_frame,
+        decode_error_frame, decode_handle_data, decode_inline_value, encode_inline_value,
+        encode_manifest, encode_optimization, read_frame, success_frame, write_frame,
     },
 };
 
@@ -565,6 +565,55 @@ impl RuntimeRunner for RemoteRunner {
         }
     }
 
+    fn read_handle_data(
+        &self,
+        handle: HandleId,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<HandleDataChunk, RunnerError> {
+        let target_id = self.to_wire_id(handle.0, "handle")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_u64(offset);
+        payload.write_u32(max_bytes);
+        let frame = self.invoke(Opcode::ReadHandleData, target_id, 0, payload.into_inner())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let total_bytes = response.read_u64().map_err(protocol_to_runner)?;
+        let bytes = response.read_bytes().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(HandleDataChunk {
+            offset,
+            total_bytes,
+            bytes,
+        })
+    }
+
+    fn get_handle_data(&self, handle: HandleId) -> Result<HandleData, RunnerError> {
+        let mut offset = 0_u64;
+        let mut bytes = Vec::new();
+        let max_chunk_bytes = self.inner.max_payload_bytes.saturating_sub(16).max(1);
+
+        loop {
+            let chunk = self.read_handle_data(handle, offset, max_chunk_bytes)?;
+            if chunk.offset != offset {
+                return Err(RunnerError::Protocol(
+                    "runtime returned a mismatched handle data chunk".to_owned(),
+                ));
+            }
+            if chunk.bytes.is_empty() && offset < chunk.total_bytes {
+                return Err(RunnerError::Protocol(
+                    "runtime returned an empty intermediate handle data chunk".to_owned(),
+                ));
+            }
+            offset = offset.saturating_add(chunk.bytes.len() as u64);
+            bytes.extend_from_slice(&chunk.bytes);
+            if offset >= chunk.total_bytes {
+                break;
+            }
+        }
+
+        decode_handle_data_bytes(&bytes)
+    }
+
     fn release_handle(&self, handle: HandleId) -> Result<bool, RunnerError> {
         let target_id = self.to_wire_id(handle.0, "handle")?;
         let mut payload = PayloadWriter::new();
@@ -683,6 +732,13 @@ fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
             RunnerError::Runtime(crate::RuntimeError::ExecutionFailed(message))
         }
     })
+}
+
+fn decode_handle_data_bytes(bytes: &[u8]) -> Result<HandleData, RunnerError> {
+    let mut reader = PayloadReader::new(bytes);
+    let value = decode_handle_data(&mut reader).map_err(protocol_to_runner)?;
+    reader.finish().map_err(protocol_to_runner)?;
+    Ok(value)
 }
 
 trait FrameExt {

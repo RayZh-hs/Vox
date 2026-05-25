@@ -10,12 +10,13 @@ use vox_core::{
     ids::{ArtifactId, HandleId, SessionId},
     opt::OptimizationLevel,
     source::{ModuleKind, SourceText},
-    value::{HandleSummary, RuntimeValue},
+    value::{HandleData, HandleSummary, RuntimeValue},
 };
 
 use crate::{
-    ReplType, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest, SessionSelector,
-    SessionSummary, TypeEnvironment, extend_manifest_symbols, infer_environment, language_keywords,
+    HandleDataChunk, ReplType, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    SessionSelector, SessionSummary, TypeEnvironment, extend_manifest_symbols, infer_environment,
+    language_keywords,
 };
 
 const REPL_MODULE: &str = "repl.session";
@@ -134,7 +135,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         }
     }
 
-    pub fn evaluate_submission(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
+    pub fn eval(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
         let parsed = parse_submission(raw)?;
         if parsed.items.is_empty() && parsed.result_source.is_none() {
             return Ok(None);
@@ -483,10 +484,14 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         completion_from_snapshot(&self.runner, &self.snapshot_source()?)
     }
 
-    pub fn evaluate_submission(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
+    pub fn eval(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
         self.runner
             .evaluate_session_submission(self.session_id, raw)
             .map_err(SessionError::from)
+    }
+
+    pub fn evaluate_submission(&mut self, raw: &str) -> Result<Option<RuntimeValue>, SessionError> {
+        self.eval(raw)
     }
 
     pub fn run_script_text(&mut self, path: &str, raw: &str) -> Result<RuntimeValue, SessionError> {
@@ -563,6 +568,19 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
 
     pub fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, SessionError> {
         Ok(self.runner.describe_handle(handle)?)
+    }
+
+    pub fn read_handle_data(
+        &self,
+        handle: HandleId,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<HandleDataChunk, SessionError> {
+        Ok(self.runner.read_handle_data(handle, offset, max_bytes)?)
+    }
+
+    pub fn get_handle_data(&self, handle: HandleId) -> Result<HandleData, SessionError> {
+        Ok(self.runner.get_handle_data(handle)?)
     }
 
     pub fn package_manifests(&self) -> Result<Vec<PackageManifest>, SessionError> {

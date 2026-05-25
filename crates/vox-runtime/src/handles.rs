@@ -55,9 +55,15 @@ pub struct HandleMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HandlePayload {
-    Data(HandleSummary),
+    Data(DataHandle),
     GenericFunction(GenericFunctionHandle),
     RealizedFunction(RealizedFunctionHandle),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DataHandle {
+    summary: HandleSummary,
+    serialized: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,7 +86,21 @@ pub struct HandleStore {
 
 impl HandleStore {
     pub fn allocate_data(&mut self, summary: HandleSummary) -> HandleId {
-        self.allocate_payload(HandlePayload::Data(summary))
+        self.allocate_payload(HandlePayload::Data(DataHandle {
+            summary,
+            serialized: None,
+        }))
+    }
+
+    pub fn allocate_serializable_data(
+        &mut self,
+        summary: HandleSummary,
+        serialized: Vec<u8>,
+    ) -> HandleId {
+        self.allocate_payload(HandlePayload::Data(DataHandle {
+            summary,
+            serialized: Some(serialized),
+        }))
     }
 
     pub fn allocate_generic_function(
@@ -113,8 +133,21 @@ impl HandleStore {
         self.entries.get(&id).map(|entry| HandleMetadata {
             summary: handle_summary(&entry.payload),
             ref_count: entry.refs.min(u32::MAX as usize) as u32,
-            flags: 0,
+            flags: match &entry.payload {
+                HandlePayload::Data(data) if data.serialized.is_some() => 0x0000_0001,
+                _ => 0,
+            },
         })
+    }
+
+    pub fn serialized_data(&self, id: HandleId) -> Option<&[u8]> {
+        match self.entries.get(&id) {
+            Some(HandleEntry {
+                payload: HandlePayload::Data(data),
+                ..
+            }) => data.serialized.as_deref(),
+            _ => None,
+        }
     }
 
     pub fn retain(&mut self, id: HandleId) -> bool {
@@ -180,7 +213,7 @@ impl HandleStore {
 
 fn handle_summary(payload: &HandlePayload) -> HandleSummary {
     match payload {
-        HandlePayload::Data(summary) => summary.clone(),
+        HandlePayload::Data(data) => data.summary.clone(),
         HandlePayload::GenericFunction(folder) => HandleSummary {
             type_name: "Function".to_owned(),
             summary: render_generic_function_summary(folder),
