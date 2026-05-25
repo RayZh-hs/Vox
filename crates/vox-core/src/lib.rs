@@ -1,4 +1,5 @@
 pub mod diagnostics;
+pub mod external_library;
 pub mod host;
 pub mod ids;
 pub mod opt;
