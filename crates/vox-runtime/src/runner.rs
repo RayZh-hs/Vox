@@ -26,8 +26,41 @@ pub enum RunnerError {
     Session(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSelector {
+    Id(SessionId),
+    Name(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOpenMode {
+    Attach,
+    Create,
+    AttachOrCreate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOpenRequest {
+    pub selector: Option<SessionSelector>,
+    pub mode: SessionOpenMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    pub name: Option<String>,
+    pub attached_endpoints: u64,
+    pub reserved: bool,
+}
+
 pub trait RuntimeRunner: Clone + Send + Sync + 'static {
-    fn open_session(&self, name: Option<&str>) -> Result<SessionId, RunnerError>;
+    fn open_session(&self, request: SessionOpenRequest) -> Result<SessionId, RunnerError>;
+
+    fn close_session(&self, session: SessionId) -> Result<(), RunnerError>;
+
+    fn list_sessions(&self) -> Result<Vec<SessionSummary>, RunnerError>;
+
+    fn set_session_reserved(&self, session: SessionId, reserved: bool) -> Result<(), RunnerError>;
 
     fn evaluate_session_submission(
         &self,
@@ -105,9 +138,17 @@ struct EmbeddedState {
 
 #[derive(Debug, Default)]
 struct SessionRegistry {
-    sessions: BTreeMap<SessionId, SessionState<EmbeddedRunner>>,
+    sessions: BTreeMap<SessionId, SessionEntry>,
     named_sessions: BTreeMap<String, SessionId>,
     next_session_id: u64,
+}
+
+#[derive(Debug)]
+struct SessionEntry {
+    state: SessionState<EmbeddedRunner>,
+    name: Option<String>,
+    attached_endpoints: u64,
+    reserved: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,50 +181,180 @@ impl EmbeddedRunner {
     fn with_session<T>(
         &self,
         session_id: SessionId,
-        action: impl FnOnce(&mut SessionState<EmbeddedRunner>) -> Result<T, RunnerError>,
+        action: impl FnOnce(&mut SessionEntry) -> Result<T, RunnerError>,
     ) -> Result<T, RunnerError> {
         let mut sessions = self
             .inner
             .sessions
             .lock()
             .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
-        let session = sessions
-            .sessions
-            .get_mut(&session_id)
-            .ok_or_else(|| RunnerError::Session(format!("interactive session {} was not found", session_id.0)))?;
+        let session = sessions.sessions.get_mut(&session_id).ok_or_else(|| {
+            RunnerError::Session(format!(
+                "interactive session {} was not found",
+                session_id.0
+            ))
+        })?;
         action(session)
     }
-}
 
-impl RuntimeRunner for EmbeddedRunner {
-    fn open_session(&self, name: Option<&str>) -> Result<SessionId, RunnerError> {
-        let trimmed = name.map(str::trim);
-        if matches!(trimmed, Some("")) {
+    fn allocate_session_id(sessions: &mut SessionRegistry) -> SessionId {
+        sessions.next_session_id += 1;
+        SessionId(sessions.next_session_id)
+    }
+
+    fn insert_session(&self, sessions: &mut SessionRegistry, name: Option<String>) -> SessionId {
+        let session_id = Self::allocate_session_id(sessions);
+        sessions.sessions.insert(
+            session_id,
+            SessionEntry {
+                state: SessionState::new(self.clone()),
+                name: name.clone(),
+                attached_endpoints: 1,
+                reserved: false,
+            },
+        );
+        if let Some(name) = name {
+            sessions.named_sessions.insert(name, session_id);
+        }
+        session_id
+    }
+
+    fn trim_session_name(name: &str) -> Result<&str, RunnerError> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
             return Err(RunnerError::Session(
                 "interactive session name must not be empty".to_owned(),
             ));
         }
+        Ok(trimmed)
+    }
 
+    fn recycle_session_if_unused(
+        sessions: &mut SessionRegistry,
+        session_id: SessionId,
+    ) -> Result<(), RunnerError> {
+        let should_recycle = sessions
+            .sessions
+            .get(&session_id)
+            .map(|entry| entry.attached_endpoints == 0 && !entry.reserved)
+            .unwrap_or(false);
+        if !should_recycle {
+            return Ok(());
+        }
+
+        let Some(entry) = sessions.sessions.remove(&session_id) else {
+            return Ok(());
+        };
+        if let Some(name) = entry.name.as_ref() {
+            sessions.named_sessions.remove(name);
+        }
+        Ok(())
+    }
+}
+
+impl RuntimeRunner for EmbeddedRunner {
+    fn open_session(&self, request: SessionOpenRequest) -> Result<SessionId, RunnerError> {
         let mut sessions = self
             .inner
             .sessions
             .lock()
             .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
-        if let Some(name) = trimmed {
-            if let Some(&session_id) = sessions.named_sessions.get(name) {
-                return Ok(session_id);
+        match request.selector {
+            None => match request.mode {
+                SessionOpenMode::Create | SessionOpenMode::AttachOrCreate => {
+                    Ok(self.insert_session(&mut sessions, None))
+                }
+                SessionOpenMode::Attach => Err(RunnerError::Session(
+                    "anonymous sessions cannot be reopened without an id".to_owned(),
+                )),
+            },
+            Some(SessionSelector::Id(session_id)) => {
+                let entry = sessions.sessions.get_mut(&session_id).ok_or_else(|| {
+                    RunnerError::Session(format!(
+                        "interactive session {} was not found",
+                        session_id.0
+                    ))
+                })?;
+                entry.attached_endpoints += 1;
+                Ok(session_id)
+            }
+            Some(SessionSelector::Name(name)) => {
+                let trimmed = Self::trim_session_name(&name)?;
+                if let Some(&session_id) = sessions.named_sessions.get(trimmed) {
+                    if matches!(request.mode, SessionOpenMode::Create) {
+                        return Err(RunnerError::Session(format!(
+                            "interactive session `{trimmed}` already exists"
+                        )));
+                    }
+                    let entry = sessions.sessions.get_mut(&session_id).ok_or_else(|| {
+                        RunnerError::Session(format!(
+                            "interactive session `{trimmed}` was not found"
+                        ))
+                    })?;
+                    entry.attached_endpoints += 1;
+                    Ok(session_id)
+                } else if matches!(
+                    request.mode,
+                    SessionOpenMode::Create | SessionOpenMode::AttachOrCreate
+                ) {
+                    Ok(self.insert_session(&mut sessions, Some(trimmed.to_owned())))
+                } else {
+                    Err(RunnerError::Session(format!(
+                        "interactive session `{trimmed}` was not found"
+                    )))
+                }
             }
         }
+    }
 
-        sessions.next_session_id += 1;
-        let session_id = SessionId(sessions.next_session_id);
-        sessions
+    fn close_session(&self, session: SessionId) -> Result<(), RunnerError> {
+        let mut sessions = self
+            .inner
             .sessions
-            .insert(session_id, SessionState::new(self.clone()));
-        if let Some(name) = trimmed {
-            sessions.named_sessions.insert(name.to_owned(), session_id);
+            .lock()
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        let entry = sessions.sessions.get_mut(&session).ok_or_else(|| {
+            RunnerError::Session(format!("interactive session {} was not found", session.0))
+        })?;
+        if entry.attached_endpoints == 0 {
+            return Err(RunnerError::Session(format!(
+                "interactive session {} has no attached endpoints",
+                session.0
+            )));
         }
-        Ok(session_id)
+        entry.attached_endpoints -= 1;
+        Self::recycle_session_if_unused(&mut sessions, session)
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionSummary>, RunnerError> {
+        let sessions = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        Ok(sessions
+            .sessions
+            .iter()
+            .map(|(id, entry)| SessionSummary {
+                id: *id,
+                name: entry.name.clone(),
+                attached_endpoints: entry.attached_endpoints,
+                reserved: entry.reserved,
+            })
+            .collect())
+    }
+
+    fn set_session_reserved(&self, session: SessionId, reserved: bool) -> Result<(), RunnerError> {
+        let mut sessions = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        let entry = sessions.sessions.get_mut(&session).ok_or_else(|| {
+            RunnerError::Session(format!("interactive session {} was not found", session.0))
+        })?;
+        entry.reserved = reserved;
+        Self::recycle_session_if_unused(&mut sessions, session)
     }
 
     fn evaluate_session_submission(
@@ -193,6 +364,7 @@ impl RuntimeRunner for EmbeddedRunner {
     ) -> Result<Option<RuntimeValue>, RunnerError> {
         self.with_session(session, |state| {
             state
+                .state
                 .evaluate_submission(raw)
                 .map_err(map_session_error)
         })
@@ -205,20 +377,27 @@ impl RuntimeRunner for EmbeddedRunner {
         raw: &str,
     ) -> Result<RuntimeValue, RunnerError> {
         self.with_session(session, |state| {
-            state.run_script_text(path, raw).map_err(map_session_error)
+            state
+                .state
+                .run_script_text(path, raw)
+                .map_err(map_session_error)
         })
     }
 
     fn drop_session_item(&self, session: SessionId, raw: &str) -> Result<bool, RunnerError> {
-        self.with_session(session, |state| state.drop_item(raw).map_err(map_session_error))
+        self.with_session(session, |state| {
+            state.state.drop_item(raw).map_err(map_session_error)
+        })
     }
 
     fn reset_session(&self, session: SessionId) -> Result<(), RunnerError> {
-        self.with_session(session, |state| state.reset().map_err(map_session_error))
+        self.with_session(session, |state| {
+            state.state.reset().map_err(map_session_error)
+        })
     }
 
     fn snapshot_session_source(&self, session: SessionId) -> Result<String, RunnerError> {
-        self.with_session(session, |state| Ok(state.snapshot_source()))
+        self.with_session(session, |state| Ok(state.state.snapshot_source()))
     }
 
     fn restore_session_snapshot(
@@ -229,6 +408,7 @@ impl RuntimeRunner for EmbeddedRunner {
     ) -> Result<(), RunnerError> {
         self.with_session(session, |state| {
             state
+                .state
                 .restore_snapshot_source(label, text)
                 .map_err(map_session_error)
         })
@@ -241,6 +421,7 @@ impl RuntimeRunner for EmbeddedRunner {
     ) -> Result<(), RunnerError> {
         self.with_session(session, |state| {
             state
+                .state
                 .set_default_xopt(xopt)
                 .map_err(map_session_error)
         })

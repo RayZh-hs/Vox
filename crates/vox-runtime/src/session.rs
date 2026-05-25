@@ -14,8 +14,8 @@ use vox_core::{
 };
 
 use crate::{
-    ReplType, RunnerError, RuntimeRunner, TypeEnvironment, extend_manifest_symbols,
-    infer_environment, language_keywords,
+    ReplType, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest, SessionSelector,
+    SessionSummary, TypeEnvironment, extend_manifest_symbols, infer_environment, language_keywords,
 };
 
 const REPL_MODULE: &str = "repl.session";
@@ -288,9 +288,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             self.runner.reload_script(artifact_id, compiled)?;
             artifact_id
         } else {
-            let artifact_id = self
-                .runner
-                .load_script(compiled, Some(self.default_xopt))?;
+            let artifact_id = self.runner.load_script(compiled, Some(self.default_xopt))?;
             self.active_artifact = Some(artifact_id);
             artifact_id
         };
@@ -407,7 +405,15 @@ impl<R: RuntimeRunner> SessionState<R> {
     }
 }
 
-#[derive(Debug, Clone)]
+impl<R: RuntimeRunner> Drop for SessionState<R> {
+    fn drop(&mut self) {
+        let _ = self.clear_binding_handles();
+        let _ = self.clear_hidden_last();
+        let _ = self.unload_active_artifact();
+    }
+}
+
+#[derive(Debug)]
 pub struct InteractiveSession<R: RuntimeRunner> {
     runner: R,
     session_id: SessionId,
@@ -415,16 +421,62 @@ pub struct InteractiveSession<R: RuntimeRunner> {
 
 impl<R: RuntimeRunner> InteractiveSession<R> {
     pub fn new(runner: R) -> Result<Self, SessionError> {
-        Self::open(runner, None)
+        Self::open(
+            runner,
+            SessionOpenRequest {
+                selector: None,
+                mode: SessionOpenMode::Create,
+            },
+        )
     }
 
     pub fn named(runner: R, name: impl AsRef<str>) -> Result<Self, SessionError> {
-        Self::open(runner, Some(name.as_ref()))
+        Self::open(
+            runner,
+            SessionOpenRequest {
+                selector: Some(SessionSelector::Name(name.as_ref().to_owned())),
+                mode: SessionOpenMode::AttachOrCreate,
+            },
+        )
     }
 
-    fn open(runner: R, name: Option<&str>) -> Result<Self, SessionError> {
-        let session_id = runner.open_session(name).map_err(SessionError::from)?;
+    pub fn attach(runner: R, selector: SessionSelector) -> Result<Self, SessionError> {
+        Self::open(
+            runner,
+            SessionOpenRequest {
+                selector: Some(selector),
+                mode: SessionOpenMode::Attach,
+            },
+        )
+    }
+
+    pub fn create_named(runner: R, name: impl AsRef<str>) -> Result<Self, SessionError> {
+        Self::open(
+            runner,
+            SessionOpenRequest {
+                selector: Some(SessionSelector::Name(name.as_ref().to_owned())),
+                mode: SessionOpenMode::Create,
+            },
+        )
+    }
+
+    pub fn open(runner: R, request: SessionOpenRequest) -> Result<Self, SessionError> {
+        let session_id = runner.open_session(request).map_err(SessionError::from)?;
         Ok(Self { runner, session_id })
+    }
+
+    pub fn id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>, SessionError> {
+        self.runner.list_sessions().map_err(SessionError::from)
+    }
+
+    pub fn set_reserved(&self, reserved: bool) -> Result<(), SessionError> {
+        self.runner
+            .set_session_reserved(self.session_id, reserved)
+            .map_err(SessionError::from)
     }
 
     pub fn completion(&self) -> Result<SessionCompletion, SessionError> {
@@ -463,9 +515,8 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         );
         let front_end = analyze_source(&SourceText::new("<repl-type>", 1, &source))
             .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
-        let environment =
-            infer_environment(&front_end.syntax, &self.runner.package_manifests()?)
-                .map_err(SessionError::Message)?;
+        let environment = infer_environment(&front_end.syntax, &self.runner.package_manifests()?)
+            .map_err(SessionError::Message)?;
         Ok(environment.result.unwrap_or(ReplType::Unit))
     }
 
@@ -516,6 +567,12 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
 
     pub fn package_manifests(&self) -> Result<Vec<PackageManifest>, SessionError> {
         Ok(self.runner.package_manifests()?)
+    }
+}
+
+impl<R: RuntimeRunner> Drop for InteractiveSession<R> {
+    fn drop(&mut self) {
+        let _ = self.runner.close_session(self.session_id);
     }
 }
 
@@ -583,10 +640,14 @@ fn environment_from_snapshot<R: RuntimeRunner>(
     );
     let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
         .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
-    infer_environment(&front_end.syntax, &runner.package_manifests()?).map_err(SessionError::Message)
+    infer_environment(&front_end.syntax, &runner.package_manifests()?)
+        .map_err(SessionError::Message)
 }
 
-fn snapshot_items(snapshot: &str, include_hidden_last: bool) -> Result<Vec<StoredItem>, SessionError> {
+fn snapshot_items(
+    snapshot: &str,
+    include_hidden_last: bool,
+) -> Result<Vec<StoredItem>, SessionError> {
     let front_end = analyze_source(&SourceText::new("<repl-snapshot>", 1, snapshot))
         .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
     let mut items = normalize_items(rebuild_items_from_unit(snapshot, &front_end.syntax));

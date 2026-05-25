@@ -23,6 +23,8 @@ pub struct CompletionSnapshot {
     pub snapshots: Vec<String>,
     pub xopts: Vec<String>,
     pub handles: Vec<String>,
+    pub sessions: Vec<String>,
+    pub session_commands: Vec<String>,
     pub symbols: Vec<String>,
 }
 
@@ -78,6 +80,30 @@ impl CompletionSnapshot {
     fn complete_handles(&self, prefix: &str) -> Vec<Pair> {
         let mut candidates = self
             .handles
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        to_pairs(candidates)
+    }
+
+    fn complete_sessions(&self, prefix: &str) -> Vec<Pair> {
+        let mut candidates = self
+            .sessions
+            .iter()
+            .filter(|candidate| candidate.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        to_pairs(candidates)
+    }
+
+    fn complete_session_commands(&self, prefix: &str) -> Vec<Pair> {
+        let mut candidates = self
+            .session_commands
             .iter()
             .filter(|candidate| candidate.starts_with(prefix))
             .cloned()
@@ -376,6 +402,43 @@ fn complete_command_line(
         ":drop" | ":type" => {
             let start = command_token_start(prefix, argument_start);
             Ok((start, snapshot.complete_symbol(&prefix[start..])))
+        }
+        ":session" => complete_session_line(snapshot, prefix, argument_start),
+        _ => Ok((0, Vec::new())),
+    }
+}
+
+fn complete_session_line(
+    snapshot: &CompletionSnapshot,
+    prefix: &str,
+    argument_start: usize,
+) -> RustylineResult<(usize, Vec<Pair>)> {
+    let rest = &prefix[argument_start..];
+    let trimmed = rest.trim_start();
+    if trimmed.is_empty() {
+        return Ok((argument_start, snapshot.complete_session_commands("")));
+    }
+
+    let leading_ws = rest.len() - trimmed.len();
+    let subcommand_start = argument_start + leading_ws;
+    let Some(space) = trimmed.find(char::is_whitespace) else {
+        return Ok((
+            subcommand_start,
+            snapshot.complete_session_commands(trimmed),
+        ));
+    };
+
+    let subcommand = trimmed[..space].trim();
+    let args_start = subcommand_start
+        + space
+        + trimmed[space..]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .count();
+    match subcommand {
+        "connect" | "new" => {
+            let start = command_token_start(prefix, args_start);
+            Ok((start, snapshot.complete_sessions(&prefix[start..])))
         }
         _ => Ok((0, Vec::new())),
     }

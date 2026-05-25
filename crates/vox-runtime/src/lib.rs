@@ -26,13 +26,16 @@ pub use analysis::{
 };
 pub use artifact_store::ArtifactStore;
 pub use handles::{
-    GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary, HandleStore,
-    HandleMetadata, RealizationKey, RealizedFunctionHandleSummary,
+    GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary,
+    HandleMetadata, HandleStore, RealizationKey, RealizedFunctionHandleSummary,
 };
 use interpreter::Interpreter;
 pub use protocol::CURRENT_PROTOCOL_VERSION;
 pub use remote::RemoteRunner;
-pub use runner::{EmbeddedRunner, RunnerError, RuntimeRunner};
+pub use runner::{
+    EmbeddedRunner, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    SessionSelector, SessionSummary,
+};
 pub use server::{RuntimeServer, RuntimeServerError};
 pub(crate) use session::SessionState;
 pub use session::{InteractiveSession, SessionCompletion, SessionError};
@@ -180,7 +183,9 @@ impl Runtime {
     }
 
     pub fn library(&self, library_id: LibraryId) -> Option<&MountedLibrary> {
-        self.libraries.iter().find(|library| library.id == library_id)
+        self.libraries
+            .iter()
+            .find(|library| library.id == library_id)
     }
 
     pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
@@ -391,6 +396,9 @@ mod tests {
             matches!(closure, RuntimeValue::Handle(_)),
             "closures should remain handle-backed across the session boundary"
         );
+        author
+            .set_reserved(true)
+            .expect("shared session should be reservable");
 
         drop(author);
 
@@ -427,8 +435,8 @@ mod tests {
             42,
         );
 
-        let mut isolated = InteractiveSession::named(runner, "isolated")
-            .expect("isolated session should open");
+        let mut isolated =
+            InteractiveSession::named(runner, "isolated").expect("isolated session should open");
         let error = isolated
             .evaluate_submission("numbers[1]")
             .expect_err("separate named sessions must not share bindings");

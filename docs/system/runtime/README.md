@@ -1,171 +1,170 @@
 # Runtime
 
-`vox-runtime` is the long-lived execution system for Vox.
+`vox-runtime` is the long-lived execution service for Vox.
 
-It loads compiled Vox plans, executes them, caches pure results, tracks `Econ`
-versions, and owns runtime handles for large host values.
+It owns:
 
-Language semantics are defined in [the language overview](../../language/overview.md).
+- mounted host libraries;
+- compiled script artifacts;
+- runtime handles for large values;
+- interactive sessions.
 
-## Role
+It can run in-process through `EmbeddedRunner` or as a TCP server through the
+`vox-runtime` binary.
 
-`vox-runtime` sits below authoring tools and above host libraries.
+## Start the Runtime
 
-- `vox-compiler` performs semantic lowering and most IR optimizations.
-- `vox-runtime` interprets optimized plans.
-- `vox-runtime` owns compiled artifact caches, result caches, handles, and `Econ`.
-- `vox-repl` is a separate client that may link the system directly or attach to the runtime process.
+Run a shared runtime server with:
 
-This supports two deployment modes:
+```sh
+cargo run -p vox-runtime -- --listen 127.0.0.1:4545
+```
 
-- in-process: a program links compiler + runtime and ships as one binary;
-- out-of-process: a program attaches to a shared runtime daemon.
+`--listen` is optional. If omitted, the server listens on `127.0.0.1:4545`.
 
-## Responsibilities
+The runtime prints the address it bound to and then waits for client
+connections.
 
-`vox-runtime` is responsible for:
+## Connect a Client
 
-- mounting libraries;
-- creating, opening, and closing interactive sessions;
-- loading and reloading scripts;
-- exposing a uniform runner API for embedded and attached clients;
-- selecting `NOpt`, `IOpt`, or `SOpt`;
-- executing compiled plans with arguments;
-- memoizing pure evaluation;
-- running `evil` work on demand;
-- managing handles for large host values;
-- tracking and refreshing `Econ` snapshots;
-- reporting lightweight handle metadata;
-- shutting down cleanly.
+The REPL can connect to that runtime with:
 
-The runtime owns shared compiled artifacts, caches, host library mounts,
-handles, and interactive sessions.
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545
+```
 
-An attached client owns only transport-local UI state such as history,
-completion menus, and viewport concerns. A runtime session owns shareable
-interactive definitions and retained results.
+Programs can also connect directly through `RemoteRunner`.
 
-## Execution Model
+To attach to a specific session from the REPL:
 
-`vox-runtime` does not interpret source code directly. It executes compiled
-plans produced by `vox-compiler`.
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@12
+```
 
-The flow is:
+Use `--new` with a named target to create it when missing:
 
-1. load libraries and host packages;
-2. compile or reload a script through `vox-compiler`;
-3. store the compiled artifact;
-4. run the compiled plan with arguments;
-5. reuse cached pure subresults when valid.
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared --new
+```
 
-Pure cache validity depends on:
+## Runtime and Session
 
-- script revision;
-- library revisions;
-- optimization mode;
-- input identity or hash;
-- referenced `Econ` versions.
+The runtime and the session are different objects.
 
-`evil` evaluation is explicit and never enters the pure cache.
+- The runtime is the shared process. It stores libraries, compiled artifacts,
+  live handles, and caches.
+- A session is an interactive workspace inside that runtime. It stores imports,
+  definitions, the last-value binding behind `$`, and any handles retained by
+  those bindings.
 
-## Optimization Modes
+When a client opens a session, all later evaluation happens inside that
+session.
 
-- `NOpt`: correctness only.
-- `IOpt`: low latency, stable caches, minimal recompilation.
-- `SOpt`: sealed execution, more aggressive storage reuse and scheduling.
+## Session Kinds
 
-Most optimization happens in `vox-compiler`. Runtime-specific reuse decisions,
-such as when a large value can be moved or storage can be recycled, happen
-inside `vox-runtime` and depend on the selected mode.
+The runtime supports two kinds of sessions:
 
-The sealed `SOpt` plan is expected to be wasm-oriented:
+- Anonymous session: always creates a new interactive workspace.
+- Named session: reopens the same interactive workspace when another client
+  uses the same name.
 
-- scalars stay in wasm locals where possible;
-- large values travel as runtime handles;
-- aggregate uses are annotated as borrow or consume;
-- tuple and record fields may stay split until a full runtime value must be
-  materialized.
+Named sessions are how multiple clients share one interactive environment.
 
-## Protocol
+Sessions also have two lifecycle states:
 
-When exposed as a daemon, `vox-runtime` uses a compact binary protocol.
-The full wire contract is defined in [Protocol](./protocol.md).
+- attached: one or more client endpoints are currently using the session;
+- reserved: the session is kept even when the attached endpoint count reaches
+  zero.
 
-Design rules:
+An unreserved session is recycled as soon as its attached endpoint count drops
+to zero.
 
-- connections attach clients to the runtime, while sessions hold shareable
-  interactive state;
-- one request yields one response;
-- object ids on the wire are integers, not strings;
-- large values travel as handles rather than serialized payloads;
-- REPL history, completions, and synthetic cell assembly stay out of the
-  runtime boundary.
+## Programmatic Session Use
 
-Session rules:
+Embedded use:
 
-- multiple clients may attach to one session and therefore share bindings,
-  definitions, and retained results;
-- separate sessions do not implicitly share mutable interactive state;
-- closing a client connection should not by itself destroy a durable session;
-- if a session binding refers to a large value handle, the session is
-  responsible for retaining that handle until the binding is dropped or the
-  session closes.
+```rust
+use vox_runtime::{EmbeddedRunner, InteractiveSession};
 
-## Interprocess Communication
+let runner = EmbeddedRunner::default();
+let mut session = InteractiveSession::new(runner)?;
+session.evaluate_submission("val answer = 42;")?;
+```
 
-`vox-runtime` is the IPC hub for Vox tools.
+Remote use with a shared named session:
 
-Different programs should collaborate by attaching to the same runtime and then
-using runtime sessions, handles, callable references, and published bindings to
-exchange data. Clients should not need direct peer-to-peer transfer logic for
-ordinary collaboration.
+```rust
+use vox_runtime::{InteractiveSession, RemoteRunner};
 
-Preferred IPC methods:
+let runner = RemoteRunner::connect("127.0.0.1:4545")?;
+let mut session = InteractiveSession::named(runner, "shared")?;
+session.evaluate_submission("val answer = 42;")?;
+```
 
-- small pure values: copy inline through the protocol;
-- large or opaque values: pass runtime-owned handles;
-- functions: pass callable references backed by runtime metadata or compiled
-  artifacts;
-- caches: reuse runtime-owned entries automatically instead of copying cache
-  contents between clients.
+If another client opens `"shared"` on the same runtime, it sees the same
+interactive state.
 
-Cross-runtime movement is a separate concern. It should use explicit export and
-import bundles rather than pretending a live runtime handle can be portable.
+## What Is Shared
+
+Clients attached to the same runtime share:
+
+- mounted libraries;
+- compiled artifacts;
+- the runtime handle store;
+- runtime-wide caches;
+- any interactive state inside the same named session.
+
+Clients in different sessions do not share:
+
+- bindings;
+- function definitions entered interactively;
+- the `$` value;
+- `:reset` effects.
+
+## Sharing Data
+
+There are two supported ways to share data today.
+
+### 1. Share one named session
+
+If multiple clients should see the same bindings and definitions, they must
+attach to the same named session. This is the direct sharing model.
+
+Anonymous sessions can also be shared by id while they are still live, or after
+they have been marked as reserved.
+
+### 2. Copy source state between sessions
+
+If the sessions must stay separate, copy the session source with snapshot and
+restore operations. In the REPL this is exposed as `:snapshot` and `:restore`.
+
+This copies source-defined interactive state. It does not move a live session
+binding from one session to another inside the runtime.
 
 ## Handles
 
-Small values may be returned inline. Large host values must be returned as opaque handles.
+Large values cross the runtime boundary as handles instead of full serialized
+payloads.
 
-The runtime owns handle lifetime. Clients may:
+Clients can:
 
-- inspect lightweight metadata;
-- release handles explicitly.
+- receive a handle as an evaluation result;
+- inspect a handle summary;
+- retain or release a handle through the runner API.
 
-The runtime must not serialize large host values by default.
+The runtime owns actual handle lifetime and storage.
 
-## Host Integration
+## Session Management
 
-Host libraries should provide:
+At the API and protocol level, clients can:
 
-- type metadata, including exported fields;
-- trait metadata;
-- function signatures;
-- lowered method functions;
-- purity metadata;
-- a stable call boundary for execution.
+- create anonymous sessions;
+- attach to sessions by id;
+- attach to sessions by name;
+- create named sessions on demand;
+- list live sessions;
+- mark a session as reserved or unreserved.
 
-Shared objects are the preferred extension model when cross-language host
-support is needed. The plugin boundary is a versioned C ABI.
-
-`vox-runtime` calls compiled host functions through registered adapters. Host
-libraries do not ship LLVM IR.
-
-## Invariants
-
-- pure Vox code cannot observe mutation of host values;
-- large values keep value semantics through handles;
-- `evil` work is explicit;
-- `Econ` refresh invalidates dependent pure results;
-- unused pure fields of sealed record or tuple producers may be omitted from
-  execution entirely;
-- `SOpt` may change reuse and scheduling, but not semantics.
+The REPL exposes these through `--connect host:port@session`, `--new`, and the
+`:session` command family.

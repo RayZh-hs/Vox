@@ -1,55 +1,92 @@
 # Embedding the Runtime
 
-Vox distinguishes between a runtime and a session.
+This page shows how Rust code uses the Vox runtime directly.
 
-- the runtime owns libraries, compiled artifacts, caches, and handles;
-- a session owns interactive state such as imports, definitions, the last
-  value shorthand, and any handles retained by those bindings.
+The important split is:
 
-This page covers the Rust-side setup path for both embedded and attached
-runtime usage.
+- `RuntimeRunner` gives you a transport-neutral way to talk to a runtime;
+- `InteractiveSession` gives you an interactive workspace inside that runtime.
 
-## Programmatic Setup
+The same session API works with both embedded and remote runners.
 
-In-process setup:
+## Embedded Use
+
+Create a runtime in-process and open a fresh anonymous session:
 
 ```rust
-use vox_runtime::{EmbeddedRunner, InteractiveSession, RuntimeRunner};
+use vox_runtime::{EmbeddedRunner, InteractiveSession};
 
 let runner = EmbeddedRunner::default();
-runner.mount_library(manifest)?;
-
 let mut session = InteractiveSession::new(runner.clone())?;
-session.evaluate_submission("import geometry;")?;
+
+session.evaluate_submission("val answer = 42;")?;
+let value = session.evaluate_submission("answer")?;
 ```
 
-For a REPL frontend:
+Use this when one program owns the runtime and does not need a separate server
+process.
+
+## Remote Use
+
+Connect to a long-lived runtime server:
 
 ```rust
-use vox_repl::ReplSession;
+use vox_runtime::{InteractiveSession, RemoteRunner};
 
-let session = ReplSession::with_runner(runner);
-```
-
-## Attached Setup
-
-When using a long-lived runtime daemon, clients connect through a runner that
-implements the same `RuntimeRunner` trait.
-
-```rust
 let runner = RemoteRunner::connect("127.0.0.1:4545")?;
-let session = ReplSession::with_runner(runner);
+let mut session = InteractiveSession::new(runner)?;
 ```
 
-The session API does not care whether the runner is embedded or attached.
+This opens a fresh anonymous session on that runtime.
 
-## Session Semantics
+## Named Sessions
 
-- multiple sessions may talk to one runtime;
-- multiple clients may attach to one session and share that session's
-  interactive source state;
-- separate sessions do not share interactive source state;
-- sessions do share mounted libraries, runtime handles, and caches;
-- resetting one session does not destroy another session's definitions;
-- disconnecting one client does not by itself destroy a durable shared session;
-- releasing a handle affects runtime-owned lifetime, not session syntax state.
+Named sessions are the mechanism for shared interactive state.
+
+```rust
+use vox_runtime::{InteractiveSession, RemoteRunner, SessionSelector};
+
+let runner = RemoteRunner::connect("127.0.0.1:4545")?;
+let mut shared = InteractiveSession::named(runner, "shared")?;
+
+shared.evaluate_submission("val answer = 42;")?;
+```
+
+If another client opens `"shared"` on the same runtime, it attaches to the same
+interactive workspace and can read or extend those bindings.
+
+To attach to an existing session by id instead of by name:
+
+```rust
+use vox_core::ids::SessionId;
+use vox_runtime::{InteractiveSession, RemoteRunner, SessionSelector};
+
+let runner = RemoteRunner::connect("127.0.0.1:4545")?;
+let mut session = InteractiveSession::attach(runner, SessionSelector::Id(SessionId(12)))?;
+```
+
+## Session Rules
+
+- `InteractiveSession::new(...)` creates a fresh anonymous session.
+- `InteractiveSession::named(..., "name")` reopens the same session when the
+  name already exists.
+- `InteractiveSession::attach(..., selector)` attaches to an existing session
+  and fails when it does not exist.
+- `InteractiveSession::create_named(..., "name")` creates a fresh named
+  session and fails when the name already exists.
+- Different session names are isolated from one another.
+- Sessions on the same runtime still share runtime-level resources such as
+  mounted libraries and live handles.
+- An unreserved session is recycled when its attached endpoint count reaches
+  zero.
+
+## Sharing Data
+
+Choose the sharing model based on what you need:
+
+- Shared interactive workspace: use one named session.
+- Isolated workspaces with copied source state: export session source with
+  `snapshot_source()` and import it with `restore_snapshot_source()`.
+
+There is currently no higher-level API that copies a live binding directly from
+one session into another separate session.

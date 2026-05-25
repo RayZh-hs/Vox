@@ -11,7 +11,7 @@ use vox_core::{
 };
 
 pub const MAGIC: u32 = 0x5658_5254;
-pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_INLINE_VALUE_BYTES: u32 = 1024 * 1024;
 
@@ -53,6 +53,9 @@ pub enum Opcode {
     RestoreSession = 0x08,
     RunSessionScript = 0x09,
     SetSessionXOpt = 0x0a,
+    CloseSession = 0x0b,
+    ListSessions = 0x0c,
+    SetSessionReserved = 0x0d,
     MountLibrary = 0x10,
     UnmountLibrary = 0x11,
     LoadScript = 0x20,
@@ -82,6 +85,9 @@ impl Opcode {
             0x08 => Self::RestoreSession,
             0x09 => Self::RunSessionScript,
             0x0a => Self::SetSessionXOpt,
+            0x0b => Self::CloseSession,
+            0x0c => Self::ListSessions,
+            0x0d => Self::SetSessionReserved,
             0x10 => Self::MountLibrary,
             0x11 => Self::UnmountLibrary,
             0x20 => Self::LoadScript,
@@ -322,7 +328,9 @@ pub fn read_frame(reader: &mut impl Read) -> Result<Option<Frame>, ProtocolError
         .ok_or_else(|| ProtocolError::message("invalid frame kind"))?;
     let payload_len = u32::from_le_bytes(header[20..24].try_into().expect("slice has fixed width"));
     if payload_len > MAX_PAYLOAD_BYTES {
-        return Err(ProtocolError::message("payload exceeds protocol size limit"));
+        return Err(ProtocolError::message(
+            "payload exceeds protocol size limit",
+        ));
     }
 
     let mut payload = vec![0_u8; payload_len as usize];
@@ -524,10 +532,7 @@ pub fn decode_inline_value(reader: &mut PayloadReader<'_>) -> Result<InlineValue
     }
 }
 
-pub fn encode_optimization(
-    writer: &mut PayloadWriter,
-    value: OptimizationLevel,
-) {
+pub fn encode_optimization(writer: &mut PayloadWriter, value: OptimizationLevel) {
     writer.write_u8(match value {
         OptimizationLevel::NOpt => 0,
         OptimizationLevel::IOpt => 1,
@@ -566,8 +571,9 @@ pub fn encode_manifest(
     for function in &manifest.functions {
         writer.write_string(&function.name)?;
         writer.write_u32(
-            u32::try_from(function.parameters.len())
-                .map_err(|_| ProtocolError::message("parameter list exceeds protocol size limit"))?,
+            u32::try_from(function.parameters.len()).map_err(|_| {
+                ProtocolError::message("parameter list exceeds protocol size limit")
+            })?,
         );
         for parameter in &function.parameters {
             writer.write_string(&parameter.name)?;
@@ -583,9 +589,7 @@ pub fn encode_manifest(
     Ok(())
 }
 
-pub fn decode_manifest(
-    reader: &mut PayloadReader<'_>,
-) -> Result<PackageManifest, ProtocolError> {
+pub fn decode_manifest(reader: &mut PayloadReader<'_>) -> Result<PackageManifest, ProtocolError> {
     let package = ModulePath::parse(&reader.read_string()?)
         .map_err(|diagnostic| ProtocolError::message(diagnostic.message))?;
     let type_count = reader.read_u32()? as usize;
@@ -647,8 +651,9 @@ fn encode_vox_type(writer: &mut PayloadWriter, ty: &VoxType) -> Result<(), Proto
         VoxType::Tuple(items) => {
             writer.write_u8(0x05);
             writer.write_u32(
-                u32::try_from(items.len())
-                    .map_err(|_| ProtocolError::message("tuple type exceeds protocol size limit"))?,
+                u32::try_from(items.len()).map_err(|_| {
+                    ProtocolError::message("tuple type exceeds protocol size limit")
+                })?,
             );
             for item in items {
                 encode_vox_type(writer, item)?;
@@ -772,10 +777,8 @@ fn decode_diagnostics(reader: &mut PayloadReader<'_>) -> Result<DiagnosticBag, P
         diagnostics.push(Diagnostic {
             severity,
             message,
-            span: (start != 0 || end != 0).then_some(vox_core::diagnostics::TextSpan {
-                start,
-                end,
-            }),
+            span: (start != 0 || end != 0)
+                .then_some(vox_core::diagnostics::TextSpan { start, end }),
         });
     }
     Ok(DiagnosticBag::from(diagnostics))

@@ -17,6 +17,7 @@ use vox_core::{
 
 use crate::{
     CacheClearScope, EmbeddedRunner, RunnerError, Runtime, RuntimeError, RuntimeRunner,
+    SessionOpenMode, SessionOpenRequest, SessionSelector,
     protocol::{
         CURRENT_PROTOCOL_VERSION, DEFAULT_INLINE_VALUE_BYTES, ErrorCode, FLAG_HANDLE_RESULT,
         FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter, ProtocolError,
@@ -92,6 +93,7 @@ struct RuntimeConnection {
     libraries: BTreeMap<u32, LibraryId>,
     handles: BTreeMap<u32, HandleLease>,
     local_handle_ids: BTreeMap<HandleId, u32>,
+    attached_sessions: BTreeMap<SessionId, u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +136,7 @@ impl RuntimeConnection {
             libraries: BTreeMap::new(),
             handles: BTreeMap::new(),
             local_handle_ids: BTreeMap::new(),
+            attached_sessions: BTreeMap::new(),
         }
     }
 
@@ -151,12 +154,12 @@ impl RuntimeConnection {
                         None,
                     )?;
                     let _ = write_frame(&mut stream, &response);
-                    self.cleanup_handles();
+                    self.cleanup();
                     return Err(error);
                 }
             };
             let Some(frame) = maybe_frame else {
-                self.cleanup_handles();
+                self.cleanup();
                 return Ok(());
             };
 
@@ -166,7 +169,7 @@ impl RuntimeConnection {
                 Ok(outcome) => {
                     write_frame(&mut stream, &outcome.frame)?;
                     if outcome.close_after {
-                        self.cleanup_handles();
+                        self.cleanup();
                         return Ok(());
                     }
                 }
@@ -181,7 +184,7 @@ impl RuntimeConnection {
                     )?;
                     write_frame(&mut stream, &response)?;
                     if failure.fatal {
-                        self.cleanup_handles();
+                        self.cleanup();
                         return Ok(());
                     }
                 }
@@ -239,6 +242,9 @@ impl RuntimeConnection {
             Opcode::RestoreSession => self.handle_restore_session(frame),
             Opcode::RunSessionScript => self.handle_run_session_script(frame),
             Opcode::SetSessionXOpt => self.handle_set_session_xopt(frame),
+            Opcode::CloseSession => self.handle_close_session(frame),
+            Opcode::ListSessions => self.handle_list_sessions(frame),
+            Opcode::SetSessionReserved => self.handle_set_session_reserved(frame),
             Opcode::MountLibrary => self.handle_mount_library(frame),
             Opcode::UnmountLibrary => Err(WireFailure::recoverable(
                 ErrorCode::UnsupportedOpcode,
@@ -347,15 +353,38 @@ impl RuntimeConnection {
 
     fn handle_open_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
         let mut payload = PayloadReader::new(&frame.payload);
-        let session_kind = payload.read_u8().map_err(WireFailure::bad_argument)?;
-        self.read_reserved(&mut payload, 3)?;
-        let name = match session_kind {
-            0 => None,
-            1 => Some(payload.read_string().map_err(WireFailure::bad_argument)?),
+        let mode = match payload.read_u8().map_err(WireFailure::bad_argument)? {
+            0 => SessionOpenMode::Attach,
+            1 => SessionOpenMode::Create,
+            2 => SessionOpenMode::AttachOrCreate,
             _ => {
                 return Err(WireFailure::recoverable(
                     ErrorCode::BadArgument,
-                    "invalid interactive session kind",
+                    "invalid interactive session open mode",
+                ));
+            }
+        };
+        let selector = match payload.read_u8().map_err(WireFailure::bad_argument)? {
+            0 => {
+                self.read_reserved(&mut payload, 2)?;
+                None
+            }
+            1 => {
+                self.read_reserved(&mut payload, 2)?;
+                Some(SessionSelector::Id(SessionId(
+                    payload.read_u32().map_err(WireFailure::bad_argument)? as u64,
+                )))
+            }
+            2 => {
+                self.read_reserved(&mut payload, 2)?;
+                Some(SessionSelector::Name(
+                    payload.read_string().map_err(WireFailure::bad_argument)?,
+                ))
+            }
+            _ => {
+                return Err(WireFailure::recoverable(
+                    ErrorCode::BadArgument,
+                    "invalid interactive session selector",
                 ));
             }
         };
@@ -363,8 +392,9 @@ impl RuntimeConnection {
 
         let session_id = self
             .runner
-            .open_session(name.as_deref())
+            .open_session(SessionOpenRequest { selector, mode })
             .map_err(WireFailure::from_runner)?;
+        *self.attached_sessions.entry(session_id).or_insert(0) += 1;
         let session_wire_id = u32::try_from(session_id.0).map_err(|_| {
             WireFailure::recoverable(
                 ErrorCode::RuntimeFailed,
@@ -381,6 +411,100 @@ impl RuntimeConnection {
             session_wire_id,
             0,
             response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_close_session(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let Some(count) = self.attached_sessions.get_mut(&session_id) else {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "interactive session is not attached on this connection",
+            ));
+        };
+        if *count == 0 {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "interactive session is not attached on this connection",
+            ));
+        }
+        *count -= 1;
+        if *count == 0 {
+            self.attached_sessions.remove(&session_id);
+        }
+        self.runner
+            .close_session(session_id)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::CloseSession,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_list_sessions(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let sessions = self
+            .runner
+            .list_sessions()
+            .map_err(WireFailure::from_runner)?;
+        let mut payload = PayloadWriter::new();
+        payload.write_u32(u32::try_from(sessions.len()).map_err(|_| {
+            WireFailure::recoverable(
+                ErrorCode::RuntimeFailed,
+                "session list exceeds the 32-bit protocol range",
+            )
+        })?);
+        for session in sessions {
+            let session_id = u32::try_from(session.id.0).map_err(|_| {
+                WireFailure::recoverable(
+                    ErrorCode::RuntimeFailed,
+                    "session id exceeds the 32-bit protocol range",
+                )
+            })?;
+            payload.write_u32(session_id);
+            payload.write_u8(u8::from(session.name.is_some()));
+            payload.write_u8(u8::from(session.reserved));
+            payload.write_u8(0);
+            payload.write_u8(0);
+            payload.write_u64(session.attached_endpoints);
+            if let Some(name) = session.name {
+                payload
+                    .write_string(&name)
+                    .map_err(WireFailure::bad_argument)?;
+            }
+        }
+        success_frame(
+            self.protocol_version(),
+            Opcode::ListSessions,
+            frame.header.request_id,
+            0,
+            0,
+            payload.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_set_session_reserved(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let reserved = payload.read_u8().map_err(WireFailure::bad_argument)? != 0;
+        self.read_reserved(&mut payload, 3)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+        self.runner
+            .set_session_reserved(session_id, reserved)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::SetSessionReserved,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
         )
         .map_err(WireFailure::bad_argument)
     }
@@ -551,16 +675,17 @@ impl RuntimeConnection {
 
         let mut manifest_payload = PayloadReader::new(&source);
         let manifest = decode_manifest(&mut manifest_payload).map_err(WireFailure::bad_argument)?;
-        manifest_payload.finish().map_err(WireFailure::bad_argument)?;
+        manifest_payload
+            .finish()
+            .map_err(WireFailure::bad_argument)?;
 
         let library = self
             .runner
             .with_runtime(|runtime| {
                 let actual_id = runtime.mount_library(manifest);
-                let mounted = runtime
-                    .library(actual_id)
-                    .cloned()
-                    .ok_or_else(|| RunnerError::Unavailable("mounted library was not found".to_owned()))?;
+                let mounted = runtime.library(actual_id).cloned().ok_or_else(|| {
+                    RunnerError::Unavailable("mounted library was not found".to_owned())
+                })?;
                 Ok(mounted)
             })
             .map_err(WireFailure::from_runner)?;
@@ -589,8 +714,9 @@ impl RuntimeConnection {
                 let artifact = runtime
                     .artifact(artifact_id)
                     .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
-                let parameter_count = u32::try_from(artifact.parameters.len())
-                    .map_err(|_| RunnerError::Protocol("script parameter count exceeds u32".to_owned()))?;
+                let parameter_count = u32::try_from(artifact.parameters.len()).map_err(|_| {
+                    RunnerError::Protocol("script parameter count exceeds u32".to_owned())
+                })?;
                 Ok((artifact_id, artifact.source_revision, parameter_count))
             })
             .map_err(WireFailure::from_runner)?;
@@ -622,8 +748,9 @@ impl RuntimeConnection {
                 let artifact = runtime
                     .artifact(artifact_id)
                     .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
-                let parameter_count = u32::try_from(artifact.parameters.len())
-                    .map_err(|_| RunnerError::Protocol("script parameter count exceeds u32".to_owned()))?;
+                let parameter_count = u32::try_from(artifact.parameters.len()).map_err(|_| {
+                    RunnerError::Protocol("script parameter count exceeds u32".to_owned())
+                })?;
                 Ok((artifact.source_revision, parameter_count))
             })
             .map_err(WireFailure::from_runner)?;
@@ -755,15 +882,14 @@ impl RuntimeConnection {
         let actual = self.resolve_handle(frame.header.target_id)?;
         let metadata = self
             .runner
-            .with_runtime(|runtime| {
-                Ok(runtime.handle_metadata(actual))
-            })
+            .with_runtime(|runtime| Ok(runtime.handle_metadata(actual)))
             .map_err(WireFailure::from_runner)?
             .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownHandle, "unknown handle"))?;
 
         let mut response = PayloadWriter::new();
         response.write_u32(frame.header.target_id);
-        response.write_string(&metadata.summary.type_name)
+        response
+            .write_string(&metadata.summary.type_name)
             .map_err(WireFailure::bad_argument)?;
         response.write_u64(metadata.summary.bytes.unwrap_or(0));
         response.write_u32(metadata.ref_count);
@@ -788,11 +914,10 @@ impl RuntimeConnection {
         let release_refs = payload.read_u32().map_err(WireFailure::bad_argument)?;
         payload.finish().map_err(WireFailure::bad_argument)?;
 
-        let lease = self
-            .handles
-            .get(&local_id)
-            .copied()
-            .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownHandle, "unknown handle"))?;
+        let lease =
+            self.handles.get(&local_id).copied().ok_or_else(|| {
+                WireFailure::recoverable(ErrorCode::UnknownHandle, "unknown handle")
+            })?;
         if release_refs > lease.owned_refs {
             return Err(WireFailure::recoverable(
                 ErrorCode::BadArgument,
@@ -828,7 +953,10 @@ impl RuntimeConnection {
     }
 
     fn handle_cache_stats(&self, request_id: u32) -> Result<Frame, WireFailure> {
-        let stats = self.runner.cache_stats().map_err(WireFailure::from_runner)?;
+        let stats = self
+            .runner
+            .cache_stats()
+            .map_err(WireFailure::from_runner)?;
         let mut response = PayloadWriter::new();
         response.write_u64(stats.artifacts as u64);
         response.write_u64(stats.pure_cache_entries as u64);
@@ -851,7 +979,12 @@ impl RuntimeConnection {
             0 => CacheClearScope::All,
             1 => CacheClearScope::Artifacts,
             2 => CacheClearScope::PureCache,
-            _ => return Err(WireFailure::recoverable(ErrorCode::BadArgument, "invalid cache scope")),
+            _ => {
+                return Err(WireFailure::recoverable(
+                    ErrorCode::BadArgument,
+                    "invalid cache scope",
+                ));
+            }
         };
         self.read_reserved(&mut payload, 3)?;
         payload.finish().map_err(WireFailure::bad_argument)?;
@@ -892,8 +1025,9 @@ impl RuntimeConnection {
             ));
         }
 
-        let source = String::from_utf8(source)
-            .map_err(|_| WireFailure::recoverable(ErrorCode::BadArgument, "script source is not valid UTF-8"))?;
+        let source = String::from_utf8(source).map_err(|_| {
+            WireFailure::recoverable(ErrorCode::BadArgument, "script source is not valid UTF-8")
+        })?;
         self.next_source_revision += 1;
         Ok((
             SourceText::new(logical_path, self.next_source_revision, source),
@@ -1045,7 +1179,20 @@ impl RuntimeConnection {
                 "interactive session target_id must not be zero",
             ));
         }
-        Ok(SessionId(session_id as u64))
+        let session_id = SessionId(session_id as u64);
+        if self
+            .attached_sessions
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
+            == 0
+        {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "interactive session is not attached on this connection",
+            ));
+        }
+        Ok(session_id)
     }
 
     fn resolve_handle(&self, local_id: u32) -> Result<HandleId, WireFailure> {
@@ -1055,7 +1202,12 @@ impl RuntimeConnection {
             .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownHandle, "unknown handle"))
     }
 
-    fn cleanup_handles(&mut self) {
+    fn cleanup(&mut self) {
+        for (session_id, count) in std::mem::take(&mut self.attached_sessions) {
+            for _ in 0..count {
+                let _ = self.runner.close_session(session_id);
+            }
+        }
         for lease in self.handles.values().copied() {
             for _ in 0..lease.owned_refs {
                 let _ = self.runner.release_handle(lease.actual);
@@ -1107,10 +1259,9 @@ impl WireFailure {
 
     fn from_runner(error: RunnerError) -> Self {
         match error {
-            RunnerError::Runtime(RuntimeError::CompilationFailed(message)) => Self::recoverable(
-                ErrorCode::CompileFailed,
-                message,
-            ),
+            RunnerError::Runtime(RuntimeError::CompilationFailed(message)) => {
+                Self::recoverable(ErrorCode::CompileFailed, message)
+            }
             RunnerError::Runtime(RuntimeError::MissingArtifact(_))
             | RunnerError::Runtime(RuntimeError::NotAScript(_)) => {
                 Self::recoverable(ErrorCode::UnknownScript, error.to_string())
@@ -1128,12 +1279,7 @@ impl WireFailure {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::TcpListener,
-        sync::atomic::Ordering,
-        thread,
-        time::Instant,
-    };
+    use std::{net::TcpListener, sync::atomic::Ordering, thread, time::Instant};
 
     use vox_core::value::{InlineValue, RuntimeValue};
 
@@ -1146,9 +1292,10 @@ mod tests {
         let (addr, server_thread) = spawn_test_server(3);
 
         let shared_addr = addr.to_string();
-        let runner_one = RemoteRunner::connect(shared_addr.as_str()).expect("first client connects");
-        let mut first = InteractiveSession::named(runner_one, "shared")
-            .expect("shared session should open");
+        let runner_one =
+            RemoteRunner::connect(shared_addr.as_str()).expect("first client connects");
+        let mut first =
+            InteractiveSession::named(runner_one, "shared").expect("shared session should open");
         assert!(
             first
                 .evaluate_submission("val numbers = [39, 41];")
@@ -1163,9 +1310,13 @@ mod tests {
             matches!(closure, RuntimeValue::Handle(_)),
             "remote closures should cross the protocol as handles"
         );
+        first
+            .set_reserved(true)
+            .expect("shared session should be reservable");
         drop(first);
 
-        let runner_two = RemoteRunner::connect(shared_addr.as_str()).expect("second client connects");
+        let runner_two =
+            RemoteRunner::connect(shared_addr.as_str()).expect("second client connects");
         let mut second = InteractiveSession::named(runner_two, "shared")
             .expect("second client should attach to the same session");
         assert_runtime_int(
@@ -1196,12 +1347,18 @@ mod tests {
         );
         drop(isolated);
 
-        server_thread.join().expect("test server should stop cleanly");
+        server_thread
+            .join()
+            .expect("test server should stop cleanly");
     }
 
-    fn spawn_test_server(expected_connections: usize) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+    fn spawn_test_server(
+        expected_connections: usize,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
-        let addr = listener.local_addr().expect("listener should expose an address");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose an address");
         let server = RuntimeServer::default();
 
         let handle = thread::spawn(move || {
@@ -1211,7 +1368,9 @@ mod tests {
                 let instance_id = server.next_instance_id.fetch_add(1, Ordering::Relaxed);
                 let mut connection =
                     RuntimeConnection::new(server.runner.clone(), instance_id, started_at);
-                connection.serve(stream).expect("connection should complete");
+                connection
+                    .serve(stream)
+                    .expect("connection should complete");
             }
         });
 

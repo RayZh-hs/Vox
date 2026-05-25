@@ -1,112 +1,154 @@
 # REPL
 
-`vox-repl` is the human-facing interactive tool for Vox.
+`vox-repl` is the interactive frontend for evaluating Vox code.
 
-It is separate from both `vox-compiler` and `vox-runtime`.
+It can either:
 
-## Role
+- run with an embedded runtime in the same process;
+- connect to a separate `vox-runtime` server.
 
-The REPL exists for interactive authoring, quick evaluation, and debugging.
+## Starting a REPL
 
-It should feel simple:
+Start an embedded REPL thus:
 
-- enter code;
-- inspect values and types;
-- reload code quickly;
-- keep useful state across commands.
-
-## Architecture
-
-`vox-repl` may run in two modes:
-
-- embedded mode: link compiler + runtime directly into one process;
-- client mode: attach to a `vox-runtime` daemon.
-
-Embedded mode is best for a self-contained binary. Client mode is best when
-multiple tools should share one runtime process, one cache, and optionally one
-interactive session.
-
-## Model
-
-The REPL is not the runtime protocol.
-
-The REPL may present the user with a growing synthetic script or module-like
-state, but the durable interactive environment should live in a runtime-managed
-session rather than only inside the REPL process.
-
-These actions should map onto runtime-owned session and runner calls, not
-expand the runtime protocol with REPL-only UI details or reimplement parsing
-logic in the REPL.
-
-## Commands
-
-Everything that does not start with `:` is treated as Vox input.
-
-The REPL should support a small command set:
-
-### General Commands
-
-- `:help`: show available commands.
-- `:quit`: exit the REPL.
-
-### Environment Manipulation
-
-- `:reset`: clear interactive state.
-- `:clear`: clear the screen.
-- `:env`: show visible imports, bindings, and functions.
-- `:snapshot <name>`: save the current state under a name for later retrieval, overwriting existing snapshots if exists. snapshots are stored under `/tmp/vox-repl/snapshots` on Unix-like machines, and `%APPDATA%\\vox-repl\\snapshots` on Windows by default.
-- `:restore <name>`: restore a previously saved snapshot by name, replacing the current state. if the snapshot does not exist, an error message is shown.
-- `:drop <name>`: remove a binding or definition from interactive state.
-
-### Running Scripts
-
-- `:run <file>`: run a script file in the current state.
-
-### Inspection
-
-- `:show <handle | handle-id>`: show lightweight metadata for a handle.
-- `:type <expr>`: show the inferred type of an expression.
-- `:handles`: list live handles visible to the REPL session.
-
-## Shorthands
-
-The REPL supports the following shorthands:
-
-- `$`: Shorthand for the last evaluated object.
-- Arrow keys: navigate command history.
-- Tab: auto-complete commands and identifiers.
-- Ctrl+C: interrupt long-running evaluations.
-- Ctrl+D: exit the REPL.
-
-## Example
-
-```text
->>> import math;
->>> val x = 4.0;
->>> math.sqrt(x)
-2.0
->>> :type $
-Float
+```sh
+cargo run -p vox-repl
 ```
 
-## Behavior
+You can also start a shared runtime first, then attach the REPL to it:
 
-The REPL should:
+```sh
+cargo run -p vox-runtime -- --listen 127.0.0.1:4545
+cargo run -p vox-repl -- --connect 127.0.0.1:4545
+```
 
-- surface diagnostics clearly;
-- preserve prior successful state when a new input fails;
-- make `IOpt` the default interactive mode;
-- allow switching to `SOpt` for final execution checks;
-- reconnect cleanly to a named session when requested;
-- make session sharing explicit rather than ambient;
-- display large values through summaries and previews rather than full serialization.
+To attach to an existing remote session, append `@session`:
 
-## Design Rules
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@12
+```
 
-- keep REPL concerns out of `vox-runtime`;
-- keep parser, session, and artifact-lifetime mechanics in `vox-runtime`;
-- prefer one runtime API that works both in-process and over a future runner protocol;
-- treat the runtime session, not the raw socket connection, as the shareable
-  unit of interactive state;
-- do not make REPL history, completion menus, or other UI state a protocol concept;
-- optimize for fast edit-check-run cycles.
+Use `--new` with a named target to create it if it does not already exist:
+
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared --new
+```
+
+## What the REPL Owns
+
+The REPL owns terminal interaction only:
+
+- line editing;
+- history;
+- completion UI;
+- command parsing;
+- snapshot files.
+
+The runtime owns execution and interactive state:
+
+- bindings;
+- functions;
+- imports;
+- the `$` last value;
+- retained handles.
+
+## Current Session Behavior
+
+Every `ReplSession` opens one runtime session and evaluates all user input
+inside it.
+
+The current CLI behavior is:
+
+- embedded mode opens a fresh anonymous session;
+- `--connect host:port` opens a fresh anonymous session on the remote runtime;
+- `--connect host:port@name` attaches to an existing named session;
+- `--connect host:port@id` attaches to an existing session by id;
+- `--connect host:port@name --new` attaches to that named session or creates it
+  if it does not exist.
+
+Session ids are numeric. If the token after `@` is all digits, the REPL treats
+it as a session id.
+
+## Entering Code
+
+Any line that does not start with `:` is treated as Vox code.
+
+Examples:
+
+```text
+>>> val x = 4;
+>>> x + 1
+5
+>>> :type x
+Int
+```
+
+The REPL preserves prior successful state when a later submission fails.
+
+## REPL Commands
+
+- `:help` shows the command list.
+- `:quit` exits the REPL.
+- `:reset` clears the current interactive session state.
+- `:clear` clears the terminal screen.
+- `:env` prints visible imports, bindings, and functions.
+- `:snapshot <name>` saves the current session source to a local snapshot file.
+- `:restore <name>` replaces the current session state with a snapshot file.
+- `:run <file>` runs a Vox script file in the current session context.
+- `:show <handle>` prints a lightweight summary for a handle id.
+- `:type <expr>` prints the inferred type of an expression.
+- `:handles` lists live handles visible through the runtime.
+- `:drop <name>` removes a binding or definition from the session.
+- `:xopt <mode>` sets the session default optimization mode to `NOpt`, `IOpt`,
+  or `SOpt`.
+- `:session connect <id-or-name>` switches to an existing session.
+- `:session new [name]` creates a fresh anonymous or named session and switches
+  to it.
+- `:session reserve` toggles whether the current session is kept when its
+  endpoint count reaches zero.
+- `:session list` shows all live sessions, their ids, attachment counts, and
+  reserve status.
+
+## Shorthands and Editing
+
+- `$` refers to the last evaluated value.
+- Arrow keys move through input history.
+- `Tab` completes commands, snapshot names, handles, and visible symbols.
+- `Ctrl+C` interrupts the current input line.
+- `Ctrl+D` exits the REPL.
+
+## Snapshot Files
+
+Snapshots are stored locally by the REPL process:
+
+- Unix-like systems: `/tmp/vox-repl/snapshots`
+- Windows: `%APPDATA%\\vox-repl\\snapshots`
+
+`:snapshot` writes `<name>.vox`.
+
+`:restore` loads that file and replaces the current session state.
+
+This is the current user-facing way to move source-defined interactive state
+from one session to another.
+
+## Sharing Data
+
+Different users often mean different things by "share", so the rules are:
+
+- Same session: shared bindings, shared functions, shared `$`, shared retained
+  handles.
+- Different sessions on the same runtime: separate interactive state.
+- Different runtimes: completely separate state.
+- A session with zero attached endpoints is recycled unless it has been marked
+  as reserved.
+
+From the REPL CLI, the practical sharing options are:
+
+- attach multiple REPLs or tools to the same reserved or still-live session by
+  name or id;
+- use `:session list` to discover session ids and names;
+- use snapshot and restore to copy session source between separate sessions.
+
+There is no REPL command that directly copies a live binding or handle from one
+session into another session.

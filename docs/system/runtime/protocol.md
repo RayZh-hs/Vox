@@ -22,8 +22,9 @@ synthetic source assembly. Those stay in the client.
 
 The transport connection and the interactive session are distinct concepts. A
 connection is the ordered byte stream used by one attached client. A session is
-the durable shareable environment that may later be revisited or shared with
-other clients.
+the shareable interactive environment that may later be revisited or shared
+with other clients while it still has attached endpoints or has been marked as
+reserved.
 
 ## Connection Model
 
@@ -38,7 +39,8 @@ other clients.
 - sharing: library mounts, caches, `Econ` state, and handle storage are owned
   by the runtime and may be shared across connections;
 - disconnect: dropping the connection should release connection-owned
-  references, but should not destroy a durable shared session by itself.
+  references; when a session reaches zero attached endpoints, the runtime may
+  recycle it unless that session is reserved.
 
 The first frame on every connection must be `HELLO`.
 
@@ -113,6 +115,9 @@ All other bits are reserved and must be sent as `0`.
 - `0x08`: `RESTORE_SESSION`
 - `0x09`: `RUN_SESSION_SCRIPT`
 - `0x0a`: `SET_SESSION_XOPT`
+- `0x0b`: `CLOSE_SESSION`
+- `0x0c`: `LIST_SESSIONS`
+- `0x0d`: `SET_SESSION_RESERVED`
 - `0x10`: `MOUNT_LIBRARY`
 - `0x11`: `UNMOUNT_LIBRARY`
 - `0x20`: `LOAD_SCRIPT`
@@ -256,9 +261,11 @@ u64 runtime_uptime_ms
 Request payload:
 
 ```text
-u8 session_kind      // 0=anonymous durable session, 1=named durable session
-u8 reserved[3]
-string session_name  // present only when session_kind = 1
+u8 open_mode         // 0=attach, 1=create, 2=attach_or_create
+u8 selector_kind     // 0=anonymous, 1=session_id, 2=session_name
+u8 reserved[2]
+u32 session_id       // present only when selector_kind = 1
+string session_name  // present only when selector_kind = 2
 ```
 
 Success response payload:
@@ -269,11 +276,65 @@ u32 session_id
 
 Rules:
 
-- opening an anonymous session always creates a fresh runtime-managed session;
-- opening a named session reattaches to the existing session when the name is
-  already present, or creates it otherwise;
+- `selector_kind = 0` with `open_mode = create` opens a fresh anonymous
+  session;
+- `selector_kind = 1` attaches to an existing session by id;
+- `selector_kind = 2` with `open_mode = attach` attaches to an existing named
+  session;
+- `selector_kind = 2` with `open_mode = create` creates a fresh named session
+  and fails if that name already exists;
+- `selector_kind = 2` with `open_mode = attach_or_create` reattaches when the
+  name already exists or creates the named session otherwise;
 - session ids are runtime-issued and may be reused on later requests across
   multiple connections attached to the same runtime instance.
+
+### `CLOSE_SESSION`
+
+`target_id` is `session_id`.
+
+Request payload: empty.
+
+Success response payload: empty.
+
+Closing a session endpoint decrements that session's attached-endpoint count on
+the current connection.
+
+### `LIST_SESSIONS`
+
+`target_id` must be `0`.
+
+Request payload: empty.
+
+Success response payload:
+
+```text
+u32 session_count
+SessionSummary sessions[session_count]
+```
+
+Where each `SessionSummary` is:
+
+```text
+u32 session_id
+u8 has_name
+u8 reserved
+u8 reserved_bytes[2]
+u64 attached_endpoints
+string session_name  // present only when has_name = 1
+```
+
+### `SET_SESSION_RESERVED`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+u8 reserved          // 0=false, 1=true
+u8 reserved_bytes[3]
+```
+
+Success response payload: empty.
 
 ### `EVALUATE_SESSION`
 

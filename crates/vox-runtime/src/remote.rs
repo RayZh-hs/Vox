@@ -16,12 +16,13 @@ use vox_core::{
 };
 
 use crate::{
-    CacheStats, RunnerError, RuntimeRunner,
+    CacheStats, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest, SessionSelector,
+    SessionSummary,
     protocol::{
         CURRENT_PROTOCOL_VERSION, DEFAULT_INLINE_VALUE_BYTES, ErrorCode, FLAG_HANDLE_RESULT,
-        FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter,
-        ProtocolError, decode_error_frame, decode_inline_value, encode_inline_value,
-        encode_manifest, encode_optimization, read_frame, success_frame, write_frame,
+        FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter, ProtocolError,
+        decode_error_frame, decode_inline_value, encode_inline_value, encode_manifest,
+        encode_optimization, read_frame, success_frame, write_frame,
     },
 };
 
@@ -48,8 +49,8 @@ struct RemoteState {
 
 impl RemoteRunner {
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Self, RunnerError> {
-        let mut stream =
-            TcpStream::connect(addr).map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        let mut stream = TcpStream::connect(addr)
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
         stream
             .set_nodelay(true)
             .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
@@ -92,7 +93,9 @@ impl RemoteRunner {
 
         let frame = read_frame(stream)
             .map_err(protocol_to_runner)?
-            .ok_or_else(|| RunnerError::Unavailable("runtime closed the connection during HELLO".to_owned()))?;
+            .ok_or_else(|| {
+                RunnerError::Unavailable("runtime closed the connection during HELLO".to_owned())
+            })?;
         match frame.header.kind {
             FrameKind::Success => {
                 let mut payload = PayloadReader::new(&frame.payload);
@@ -101,8 +104,7 @@ impl RemoteRunner {
                 let _server_caps = payload.read_u32().map_err(protocol_to_runner)?;
                 let _instance_id = payload.read_u32().map_err(protocol_to_runner)?;
                 let max_payload_bytes = payload.read_u32().map_err(protocol_to_runner)?;
-                let max_inline_value_bytes =
-                    payload.read_u32().map_err(protocol_to_runner)?;
+                let max_inline_value_bytes = payload.read_u32().map_err(protocol_to_runner)?;
                 payload.finish().map_err(protocol_to_runner)?;
                 Ok((selected_version, max_payload_bytes, max_inline_value_bytes))
             }
@@ -120,8 +122,9 @@ impl RemoteRunner {
         flags: u32,
         payload: Vec<u8>,
     ) -> Result<Frame, RunnerError> {
-        let payload_len = u32::try_from(payload.len())
-            .map_err(|_| RunnerError::Protocol("request payload exceeds protocol size limit".to_owned()))?;
+        let payload_len = u32::try_from(payload.len()).map_err(|_| {
+            RunnerError::Protocol("request payload exceeds protocol size limit".to_owned())
+        })?;
         if payload_len > self.inner.max_payload_bytes {
             return Err(RunnerError::Protocol(
                 "request payload exceeds the negotiated runtime limit".to_owned(),
@@ -152,7 +155,9 @@ impl RemoteRunner {
         loop {
             let response = read_frame(&mut *stream)
                 .map_err(protocol_to_runner)?
-                .ok_or_else(|| RunnerError::Unavailable("runtime closed the connection".to_owned()))?;
+                .ok_or_else(|| {
+                    RunnerError::Unavailable("runtime closed the connection".to_owned())
+                })?;
             if response.header.kind == FrameKind::Event {
                 continue;
             }
@@ -251,21 +256,30 @@ impl RemoteRunner {
 }
 
 impl RuntimeRunner for RemoteRunner {
-    fn open_session(&self, name: Option<&str>) -> Result<SessionId, RunnerError> {
+    fn open_session(&self, request: SessionOpenRequest) -> Result<SessionId, RunnerError> {
         let mut payload = PayloadWriter::new();
-        match name {
-            Some(name) => {
-                payload.write_u8(1);
-                payload.write_u8(0);
-                payload.write_u8(0);
-                payload.write_u8(0);
-                payload.write_string(name).map_err(protocol_to_runner)?;
-            }
+        payload.write_u8(match request.mode {
+            SessionOpenMode::Attach => 0,
+            SessionOpenMode::Create => 1,
+            SessionOpenMode::AttachOrCreate => 2,
+        });
+        match request.selector {
             None => {
                 payload.write_u8(0);
                 payload.write_u8(0);
                 payload.write_u8(0);
+            }
+            Some(SessionSelector::Id(session_id)) => {
+                payload.write_u8(1);
                 payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_u32(self.to_wire_id(session_id.0, "session")?);
+            }
+            Some(SessionSelector::Name(name)) => {
+                payload.write_u8(2);
+                payload.write_u8(0);
+                payload.write_u8(0);
+                payload.write_string(&name).map_err(protocol_to_runner)?;
             }
         }
         let frame = self.invoke(Opcode::OpenSession, 0, 0, payload.into_inner())?;
@@ -273,6 +287,56 @@ impl RuntimeRunner for RemoteRunner {
         let session_id = response.read_u32().map_err(protocol_to_runner)?;
         response.finish().map_err(protocol_to_runner)?;
         Ok(SessionId(session_id as u64))
+    }
+
+    fn close_session(&self, session: SessionId) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let _ = self.invoke(Opcode::CloseSession, target_id, 0, Vec::new())?;
+        Ok(())
+    }
+
+    fn list_sessions(&self) -> Result<Vec<SessionSummary>, RunnerError> {
+        let frame = self.invoke(Opcode::ListSessions, 0, 0, Vec::new())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let count = response.read_u32().map_err(protocol_to_runner)? as usize;
+        let mut sessions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = SessionId(response.read_u32().map_err(protocol_to_runner)? as u64);
+            let has_name = response.read_u8().map_err(protocol_to_runner)? != 0;
+            let reserved = response.read_u8().map_err(protocol_to_runner)? != 0;
+            let _reserved0 = response.read_u8().map_err(protocol_to_runner)?;
+            let _reserved1 = response.read_u8().map_err(protocol_to_runner)?;
+            let attached_endpoints = response.read_u64().map_err(protocol_to_runner)?;
+            let name = if has_name {
+                Some(response.read_string().map_err(protocol_to_runner)?)
+            } else {
+                None
+            };
+            sessions.push(SessionSummary {
+                id,
+                name,
+                attached_endpoints,
+                reserved,
+            });
+        }
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(sessions)
+    }
+
+    fn set_session_reserved(&self, session: SessionId, reserved: bool) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_u8(u8::from(reserved));
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        let _ = self.invoke(
+            Opcode::SetSessionReserved,
+            target_id,
+            0,
+            payload.into_inner(),
+        )?;
+        Ok(())
     }
 
     fn evaluate_session_submission(
@@ -594,6 +658,9 @@ fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
                 | Opcode::RestoreSession
                 | Opcode::RunSessionScript
                 | Opcode::SetSessionXOpt
+                | Opcode::CloseSession
+                | Opcode::ListSessions
+                | Opcode::SetSessionReserved
         )
     );
     Ok(match error.code {
@@ -609,8 +676,12 @@ fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
         ErrorCode::UnknownLibrary | ErrorCode::UnknownScript | ErrorCode::UnknownHandle => {
             RunnerError::Protocol(message)
         }
-        ErrorCode::CompileFailed => RunnerError::Runtime(crate::RuntimeError::CompilationFailed(message)),
-        ErrorCode::RuntimeFailed => RunnerError::Runtime(crate::RuntimeError::ExecutionFailed(message)),
+        ErrorCode::CompileFailed => {
+            RunnerError::Runtime(crate::RuntimeError::CompilationFailed(message))
+        }
+        ErrorCode::RuntimeFailed => {
+            RunnerError::Runtime(crate::RuntimeError::ExecutionFailed(message))
+        }
     })
 }
 

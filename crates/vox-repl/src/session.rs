@@ -5,13 +5,19 @@ use std::{
 };
 
 use vox_core::{
-    ids::HandleId,
+    ids::{HandleId, SessionId},
     opt::OptimizationLevel,
     value::{InlineValue, RuntimeValue},
 };
-use vox_runtime::{EmbeddedRunner, InteractiveSession, RuntimeRunner, TypeEnvironment};
+use vox_runtime::{
+    EmbeddedRunner, InteractiveSession, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    SessionSelector, SessionSummary, TypeEnvironment,
+};
 
-use crate::{CompletionSnapshot, command::ReplCommand};
+use crate::{
+    CompletionSnapshot,
+    command::{ReplCommand, SessionCommand},
+};
 
 const LAST_VALUE_NAME: &str = "__repl_last";
 
@@ -32,8 +38,9 @@ impl ReplOutput {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReplSession<R: RuntimeRunner = EmbeddedRunner> {
+    runner: R,
     runtime: InteractiveSession<R>,
 }
 
@@ -45,10 +52,19 @@ impl Default for ReplSession<EmbeddedRunner> {
 
 impl<R: RuntimeRunner> ReplSession<R> {
     pub fn with_runner(runner: R) -> Self {
-        Self {
-            runtime: InteractiveSession::new(runner)
-                .expect("interactive session should open"),
-        }
+        Self::with_session_request(
+            runner,
+            SessionOpenRequest {
+                selector: None,
+                mode: SessionOpenMode::Create,
+            },
+        )
+    }
+
+    pub fn with_session_request(runner: R, request: SessionOpenRequest) -> Self {
+        let runtime = InteractiveSession::open(runner.clone(), request)
+            .expect("interactive session should open");
+        Self { runner, runtime }
     }
 
     pub fn handle_line(&mut self, line: &str) -> ReplOutput {
@@ -74,6 +90,13 @@ impl<R: RuntimeRunner> ReplSession<R> {
             Ok(runtime) => (runtime.handles, runtime.symbols),
             Err(_) => (Vec::new(), Vec::new()),
         };
+        let sessions = self
+            .runtime
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|session| session_completion_keys(&session))
+            .collect::<Vec<_>>();
 
         let mut snapshot = CompletionSnapshot {
             commands: vec![
@@ -90,10 +113,18 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 ":handles".to_owned(),
                 ":drop".to_owned(),
                 ":xopt".to_owned(),
+                ":session".to_owned(),
             ],
             snapshots: available_snapshot_names(),
             xopts: vec!["NOpt".to_owned(), "IOpt".to_owned(), "SOpt".to_owned()],
             handles,
+            sessions,
+            session_commands: vec![
+                "connect".to_owned(),
+                "new".to_owned(),
+                "reserve".to_owned(),
+                "list".to_owned(),
+            ],
             symbols,
         };
 
@@ -157,6 +188,39 @@ impl<R: RuntimeRunner> ReplSession<R> {
                     Err(error) => ReplOutput::error(error.to_string()),
                 }
             }
+            ReplCommand::Session(command) => self.handle_session_command(command),
+        }
+    }
+
+    fn handle_session_command(&mut self, command: SessionCommand) -> ReplOutput {
+        match command {
+            SessionCommand::Connect(target) => {
+                let selector = match parse_session_selector(&target) {
+                    Ok(selector) => selector,
+                    Err(error) => return ReplOutput::error(error),
+                };
+                let next = match InteractiveSession::attach(self.runner.clone(), selector) {
+                    Ok(session) => session,
+                    Err(error) => return ReplOutput::error(error.to_string()),
+                };
+                self.replace_runtime(next, "connected to")
+            }
+            SessionCommand::New(name) => {
+                let next = match name {
+                    Some(name) => match InteractiveSession::create_named(self.runner.clone(), name)
+                    {
+                        Ok(session) => session,
+                        Err(error) => return ReplOutput::error(error.to_string()),
+                    },
+                    None => match InteractiveSession::new(self.runner.clone()) {
+                        Ok(session) => session,
+                        Err(error) => return ReplOutput::error(error.to_string()),
+                    },
+                };
+                self.replace_runtime(next, "opened")
+            }
+            SessionCommand::Reserve => self.toggle_session_reserve(),
+            SessionCommand::List => self.list_sessions(),
         }
     }
 
@@ -215,6 +279,70 @@ impl<R: RuntimeRunner> ReplSession<R> {
             Ok(None) => ReplOutput::error(format!("handle {} was not found", handle.0)),
             Err(error) => ReplOutput::error(error.to_string()),
         }
+    }
+
+    fn list_sessions(&self) -> ReplOutput {
+        let sessions = match self.runtime.list_sessions() {
+            Ok(sessions) => sessions,
+            Err(error) => return ReplOutput::error(error.to_string()),
+        };
+        if sessions.is_empty() {
+            return ReplOutput::message("no sessions".to_owned());
+        }
+
+        let current = self.runtime.id();
+        let lines = sessions
+            .iter()
+            .map(|session| render_session_row(session, session.id == current))
+            .collect::<Vec<_>>();
+        ReplOutput::message(lines.join("\n"))
+    }
+
+    fn toggle_session_reserve(&mut self) -> ReplOutput {
+        let summary = match self.current_session_summary() {
+            Ok(summary) => summary,
+            Err(error) => return ReplOutput::error(error),
+        };
+        let next_reserved = !summary.reserved;
+        if let Err(error) = self.runtime.set_reserved(next_reserved) {
+            return ReplOutput::error(error.to_string());
+        }
+        let summary = match self.current_session_summary() {
+            Ok(summary) => summary,
+            Err(error) => return ReplOutput::error(error),
+        };
+        ReplOutput::message(format!(
+            "{} {}",
+            if summary.reserved {
+                "reserved"
+            } else {
+                "unreserved"
+            },
+            render_session_identity(&summary)
+        ))
+    }
+
+    fn replace_runtime(&mut self, next: InteractiveSession<R>, verb: &str) -> ReplOutput {
+        let previous = std::mem::replace(&mut self.runtime, next);
+        drop(previous);
+        match self.current_session_summary() {
+            Ok(summary) => {
+                ReplOutput::message(format!("{verb} {}", render_session_status(&summary)))
+            }
+            Err(_) => ReplOutput::message(format!("{verb} session {}", self.runtime.id().0)),
+        }
+    }
+
+    fn current_session_summary(&self) -> Result<SessionSummary, String> {
+        let current_id = self.runtime.id();
+        let sessions = self
+            .runtime
+            .list_sessions()
+            .map_err(|error| normalize_error_message(error.to_string()))?;
+        sessions
+            .into_iter()
+            .find(|session| session.id == current_id)
+            .ok_or_else(|| format!("current session {} was not found", current_id.0))
     }
 
     fn snapshot(&self, name: &str) -> ReplOutput {
@@ -286,21 +414,71 @@ impl<R: RuntimeRunner> ReplSession<R> {
 
 fn render_help() -> String {
     [
-        ":help              - show a brief description of each REPL command",
-        ":quit              - exit the REPL",
-        ":reset             - clear interactive state",
-        ":clear             - clear the screen",
-        ":env               - show visible imports, bindings, and functions",
-        ":snapshot <name>   - save the current state as a named snapshot",
-        ":restore <name>    - restore a previously saved snapshot",
-        ":run <file>        - run a script file in the current state",
-        ":show <handle>     - show lightweight metadata for a handle",
-        ":type <expr>       - show the inferred type of an expression",
-        ":handles           - list live handles visible to this session",
-        ":drop <name>       - remove a binding or definition from interactive state",
-        ":xopt <mode>       - set the default optimization mode (NOpt, IOpt, SOpt)",
+        ":help                      - show a brief description of each REPL command",
+        ":quit                      - exit the REPL",
+        ":reset                     - clear interactive state",
+        ":clear                     - clear the screen",
+        ":env                       - show visible imports, bindings, and functions",
+        ":snapshot [name]           - save the current state as a named snapshot",
+        ":restore [name]            - restore a previously saved snapshot",
+        ":run [file]                - run a script file in the current state",
+        ":show [handle]             - show lightweight metadata for a handle",
+        ":type [expr]               - show the inferred type of an expression",
+        ":handles                   - list live handles visible to this session",
+        ":drop [name]               - remove a binding or definition from interactive state",
+        ":xopt [mode]               - set the default optimization mode (NOpt, IOpt, SOpt)",
+        ":session connect (target)  - attach to an existing session by id or name",
+        ":session new [name]        - create a fresh anonymous or named session",
+        ":session reserve           - toggle whether the current session is retained at 0 users",
+        ":session list              - list available sessions",
     ]
     .join("\n")
+}
+
+fn parse_session_selector(raw: &str) -> Result<SessionSelector, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("session id or name must not be empty".to_owned());
+    }
+
+    match trimmed.parse::<u64>() {
+        Ok(id) => Ok(SessionSelector::Id(SessionId(id))),
+        Err(_) => Ok(SessionSelector::Name(trimmed.to_owned())),
+    }
+}
+
+fn render_session_row(session: &SessionSummary, current: bool) -> String {
+    format!(
+        "{} {} attached={} reserved={}",
+        if current { "*" } else { " " },
+        render_session_identity(session),
+        session.attached_endpoints,
+        if session.reserved { "yes" } else { "no" }
+    )
+}
+
+fn render_session_identity(session: &SessionSummary) -> String {
+    match session.name.as_deref() {
+        Some(name) => format!("{} ({name})", session.id.0),
+        None => format!("{} (<anonymous>)", session.id.0),
+    }
+}
+
+fn render_session_status(session: &SessionSummary) -> String {
+    format!(
+        "{} attached={} reserved={}",
+        render_session_identity(session),
+        session.attached_endpoints,
+        if session.reserved { "yes" } else { "no" }
+    )
+}
+
+fn session_completion_keys(session: &SessionSummary) -> Vec<String> {
+    let mut keys = vec![session.id.0.to_string()];
+    if let Some(name) = session.name.as_ref() {
+        keys.push(name.clone());
+    }
+    keys
 }
 
 fn render_inline_value(value: &InlineValue) -> String {

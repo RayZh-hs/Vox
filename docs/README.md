@@ -14,15 +14,28 @@ Thus Vox is born, a language designed for NBP scripting and execution. It featur
 
 ## Getting Started
 
-Vox is currently in early development, and to install the development version you need to manually clone the repository and build it from source.
+Vox is currently built from source.
 
-```
+```sh
 git clone https://github.com/RayZh-hs/Vox
 cd Vox
 ```
 
-Use cargo to build the project and spawn the REPL:
+Start the REPL with an embedded runtime:
 
+```sh
+cargo run -p vox-repl
 ```
-cargo run repl
+
+Or start a shared runtime and attach the REPL to it:
+
+```sh
+cargo run -p vox-runtime -- --listen 127.0.0.1:4545
+cargo run -p vox-repl -- --connect 127.0.0.1:4545
+```
+
+To attach to a specific remote session, append `@name` or `@id`:
+
+```sh
+cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared --new
 ```

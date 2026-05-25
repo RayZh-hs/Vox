@@ -5,20 +5,28 @@ use rustyline::{
     KeyEvent, Modifiers, Movement, RepeatCount, history::DefaultHistory,
 };
 use vox_repl::{CompletionUi, ReplHelper, ReplOutput, ReplSession, TabCompletion};
-use vox_runtime::{EmbeddedRunner, RemoteRunner, RuntimeRunner};
+use vox_runtime::{
+    EmbeddedRunner, RemoteRunner, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    SessionSelector,
+};
 
 const PRIMARY_PROMPT: &str = ">>> ";
 const CONTINUATION_PROMPT: &str = "... ";
 const INDENT: &str = "    ";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let runner = match parse_connect_addr()? {
-        Some(addr) => RunnerChoice::Remote(RemoteRunner::connect(addr)?),
+    let runner = match parse_connect_spec()? {
+        Some(spec) => RunnerChoice::Remote {
+            runner: RemoteRunner::connect(spec.addr)?,
+            session: spec.session,
+        },
         None => RunnerChoice::Embedded(EmbeddedRunner::default()),
     };
     match runner {
         RunnerChoice::Embedded(runner) => run_repl(ReplSession::with_runner(runner)),
-        RunnerChoice::Remote(runner) => run_repl(ReplSession::with_runner(runner)),
+        RunnerChoice::Remote { runner, session } => {
+            run_repl(ReplSession::with_session_request(runner, session))
+        }
     }
 }
 
@@ -109,12 +117,21 @@ fn run_repl<R: RuntimeRunner>(mut session: ReplSession<R>) -> Result<(), Box<dyn
 
 enum RunnerChoice {
     Embedded(EmbeddedRunner),
-    Remote(RemoteRunner),
+    Remote {
+        runner: RemoteRunner,
+        session: SessionOpenRequest,
+    },
 }
 
-fn parse_connect_addr() -> Result<Option<String>, Box<dyn Error>> {
+struct RemoteConnectSpec {
+    addr: String,
+    session: SessionOpenRequest,
+}
+
+fn parse_connect_spec() -> Result<Option<RemoteConnectSpec>, Box<dyn Error>> {
     let mut args = env::args().skip(1);
     let mut connect = None;
+    let mut create_if_missing = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -124,8 +141,9 @@ fn parse_connect_addr() -> Result<Option<String>, Box<dyn Error>> {
                 };
                 connect = Some(addr);
             }
+            "--new" => create_if_missing = true,
             "--help" | "-h" => {
-                println!("Usage: vox-repl [--connect host:port]");
+                println!("Usage: vox-repl [--connect host:port[@session]] [--new]");
                 std::process::exit(0);
             }
             other => {
@@ -134,7 +152,71 @@ fn parse_connect_addr() -> Result<Option<String>, Box<dyn Error>> {
         }
     }
 
-    Ok(connect)
+    let Some(connect) = connect else {
+        if create_if_missing {
+            return Err("`--new` requires `--connect host:port@session`".into());
+        }
+        return Ok(None);
+    };
+
+    let (addr, selector) = split_connect_target(&connect)?;
+    let session = match selector {
+        Some(SessionSelector::Id(id)) => {
+            if create_if_missing {
+                return Err(
+                    format!("`--new` cannot create a session with explicit id {}", id.0).into(),
+                );
+            }
+            SessionOpenRequest {
+                selector: Some(SessionSelector::Id(id)),
+                mode: SessionOpenMode::Attach,
+            }
+        }
+        Some(SessionSelector::Name(name)) => SessionOpenRequest {
+            selector: Some(SessionSelector::Name(name)),
+            mode: if create_if_missing {
+                SessionOpenMode::AttachOrCreate
+            } else {
+                SessionOpenMode::Attach
+            },
+        },
+        None => SessionOpenRequest {
+            selector: None,
+            mode: SessionOpenMode::Create,
+        },
+    };
+
+    Ok(Some(RemoteConnectSpec { addr, session }))
+}
+
+fn split_connect_target(raw: &str) -> Result<(String, Option<SessionSelector>), Box<dyn Error>> {
+    let (addr, target) = match raw.rsplit_once('@') {
+        Some((_, target)) if target.trim().is_empty() => {
+            return Err("session id or name after `@` must not be empty".into());
+        }
+        Some((addr, target)) => (addr.to_owned(), Some(target)),
+        None => (raw.to_owned(), None),
+    };
+    if addr.trim().is_empty() {
+        return Err("`--connect` requires an address".into());
+    }
+
+    let selector = match target {
+        Some(target) => Some(parse_session_selector(target)?),
+        None => None,
+    };
+    Ok((addr, selector))
+}
+
+fn parse_session_selector(raw: &str) -> Result<SessionSelector, Box<dyn Error>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("session id or name must not be empty".into());
+    }
+    match trimmed.parse::<u64>() {
+        Ok(id) => Ok(SessionSelector::Id(vox_core::ids::SessionId(id))),
+        Err(_) => Ok(SessionSelector::Name(trimmed.to_owned())),
+    }
 }
 
 #[derive(Clone, Copy)]
