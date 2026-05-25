@@ -1,10 +1,10 @@
 # Expressions
 
-This chapter defines the expression language and its precedence.
+This chapter defines Vox expressions and operator precedence.
 
 ## 1. Overview
 
-Vox is expression-oriented.
+Vox is expression-oriented. Most constructs produce values.
 
 The following constructs are expressions:
 
@@ -176,7 +176,7 @@ Rules:
 
 ## 6. `when` Expressions
 
-`when` is reserved for type dispatch.
+`when` is used for type-based dispatch.
 
 ```ebnf
 WhenExpr
@@ -223,7 +223,7 @@ A block evaluates to:
 
 ## 8. Range Expressions
 
-Vox uses Rust-style range semantics.
+Range expressions use standard half-open and closed forms.
 
 The range forms are:
 
@@ -237,7 +237,7 @@ RangeExpr
    |  "..=" OrExpr
 ```
 
-Their meanings are:
+Range meanings:
 
 - `start..end`: inclusive lower bound, exclusive upper bound;
 - `start..`: inclusive lower bound with no upper bound;

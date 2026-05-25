@@ -1,7 +1,6 @@
 # Types and Declarations
 
-This chapter defines the Vox type system surface and the declaration forms that
-appear at top level.
+This chapter defines Vox type syntax and top-level declarations.
 
 ## 1. Types
 
@@ -107,7 +106,7 @@ Rules:
 
 - each generic parameter has exactly one trait bound;
 - bounds are named trait constraints;
-- user-authored trait declarations are not part of this specification.
+- user-authored trait declarations are not available in Vox.
 
 Examples:
 
@@ -130,7 +129,7 @@ Rules:
 - `private import` is permitted but equivalent to an omitted visibility
   modifier.
 
-Selective imports and import aliasing are not part of this specification.
+Selective imports and import aliasing are not available in Vox.
 
 ## 5. Script Parameters
 
@@ -168,7 +167,7 @@ TypeAnnotation
 Rules:
 
 - `val` declares an immutable binding;
-- `var` declares a reassignable local-style binding;
+- `var` declares a reassignable binding;
 - an omitted type annotation is inferred from the initializer.
 
 ## 7. Function Declarations

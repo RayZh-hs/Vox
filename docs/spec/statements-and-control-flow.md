@@ -18,8 +18,8 @@ ExprStatement
   ::= Expr ";"
 ```
 
-The final expression in a block is not an `ExprStatement`. It is a trailing
-expression and has no semicolon.
+The final expression in a block is a trailing expression, not an
+`ExprStatement`, and it has no semicolon.
 
 ## 2. Local Value Declarations
 
@@ -107,11 +107,7 @@ PanicStatement
 
 The panic message is passed to the host.
 
-## 8. Desugaring Model
+## 8. Local Mutation
 
-`var`, assignment, compound assignment, and `for` are surface-language sugar.
-
-They do not introduce shared mutable references.
-
-Implementations may lower them into immutable core forms such as fresh
-bindings and folds, provided the observable behavior is preserved.
+`var`, assignment, compound assignment, and `for` are local control-flow
+features. They do not introduce shared mutable references.

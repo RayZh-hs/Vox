@@ -1,17 +1,15 @@
 # Source Model
 
-This chapter defines Vox source files, modules, and top-level structure.
+This chapter defines the file-level structure of Vox source code.
 
-## 1. Compilation Units
+## 1. Files
 
-A Vox source file is a compilation unit.
+A Vox source file is exactly one of:
 
-Each compilation unit is exactly one of:
-
-- a package file; or
+- a package file;
 - a script file.
 
-The first declaration in the file is the file header.
+The first line of the file is the file header.
 
 ## 2. Module Paths
 
@@ -30,7 +28,7 @@ Examples:
 
 ## 3. Package Files
 
-A package file declares reusable code that may be imported by other Vox files.
+A package file declares reusable code.
 
 ```ebnf
 PackageUnit
@@ -40,13 +38,12 @@ PackageHeader
   ::= "package" ModulePath
 ```
 
-Rules:
+Package rules:
 
 - a package file must not contain a top-level trailing expression;
 - a package file may contain top-level `val` initializers;
 - a package exports its `public` declarations and `public import`s;
-- a package may contain `evil fun` declarations, but the package itself does
-  not evaluate as a top-level effectful computation.
+- a package may contain `evil fun` declarations.
 
 ## 4. Script Files
 
@@ -64,7 +61,7 @@ ScriptResult
   ::= Expr
 ```
 
-Rules:
+Script rules:
 
 - a script may declare `param` inputs;
 - a script may end with one top-level trailing expression;
@@ -83,8 +80,6 @@ TopLevelItem
    |  FunctionDecl
 ```
 
-Additional top-level forms are not part of this specification.
-
 ## 6. Visibility
 
 Vox has two visibility modifiers:
@@ -96,15 +91,15 @@ They are mutually exclusive.
 
 If a declaration has no visibility modifier, it is private by default.
 
-`public` and `private` may prefix any top-level declaration form defined by
-this specification that accepts visibility.
+`public` and `private` may prefix any top-level declaration form that accepts
+visibility.
 
-In a package file:
+In packages:
 
 - `public` exports the declaration from the package;
 - `private` keeps it internal to the file.
 
-In a script file:
+In scripts:
 
 - declarations remain script-local regardless of visibility spelling;
 - `public` has no import/export effect.

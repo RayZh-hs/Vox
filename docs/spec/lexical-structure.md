@@ -1,6 +1,6 @@
 # Lexical Structure
 
-This chapter defines comments, identifiers, keywords, operators, and literals.
+This chapter defines comments, identifiers, operators, and literals.
 
 ## 1. Whitespace
 
@@ -109,7 +109,7 @@ The language uses the following operators and punctuation:
 .. ..=
 ```
 
-The `=>` token is reserved and has no meaning in this specification.
+The `=>` token is reserved. Its language meaning will be implemented later.
 
 ## 6. Literals
 
@@ -247,7 +247,7 @@ Rules:
 
 ## 7. Statement Terminators
 
-Declarations and simple statements terminate with `;`.
+Declarations and simple statements end with `;`.
 
 A block expression does not require a trailing semicolon after its closing `}`.
 

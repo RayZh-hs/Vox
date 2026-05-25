@@ -1,7 +1,7 @@
 # Effects and Execution
 
-This chapter defines purity, `evil`, `econ`, and the execution model visible
-from source code.
+This chapter defines purity, `evil`, `econ`, and the source-level execution
+rules visible to Vox users.
 
 ## 1. Purity
 
@@ -69,8 +69,8 @@ Semantics:
 - pure computations that depend on an `Econ[T]` depend on the snapshot version,
   not on re-running the effect.
 
-This specification defines no additional special `Econ` syntax beyond
-`econ[T] { ... }`.
+Runtime support for refreshing `econ` snapshots will be implemented. The
+surface syntax already exists.
 
 ## 5. Evaluation Model
 
@@ -87,8 +87,6 @@ Vox uses value semantics.
 Consequences:
 
 - passing a value behaves as passing an independent value;
-- implementations may share storage internally when that sharing is not
-  observable;
 - Vox has no user-visible reference syntax such as `&` or `mut&`;
 - host values exposed to pure Vox code must behave immutably.
 
@@ -97,28 +95,3 @@ Consequences:
 `var` and loop reassignment are local conveniences only.
 
 They do not create mutable shared objects or mutable references.
-
-The language remains value-oriented even when these surface forms are used.
-
-## 8. Optimization Modes
-
-The language recognizes three execution modes:
-
-- `NOpt`
-- `IOpt`
-- `SOpt`
-
-These modes do not change source-level semantics.
-
-They may change implementation strategy, including:
-
-- optimization effort;
-- cache retention policy;
-- storage reuse aggressiveness.
-
-`SOpt` may reuse storage more aggressively than `IOpt`, but it must preserve
-the same observable behavior.
-
-The source language does not define additional sealed-function syntax.
-`SOpt` lowering strategy is a compiler concern and is documented in the system
-design notes.
