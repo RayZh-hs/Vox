@@ -621,32 +621,74 @@ fn path_to_label(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+#[derive(Clone, Copy)]
+enum ErrorKind {
+    Generic,
+    Compile,
+    Runtime,
+}
+
 fn normalize_error_message(message: String) -> String {
-    let mut normalized = message.trim().to_owned();
+    let normalized = message.trim();
+    let (kind, body) = if let Some(stripped) = normalized.strip_prefix("compilation failed:\n") {
+        (ErrorKind::Compile, stripped)
+    } else if let Some(stripped) = normalized.strip_prefix("script execution failed: ") {
+        (ErrorKind::Runtime, stripped)
+    } else {
+        (ErrorKind::Generic, normalized)
+    };
 
-    if let Some(stripped) = normalized.strip_prefix("compilation failed:\n") {
-        normalized = stripped.to_owned();
-    }
-    if let Some(stripped) = normalized.strip_prefix("script execution failed: ") {
-        normalized = stripped.to_owned();
-    }
-
-    let lines = normalized
+    let lines = body
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let line = line
-                .trim()
-                .strip_prefix("Error: ")
-                .or_else(|| line.trim().strip_prefix("error: "))
-                .unwrap_or(line.trim());
-            format!("TypeError: {line}")
-        })
+        .map(|line| normalize_error_line(kind, line.trim()))
         .collect::<Vec<_>>();
 
     if lines.is_empty() {
-        "TypeError".to_owned()
+        match kind {
+            ErrorKind::Compile => "CompileError".to_owned(),
+            ErrorKind::Runtime => "RuntimeError".to_owned(),
+            ErrorKind::Generic => "Error".to_owned(),
+        }
     } else {
         lines.join("\n")
     }
+}
+
+fn normalize_error_line(kind: ErrorKind, line: &str) -> String {
+    match kind {
+        ErrorKind::Compile => {
+            if let Some(stripped) = line
+                .strip_prefix("Error: ")
+                .or_else(|| line.strip_prefix("error: "))
+            {
+                format!("SyntaxError: {stripped}")
+            } else if has_explicit_error_prefix(line) {
+                line.to_owned()
+            } else {
+                format!("CompileError: {line}")
+            }
+        }
+        ErrorKind::Runtime => {
+            if has_explicit_error_prefix(line) {
+                line.to_owned()
+            } else {
+                format!("RuntimeError: {line}")
+            }
+        }
+        ErrorKind::Generic => {
+            if has_explicit_error_prefix(line) {
+                line.to_owned()
+            } else {
+                format!("Error: {line}")
+            }
+        }
+    }
+}
+
+fn has_explicit_error_prefix(line: &str) -> bool {
+    matches!(
+        line.split_once(':').map(|(prefix, _)| prefix),
+        Some("Error" | "SyntaxError" | "CompileError" | "RuntimeError" | "TypeError")
+    )
 }

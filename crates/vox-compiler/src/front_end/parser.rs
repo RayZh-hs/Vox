@@ -49,7 +49,7 @@ impl Parser {
             let result = self.parse_expr()?;
             self.expect_simple(
                 TokenKind::Eof,
-                "unexpected tokens after trailing script expression",
+                "unexpected tokens after top-level expression",
             )?;
 
             let span = TextSpan::new(header.span.start, result.span.end);

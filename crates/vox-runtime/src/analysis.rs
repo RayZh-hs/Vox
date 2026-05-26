@@ -363,7 +363,7 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn prime(&mut self) -> Result<(), String> {
-        self.collect_imports();
+        self.collect_imports()?;
         self.collect_function_headers();
         self.collect_value_placeholders();
         self.infer_function_bodies()?;
@@ -371,18 +371,24 @@ impl<'a> TypeEngine<'a> {
         Ok(())
     }
 
-    fn collect_imports(&mut self) {
+    fn collect_imports(&mut self) -> Result<(), String> {
         for item in &self.unit.items {
             if let TopLevelItem::Import(import) = item {
                 let name = import.module.to_source_string();
+                let manifest = self
+                    .manifests
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| format!("imported package `{name}` is not mounted"))?;
                 self.imports.insert(
                     name.clone(),
                     ImportedPackage {
-                        manifest: self.manifests.get(&name).cloned(),
+                        manifest: Some(manifest),
                     },
                 );
             }
         }
+        Ok(())
     }
 
     fn collect_function_headers(&mut self) {

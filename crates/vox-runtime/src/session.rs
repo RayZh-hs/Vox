@@ -45,6 +45,15 @@ impl From<RunnerError> for SessionError {
     }
 }
 
+fn compile_error(message: impl Into<String>) -> SessionError {
+    let message = message.into();
+    if message.starts_with("compilation failed:\n") {
+        SessionError::Message(message)
+    } else {
+        SessionError::Message(format!("compilation failed:\n{}", message.trim()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredItem {
     key: StoredItemKey,
@@ -158,7 +167,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             self.next_revision(),
             &source,
         ))
-        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
 
         self.validate_environment(&front_end.syntax)?;
 
@@ -190,7 +199,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         let source = self.synthetic_source(&items, None, parsed.result_source.as_deref());
 
         let front_end = analyze_source(&SourceText::new(path, self.next_revision(), &source))
-            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+            .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
         self.validate_environment(&front_end.syntax)?;
 
         self.evaluate_script_source(&source)
@@ -236,7 +245,7 @@ impl<R: RuntimeRunner> SessionState<R> {
 
     pub fn restore_snapshot_source(&mut self, label: &str, text: &str) -> Result<(), SessionError> {
         let front_end = analyze_source(&SourceText::new(label, 1, text))
-            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+            .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
 
         if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
             return Err(SessionError::Message(
@@ -269,7 +278,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         &self,
         unit: &CompilationUnit,
     ) -> Result<TypeEnvironment, SessionError> {
-        infer_environment(unit, &self.runner.package_manifests()?).map_err(SessionError::Message)
+        infer_environment(unit, &self.runner.package_manifests()?).map_err(compile_error)
     }
 
     fn synthetic_source(
@@ -519,9 +528,9 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             Some(&rewritten.source),
         );
         let front_end = analyze_source(&SourceText::new("<repl-type>", 1, &source))
-            .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+            .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
         let environment = infer_environment(&front_end.syntax, &self.runner.package_manifests()?)
-            .map_err(SessionError::Message)?;
+            .map_err(compile_error)?;
         Ok(environment.result.unwrap_or(ReplType::Unit))
     }
 
@@ -657,9 +666,9 @@ fn environment_from_snapshot<R: RuntimeRunner>(
         None,
     );
     let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
-        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
     infer_environment(&front_end.syntax, &runner.package_manifests()?)
-        .map_err(SessionError::Message)
+        .map_err(compile_error)
 }
 
 fn snapshot_items(
@@ -667,7 +676,7 @@ fn snapshot_items(
     include_hidden_last: bool,
 ) -> Result<Vec<StoredItem>, SessionError> {
     let front_end = analyze_source(&SourceText::new("<repl-snapshot>", 1, snapshot))
-        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
     let mut items = normalize_items(rebuild_items_from_unit(snapshot, &front_end.syntax));
     if !include_hidden_last {
         items.retain(|item| !item.is_hidden_last());
@@ -713,7 +722,7 @@ fn parse_submission(raw: &str) -> Result<ParsedSubmission, SessionError> {
 
 fn parse_external_script(path: &str, raw: &str) -> Result<ParsedSubmission, SessionError> {
     let front_end = analyze_source(&SourceText::new(path, 1, raw))
-        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
     if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
         return Err(SessionError::Message(
             "`:run` requires a script file".to_owned(),
@@ -739,7 +748,7 @@ fn parse_script_fragment(path: &str, raw: &str) -> Result<ParsedSubmission, Sess
     let rewritten = rewrite_last_shorthand(raw);
     let wrapped = format!("script {REPL_MODULE};\n{}\n", rewritten.source);
     let front_end = analyze_source(&SourceText::new(path, 1, &wrapped))
-        .map_err(|diagnostics| SessionError::Message(diagnostics.to_string()))?;
+        .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
     Ok(ParsedSubmission {
         items: rebuild_items_from_unit(&wrapped, &front_end.syntax),
         result_source: front_end
