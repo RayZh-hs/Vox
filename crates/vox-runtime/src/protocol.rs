@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, io::{self, Read, Write}};
+use std::{
+    collections::BTreeMap,
+    io::{self, Read, Write},
+};
 
 use thiserror::Error;
 use vox_core::{
     diagnostics::{Diagnostic, DiagnosticBag, Severity},
-    external_library::{ExternalLibraryFormatError, decode_package_manifest, encode_package_manifest},
+    external_library::{
+        ExternalLibraryFormatError, decode_package_manifest, encode_package_manifest,
+    },
     host::PackageManifest,
     opt::OptimizationLevel,
     value::{HandleData, InlineValue},

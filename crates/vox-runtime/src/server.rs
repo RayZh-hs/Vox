@@ -993,7 +993,9 @@ impl RuntimeConnection {
 
         let mut response = PayloadWriter::new();
         response.write_u64(total_bytes);
-        response.write_bytes(&bytes).map_err(WireFailure::bad_argument)?;
+        response
+            .write_bytes(&bytes)
+            .map_err(WireFailure::bad_argument)?;
         success_frame(
             self.protocol_version(),
             Opcode::ReadHandleData,

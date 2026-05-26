@@ -14,14 +14,17 @@ use vox_compiler::{
     },
 };
 use vox_core::{
+    host::FunctionSpec,
     ids::ArtifactId,
     plan::CompiledArtifact,
+    source::ModulePath,
+    types::VoxType,
     value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
 use crate::{
     GenericFunctionHandleSummary, GenericFunctionKey, GenericParameterHandleSummary,
-    RealizationKey, RealizedFunctionHandleSummary, ReplType, Runtime,
+    HostCallArgument, RealizationKey, RealizedFunctionHandleSummary, ReplType, Runtime,
 };
 
 pub struct Interpreter<'a> {
@@ -107,42 +110,11 @@ impl<'a> Interpreter<'a> {
     }
 
     fn from_runtime_value(&self, value: &RuntimeValue) -> Result<Value, String> {
-        match value {
-            RuntimeValue::Inline(value) => Ok(Value::from_inline(value.clone())),
-            RuntimeValue::Handle(handle) => Err(format!(
-                "handle arguments are not supported by the NOpt interpreter yet: {}",
-                handle.0
-            )),
-        }
+        value_from_runtime_value(self.runtime, value)
     }
 
     fn into_runtime_value(&mut self, value: Value) -> Result<RuntimeValue, String> {
-        if let Some(inline) = value.to_inline() {
-            return Ok(RuntimeValue::Inline(inline));
-        }
-
-        if let Value::Function(function) = &value {
-            if let FunctionValue::Generic(generic) = &**function {
-                let handle = self.runtime.materialize_generic_handle(
-                    generic.key.clone(),
-                    generic_handle_summary(
-                        &generic.name,
-                        &generic.generic_parameters,
-                        &generic.parameters,
-                        &generic.return_type,
-                    ),
-                );
-                return Ok(RuntimeValue::Handle(handle));
-            }
-        }
-
-        let summary = value.summary();
-        let handle = if let Some(data) = value.to_handle_data() {
-            self.runtime.allocate_serializable_handle(summary, data)
-        } else {
-            self.runtime.allocate_handle(summary)
-        };
-        Ok(RuntimeValue::Handle(handle))
+        runtime_value_from_value(self.runtime, value)
     }
 }
 
@@ -151,6 +123,7 @@ struct ModuleState {
     artifact_id: ArtifactId,
     optimization: vox_core::opt::OptimizationLevel,
     name: String,
+    imports: Vec<ModulePath>,
     parameters: Vec<ParamDecl>,
     result: Option<Expr>,
     values: BTreeMap<String, ValueDecl>,
@@ -178,6 +151,14 @@ impl ModuleState {
             artifact_id,
             optimization: artifact.optimization,
             name: artifact.module.as_str(),
+            imports: script
+                .imports
+                .iter()
+                .map(|import| {
+                    ModulePath::parse(&import.module.to_source_string())
+                        .expect("parsed import paths should be valid module paths")
+                })
+                .collect(),
             parameters: script.parameters.clone(),
             result: script.syntax.result.clone(),
             values,
@@ -265,6 +246,37 @@ impl ModuleState {
                 })
             }
         })
+    }
+
+    fn resolve_imported_host_function(
+        &self,
+        runtime: &Runtime,
+        name: &QualifiedName,
+    ) -> Result<Option<HostFunction>, String> {
+        for length in (1..name.segments.len()).rev() {
+            let package = name.segments[..length].join(".");
+            let Some(imported) = self
+                .imports
+                .iter()
+                .find(|candidate| candidate.as_str() == package)
+            else {
+                continue;
+            };
+            let Some(manifest) = runtime.package_manifest(imported) else {
+                return Err(format!("package `{package}` is not mounted"));
+            };
+
+            if name.segments.len() != length + 1 {
+                continue;
+            }
+
+            let symbol = &name.segments[length];
+            if let Some(function) = manifest.functions.iter().find(|item| &item.name == symbol) {
+                return Ok(Some(HostFunction::from_spec(imported.clone(), function)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn top_level_value(
@@ -454,26 +466,34 @@ impl<'a> EvalContext<'a> {
     }
 
     fn resolve_name(&mut self, name: &QualifiedName) -> Result<Value, EvalError> {
-        let Some(local_name) = self.module.resolve_qualified_local_name(name) else {
-            return Err(EvalError::Message(format!(
-                "qualified host references are not supported by the NOpt interpreter yet: `{}`",
-                name.to_source_string()
-            )));
-        };
+        if let Some(local_name) = self.module.resolve_qualified_local_name(name) {
+            if let Some(value) = self.lookup_local(&local_name) {
+                return Ok(value);
+            }
 
-        if let Some(value) = self.lookup_local(&local_name) {
-            return Ok(value);
+            if let Some(value) = self.module.parameter(&local_name) {
+                return Ok(value);
+            }
+
+            if let Some(function) = self.module.resolve_function(&local_name) {
+                return Ok(Value::Function(Rc::new(function)));
+            }
+
+            return self.module.clone().top_level_value(&local_name, self);
         }
 
-        if let Some(value) = self.module.parameter(&local_name) {
-            return Ok(value);
+        if let Some(function) = self
+            .module
+            .resolve_imported_host_function(self.runtime, name)
+            .map_err(EvalError::Message)?
+        {
+            return Ok(Value::Function(Rc::new(FunctionValue::Host(function))));
         }
 
-        if let Some(function) = self.module.resolve_function(&local_name) {
-            return Ok(Value::Function(Rc::new(function)));
-        }
-
-        self.module.clone().top_level_value(&local_name, self)
+        Err(EvalError::Message(format!(
+            "unknown qualified name `{}`",
+            name.to_source_string()
+        )))
     }
 
     fn eval_call(&mut self, callee: &Expr, arguments: &[Argument]) -> Result<Value, EvalError> {
@@ -1087,6 +1107,7 @@ struct Binding {
 enum FunctionValue {
     User(UserFunction),
     Generic(GenericFunction),
+    Host(HostFunction),
 }
 
 impl FunctionValue {
@@ -1098,6 +1119,7 @@ impl FunctionValue {
         match self {
             Self::User(function) => function.call(runtime, arguments),
             Self::Generic(function) => function.call(runtime, arguments),
+            Self::Host(function) => function.call(runtime, arguments),
         }
     }
 
@@ -1128,6 +1150,14 @@ impl FunctionValue {
                 result: Box::new(function.return_type.clone().unwrap_or_else(|| {
                     ReplType::Unknown(format!("{} return type", function.name))
                 })),
+            },
+            Self::Host(function) => ReplType::Function {
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect(),
+                result: Box::new(function.return_type.clone()),
             },
         }
     }
@@ -1294,6 +1324,62 @@ impl GenericFunction {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HostFunction {
+    package: ModulePath,
+    name: String,
+    parameters: Vec<HostCallableParameter>,
+    return_type: ReplType,
+}
+
+impl HostFunction {
+    fn from_spec(package: ModulePath, function: &FunctionSpec) -> Self {
+        Self {
+            package,
+            name: function.name.clone(),
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| HostCallableParameter {
+                    name: parameter.name.clone(),
+                    ty: runtime_type_from_host_type(&parameter.ty),
+                    has_default: parameter.has_default,
+                })
+                .collect(),
+            return_type: runtime_type_from_host_type(&function.return_type),
+        }
+    }
+
+    fn call(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
+        let assigned = assign_host_arguments(&self.qualified_name(), &self.parameters, arguments)?;
+        let assigned = assigned
+            .into_iter()
+            .map(|argument| {
+                Ok(HostCallArgument {
+                    name: argument.name,
+                    value: argument
+                        .value
+                        .map(|value| runtime_value_from_value(runtime, value))
+                        .transpose()
+                        .map_err(EvalError::Message)?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = runtime
+            .invoke_host_function(&self.package, &self.name, &assigned)
+            .map_err(EvalError::Message)?;
+        value_from_runtime_value(runtime, &value).map_err(EvalError::Message)
+    }
+
+    fn qualified_name(&self) -> String {
+        format!("{}.{}", self.package.as_str(), self.name)
+    }
+}
+
 #[derive(Clone)]
 struct CallableParameter {
     name: String,
@@ -1324,6 +1410,18 @@ impl CallableParameter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct HostCallableParameter {
+    name: String,
+    ty: ReplType,
+    has_default: bool,
+}
+
+struct AssignedHostArgument {
+    name: String,
+    value: Option<Value>,
+}
+
 #[derive(Clone)]
 struct GenericRuntimeParameter {
     name: String,
@@ -1342,6 +1440,7 @@ enum Value {
     Int(i64),
     Float(f64),
     String(String),
+    Handle(vox_core::ids::HandleId, HandleSummary),
     List(Vec<Value>),
     Tuple(Vec<Value>),
     Record(BTreeMap<String, Value>),
@@ -1374,6 +1473,28 @@ impl Value {
         }
     }
 
+    fn from_handle_data(value: HandleData) -> Self {
+        match value {
+            HandleData::Null => Self::Null,
+            HandleData::Bool(value) => Self::Bool(value),
+            HandleData::Int(value) => Self::Int(value),
+            HandleData::Float(value) => Self::Float(value),
+            HandleData::String(value) => Self::String(value),
+            HandleData::List(values) => {
+                Self::List(values.into_iter().map(Self::from_handle_data).collect())
+            }
+            HandleData::Tuple(values) => {
+                Self::Tuple(values.into_iter().map(Self::from_handle_data).collect())
+            }
+            HandleData::Record(fields) => Self::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| (name, Self::from_handle_data(value)))
+                    .collect(),
+            ),
+        }
+    }
+
     fn to_inline(&self) -> Option<InlineValue> {
         match self {
             Self::Null => Some(InlineValue::Null),
@@ -1381,6 +1502,7 @@ impl Value {
             Self::Int(value) => Some(InlineValue::Int(*value)),
             Self::Float(value) => Some(InlineValue::Float(*value)),
             Self::String(value) => Some(InlineValue::String(value.clone())),
+            Self::Handle(_, _) => None,
             Self::Tuple(values) => values
                 .iter()
                 .map(Value::to_inline)
@@ -1391,10 +1513,7 @@ impl Value {
                 .map(|(name, value)| Some((name.clone(), value.to_inline()?)))
                 .collect::<Option<BTreeMap<_, _>>>()
                 .map(InlineValue::Record),
-            Self::List(_)
-            | Self::Range(_)
-            | Self::Function(_)
-            | Self::Econ(_) => None,
+            Self::List(_) | Self::Range(_) | Self::Function(_) | Self::Econ(_) => None,
         }
     }
 
@@ -1405,6 +1524,7 @@ impl Value {
             Self::Int(value) => Some(HandleData::Int(*value)),
             Self::Float(value) => Some(HandleData::Float(*value)),
             Self::String(value) => Some(HandleData::String(value.clone())),
+            Self::Handle(_, _) => None,
             Self::List(values) => values
                 .iter()
                 .map(Value::to_handle_data)
@@ -1433,6 +1553,7 @@ impl Value {
             (Self::Int(left), Self::Float(right)) => (*left as f64) == *right,
             (Self::Float(left), Self::Int(right)) => *left == (*right as f64),
             (Self::String(left), Self::String(right)) => left == right,
+            (Self::Handle(left, _), Self::Handle(right, _)) => left == right,
             (Self::List(left), Self::List(right)) | (Self::Tuple(left), Self::Tuple(right)) => {
                 left.len() == right.len()
                     && left
@@ -1463,6 +1584,7 @@ impl Value {
             Self::Int(_) => "Int",
             Self::Float(_) => "Float",
             Self::String(_) => "String",
+            Self::Handle(_, _) => "Handle",
             Self::List(_) => "List",
             Self::Tuple(_) => "Tuple",
             Self::Record(_) => "Record",
@@ -1479,6 +1601,9 @@ impl Value {
             Self::Int(value) => value.to_string(),
             Self::Float(value) => value.to_string(),
             Self::String(value) => value.clone(),
+            Self::Handle(handle, summary) => {
+                format!("<{} handle {}>", summary.type_name, handle.0)
+            }
             Self::List(values) => render_delimited("[", "]", values),
             Self::Tuple(values) => match values.as_slice() {
                 [] => "()".to_owned(),
@@ -1501,12 +1626,18 @@ impl Value {
                 FunctionValue::Generic(function) => {
                     format!("<generic function {}>", function.name)
                 }
+                FunctionValue::Host(function) => {
+                    format!("<host function {}>", function.qualified_name())
+                }
             },
             Self::Econ(value) => format!("econ({})", value.render()),
         }
     }
 
     fn summary(&self) -> HandleSummary {
+        if let Self::Handle(_, summary) = self {
+            return summary.clone();
+        }
         HandleSummary {
             type_name: self.type_name().to_owned(),
             summary: self.render(),
@@ -1521,6 +1652,10 @@ impl Value {
             Self::Int(_) => ReplType::Int,
             Self::Float(_) => ReplType::Float,
             Self::String(_) => ReplType::String,
+            Self::Handle(_, summary) => ReplType::Named {
+                name: summary.type_name.clone(),
+                arguments: Vec::new(),
+            },
             Self::List(items) => ReplType::List(Box::new(
                 items
                     .first()
@@ -1647,6 +1782,72 @@ fn assign_arguments(
     Ok(assigned)
 }
 
+fn assign_host_arguments(
+    function_name: &str,
+    parameters: &[HostCallableParameter],
+    arguments: Vec<CallArgument>,
+) -> Result<Vec<AssignedHostArgument>, EvalError> {
+    let mut assigned = BTreeMap::new();
+    let mut next_positional = 0usize;
+
+    for argument in arguments {
+        match argument {
+            CallArgument::Positional(value) => {
+                while next_positional < parameters.len()
+                    && assigned.contains_key(&parameters[next_positional].name)
+                {
+                    next_positional += 1;
+                }
+                let Some(parameter) = parameters.get(next_positional) else {
+                    return Err(EvalError::Message(format!(
+                        "function `{function_name}` received too many positional arguments"
+                    )));
+                };
+                assigned.insert(parameter.name.clone(), value);
+                next_positional += 1;
+            }
+            CallArgument::Named(name, value) => {
+                if !parameters.iter().any(|parameter| parameter.name == name) {
+                    return Err(EvalError::Message(format!(
+                        "function `{function_name}` does not have a parameter named `{name}`"
+                    )));
+                }
+                if assigned.insert(name.clone(), value).is_some() {
+                    return Err(EvalError::Message(format!(
+                        "parameter `{name}` was provided more than once"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        if let Some(value) = assigned.remove(&parameter.name) {
+            ordered.push(AssignedHostArgument {
+                name: parameter.name.clone(),
+                value: Some(value),
+            });
+            continue;
+        }
+
+        if parameter.has_default {
+            ordered.push(AssignedHostArgument {
+                name: parameter.name.clone(),
+                value: None,
+            });
+            continue;
+        }
+
+        return Err(EvalError::Message(format!(
+            "missing required parameter `{}` in function `{function_name}`",
+            parameter.name
+        )));
+    }
+
+    Ok(ordered)
+}
+
 fn runtime_generic_type_scope(
     parameters: &[vox_compiler::front_end::ast::GenericParameter],
 ) -> BTreeMap<String, String> {
@@ -1732,6 +1933,109 @@ fn runtime_type_from_syntax(
             }
         }
     }
+}
+
+fn runtime_type_from_host_type(ty: &VoxType) -> ReplType {
+    match ty {
+        VoxType::Int => ReplType::Int,
+        VoxType::Float => ReplType::Float,
+        VoxType::Bool => ReplType::Bool,
+        VoxType::String => ReplType::String,
+        VoxType::List(item) => ReplType::List(Box::new(runtime_type_from_host_type(item))),
+        VoxType::Tuple(items) => {
+            if items.is_empty() {
+                ReplType::Unit
+            } else {
+                ReplType::Tuple(items.iter().map(runtime_type_from_host_type).collect())
+            }
+        }
+        VoxType::Record(fields) => {
+            if fields.is_empty() {
+                ReplType::Unit
+            } else {
+                ReplType::Record(
+                    fields
+                        .iter()
+                        .map(|field| crate::RecordFieldType {
+                            name: field.name.clone(),
+                            ty: runtime_type_from_host_type(&field.ty),
+                        })
+                        .collect(),
+                )
+            }
+        }
+        VoxType::Nullable(inner) => {
+            ReplType::Nullable(Box::new(runtime_type_from_host_type(inner)))
+        }
+        VoxType::DynTrait(name) => {
+            ReplType::DynTrait(format!("{}.{}", name.module.as_str(), name.name))
+        }
+        VoxType::Named(name) => ReplType::Named {
+            name: format!("{}.{}", name.module.as_str(), name.name),
+            arguments: Vec::new(),
+        },
+        VoxType::TypeParameter(name) => ReplType::TypeParameter {
+            name: name.clone(),
+            bound: None,
+        },
+        VoxType::OpaqueSurface(name) => ReplType::Unknown(name.clone()),
+    }
+}
+
+fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<Value, String> {
+    match value {
+        RuntimeValue::Inline(value) => Ok(Value::from_inline(value.clone())),
+        RuntimeValue::Handle(handle) => {
+            if let Some(bytes) = runtime.handle_data(*handle) {
+                let mut reader = crate::protocol::PayloadReader::new(bytes);
+                let data = crate::protocol::decode_handle_data(&mut reader).map_err(|error| {
+                    format!("failed to decode handle {} data: {error}", handle.0)
+                })?;
+                reader.finish().map_err(|error| {
+                    format!("failed to decode handle {} data: {error}", handle.0)
+                })?;
+                return Ok(Value::from_handle_data(data));
+            }
+
+            let summary = runtime
+                .describe_handle(*handle)
+                .ok_or_else(|| format!("unknown handle {}", handle.0))?;
+            Ok(Value::Handle(*handle, summary))
+        }
+    }
+}
+
+fn runtime_value_from_value(runtime: &mut Runtime, value: Value) -> Result<RuntimeValue, String> {
+    if let Some(inline) = value.to_inline() {
+        return Ok(RuntimeValue::Inline(inline));
+    }
+
+    if let Value::Handle(handle, _) = &value {
+        return Ok(RuntimeValue::Handle(*handle));
+    }
+
+    if let Value::Function(function) = &value {
+        if let FunctionValue::Generic(generic) = &**function {
+            let handle = runtime.materialize_generic_handle(
+                generic.key.clone(),
+                generic_handle_summary(
+                    &generic.name,
+                    &generic.generic_parameters,
+                    &generic.parameters,
+                    &generic.return_type,
+                ),
+            );
+            return Ok(RuntimeValue::Handle(handle));
+        }
+    }
+
+    let summary = value.summary();
+    let handle = if let Some(data) = value.to_handle_data() {
+        runtime.allocate_serializable_handle(summary, data)
+    } else {
+        runtime.allocate_handle(summary)
+    };
+    Ok(RuntimeValue::Handle(handle))
 }
 
 fn infer_runtime_type_parameter(

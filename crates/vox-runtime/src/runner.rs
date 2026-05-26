@@ -513,9 +513,7 @@ impl RuntimeRunner for EmbeddedRunner {
                 )));
             }
 
-            let end = offset
-                .saturating_add(max_bytes as u64)
-                .min(total_bytes) as usize;
+            let end = offset.saturating_add(max_bytes as u64).min(total_bytes) as usize;
             Ok(HandleDataChunk {
                 offset,
                 total_bytes,

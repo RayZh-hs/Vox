@@ -1,6 +1,13 @@
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    sync::Arc,
+};
+
 mod analysis;
 mod artifact_store;
 mod handles;
+pub mod host_exports;
 mod interpreter;
 mod protocol;
 mod remote;
@@ -15,7 +22,7 @@ use vox_core::{
     ids::{ArtifactId, HandleId, LibraryId},
     opt::OptimizationLevel,
     plan::CompiledArtifact,
-    source::{ModuleKind, SourceText},
+    source::{ModuleKind, ModulePath, SourceText},
     value::{HandleData, HandleSummary, RuntimeValue},
 };
 
@@ -83,10 +90,20 @@ pub enum RuntimeError {
     ExecutionFailed(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostCallArgument {
+    pub name: String,
+    pub value: Option<RuntimeValue>,
+}
+
+pub type HostFunctionHandler =
+    Arc<dyn Fn(&mut Runtime, &[HostCallArgument]) -> Result<RuntimeValue, String> + Send + Sync>;
+
 #[derive(Debug, Default)]
 pub struct Runtime {
     compiler: Compiler,
     host: HostRegistry,
+    host_functions: BTreeMap<(ModulePath, String), RegisteredHostFunction>,
     artifacts: ArtifactStore,
     handles: HandleStore,
     generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
@@ -103,8 +120,21 @@ struct CachedGenericFunction {
     realized: std::collections::BTreeMap<RealizationKey, HandleId>,
 }
 
+#[derive(Clone)]
+struct RegisteredHostFunction {
+    handler: HostFunctionHandler,
+}
+
+impl fmt::Debug for RegisteredHostFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<host function>")
+    }
+}
+
 impl Runtime {
     pub fn mount_library(&mut self, manifest: PackageManifest) -> LibraryId {
+        self.host_functions
+            .retain(|(package, _), _| package != &manifest.package);
         self.host.register_package(manifest.clone());
         self.next_library_id += 1;
         self.next_library_revision += 1;
@@ -116,6 +146,76 @@ impl Runtime {
             manifest,
         });
         id
+    }
+
+    pub fn mount_host_library<I>(
+        &mut self,
+        manifest: PackageManifest,
+        functions: I,
+    ) -> Result<LibraryId, String>
+    where
+        I: IntoIterator<Item = (String, HostFunctionHandler)>,
+    {
+        let package = manifest.package.clone();
+        let declared = manifest
+            .functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<BTreeSet<_>>();
+        let functions = functions.into_iter().collect::<Vec<_>>();
+        let mut provided = BTreeSet::new();
+        for (name, _) in &functions {
+            if !declared.contains(name) {
+                return Err(format!(
+                    "host function `{}` is not declared in mounted manifest",
+                    qualified_host_name(&package, name)
+                ));
+            }
+            if !provided.insert(name.clone()) {
+                return Err(format!(
+                    "duplicate host function implementation for `{}`",
+                    qualified_host_name(&package, name)
+                ));
+            }
+        }
+
+        let id = self.mount_library(manifest);
+        for (name, handler) in functions {
+            self.host_functions
+                .insert((package.clone(), name), RegisteredHostFunction { handler });
+        }
+        Ok(id)
+    }
+
+    pub fn mount_registered_host_library(
+        &mut self,
+        manifest: PackageManifest,
+    ) -> Result<LibraryId, String> {
+        host_exports::mount_registered_host_library(self, manifest)
+    }
+
+    pub fn register_host_function(
+        &mut self,
+        package: &ModulePath,
+        function: impl Into<String>,
+        handler: HostFunctionHandler,
+    ) -> Result<(), String> {
+        let function = function.into();
+        let Some(manifest) = self.host.package(package) else {
+            return Err(format!("package `{}` is not mounted", package.as_str()));
+        };
+        if !manifest.functions.iter().any(|item| item.name == function) {
+            return Err(format!(
+                "host function `{}` is not declared in mounted manifest",
+                qualified_host_name(package, &function)
+            ));
+        }
+
+        self.host_functions.insert(
+            (package.clone(), function),
+            RegisteredHostFunction { handler },
+        );
+        Ok(())
     }
 
     pub fn load_script(
@@ -240,8 +340,7 @@ impl Runtime {
             .expect("serializable handle data should fit into memory");
         let payload = payload.into_inner();
         summary.bytes = Some(summary.bytes.unwrap_or(payload.len() as u64));
-        self.handles
-            .allocate_serializable_data(summary, payload)
+        self.handles.allocate_serializable_data(summary, payload)
     }
 
     pub fn retain_handle(&mut self, handle: HandleId) -> bool {
@@ -260,6 +359,23 @@ impl Runtime {
         self.handles.serialized_data(handle)
     }
 
+    pub fn get_handle_data(&self, handle: HandleId) -> Result<HandleData, String> {
+        let Some(bytes) = self.handle_data(handle) else {
+            return Err(format!(
+                "handle {} does not expose serializable data",
+                handle.0
+            ));
+        };
+
+        let mut reader = crate::protocol::PayloadReader::new(bytes);
+        let data = crate::protocol::decode_handle_data(&mut reader)
+            .map_err(|error| format!("failed to decode handle {} data: {error}", handle.0))?;
+        reader
+            .finish()
+            .map_err(|error| format!("failed to decode handle {} data: {error}", handle.0))?;
+        Ok(data)
+    }
+
     pub fn release_handle(&mut self, handle: HandleId) -> bool {
         self.handles.release(handle)
     }
@@ -270,6 +386,30 @@ impl Runtime {
 
     pub fn package_manifests(&self) -> Vec<PackageManifest> {
         self.host.packages().cloned().collect()
+    }
+
+    pub(crate) fn package_manifest(&self, package: &ModulePath) -> Option<&PackageManifest> {
+        self.host.package(package)
+    }
+
+    pub(crate) fn invoke_host_function(
+        &mut self,
+        package: &ModulePath,
+        function: &str,
+        arguments: &[HostCallArgument],
+    ) -> Result<RuntimeValue, String> {
+        let Some(entry) = self
+            .host_functions
+            .get(&(package.clone(), function.to_owned()))
+            .cloned()
+        else {
+            return Err(format!(
+                "host function implementation is not mounted for `{}`",
+                qualified_host_name(package, function)
+            ));
+        };
+
+        (entry.handler)(self, arguments)
     }
 
     pub fn set_default_xopt(&mut self, xopt: OptimizationLevel) {
@@ -380,6 +520,10 @@ impl Runtime {
             }
         }
     }
+}
+
+fn qualified_host_name(package: &ModulePath, function: &str) -> String {
+    format!("{}.{}", package.as_str(), function)
 }
 
 #[cfg(test)]
