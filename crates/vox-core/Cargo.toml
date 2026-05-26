@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 camino.workspace = true
+inventory.workspace = true
+vox-core-macros = { path = "../vox-core-macros" }

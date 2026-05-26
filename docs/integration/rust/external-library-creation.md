@@ -105,7 +105,7 @@ omitted, Vox uses the Rust function name.
 
 ```rust
 let manifest = ExternalLibrary::new("image")?
-    .build();
+    .build()?;
 ```
 
 That is the full external library declaration.
@@ -148,7 +148,7 @@ fn filter_apply(filter: &dyn Filter, input: Image) -> Image {
     filter.apply(input)
 }
 
-let manifest = ExternalLibrary::new("image")?.build();
+let manifest = ExternalLibrary::new("image")?.build()?;
 ```
 
 The user overhead is intentionally small:
@@ -157,6 +157,31 @@ The user overhead is intentionally small:
 - one attribute per exported trait;
 - one attribute per exported function;
 - one package name at the `ExternalLibrary` root.
+
+## Generated Artifact Format
+
+When a Rust binding compiles itself into a Vox external library, the generated
+artifact is two files:
+
+- `name.voxh`: a compact binary header file;
+- `name.wasm`: the lowered wasm implementation.
+
+`name` defaults to the last segment of the Vox package path.
+
+The `.voxh` header contains only:
+
+- a short magic and version;
+- the wasm file name;
+- the exported `PackageManifest`.
+
+The header is the declarative package surface. The wasm file is the executable
+implementation.
+
+This split keeps the format small:
+
+- the runtime can inspect or mount the header metadata without loading wasm;
+- later runtime work can load the referenced wasm module to execute exported
+  host calls through the same library artifact.
 
 ## Exported Names
 
@@ -269,8 +294,20 @@ return type instead of inventing a temporary exported struct. Structs remain
 single named values in the Vox type system; records are the anonymous product
 type for "these named fields together".
 
-In low-level manifest code, represent such a return type with
-`VoxType::Record(...)`.
+For the common path, expose the Rust function normally and override only the
+Vox-facing return type when Rust cannot express the anonymous record directly:
+
+```rust
+#[vox_fn(
+    purity = "pure",
+    return_type = "{ shadows: Int, mids: Int, highlights: Int }"
+)]
+fn histogram(image: Image) -> HistogramSummary {
+    todo!()
+}
+```
+
+In low-level manifest code, the equivalent shape is `VoxType::Record(...)`.
 
 ## API Summary
 
@@ -281,7 +318,7 @@ In low-level manifest code, represent such a return type with
 - `#[vox_trait(...)]` marks a Rust trait as exportable metadata and may
   override its exported name.
 - `#[vox_fn(...)]` describes one exported function and may override its
-  exported name.
+  exported name or Vox return type.
 - `ExternalLibrary::build()` produces the package manifest consumed by the
   runtime.
 

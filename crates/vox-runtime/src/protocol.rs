@@ -3,10 +3,9 @@ use std::{collections::BTreeMap, io::{self, Read, Write}};
 use thiserror::Error;
 use vox_core::{
     diagnostics::{Diagnostic, DiagnosticBag, Severity},
-    host::{FunctionSpec, PackageManifest, ParameterSpec, Purity, TypeSpec},
+    external_library::{ExternalLibraryFormatError, decode_package_manifest, encode_package_manifest},
+    host::PackageManifest,
     opt::OptimizationLevel,
-    source::ModulePath,
-    types::{QualifiedTypeName, RecordField, VoxType},
     value::{HandleData, InlineValue},
 };
 
@@ -676,197 +675,12 @@ pub fn encode_manifest(
     writer: &mut PayloadWriter,
     manifest: &PackageManifest,
 ) -> Result<(), ProtocolError> {
-    writer.write_string(&manifest.package.as_str())?;
-    writer.write_u32(
-        u32::try_from(manifest.types.len())
-            .map_err(|_| ProtocolError::message("type list exceeds protocol size limit"))?,
-    );
-    for ty in &manifest.types {
-        encode_qualified_type_name(writer, &ty.name)?;
-    }
-
-    writer.write_u32(
-        u32::try_from(manifest.functions.len())
-            .map_err(|_| ProtocolError::message("function list exceeds protocol size limit"))?,
-    );
-    for function in &manifest.functions {
-        writer.write_string(&function.name)?;
-        writer.write_u32(
-            u32::try_from(function.parameters.len()).map_err(|_| {
-                ProtocolError::message("parameter list exceeds protocol size limit")
-            })?,
-        );
-        for parameter in &function.parameters {
-            writer.write_string(&parameter.name)?;
-            encode_vox_type(writer, &parameter.ty)?;
-            writer.write_u8(u8::from(parameter.has_default));
-        }
-        encode_vox_type(writer, &function.return_type)?;
-        writer.write_u8(match function.purity {
-            Purity::Pure => 0,
-            Purity::Evil => 1,
-        });
-    }
+    writer.write_bytes(&encode_package_manifest(manifest).map_err(core_format_to_protocol)?)?;
     Ok(())
 }
 
 pub fn decode_manifest(reader: &mut PayloadReader<'_>) -> Result<PackageManifest, ProtocolError> {
-    let package = ModulePath::parse(&reader.read_string()?)
-        .map_err(|diagnostic| ProtocolError::message(diagnostic.message))?;
-    let type_count = reader.read_u32()? as usize;
-    let mut types = Vec::with_capacity(type_count);
-    for _ in 0..type_count {
-        types.push(TypeSpec {
-            name: decode_qualified_type_name(reader)?,
-        });
-    }
-
-    let function_count = reader.read_u32()? as usize;
-    let mut functions = Vec::with_capacity(function_count);
-    for _ in 0..function_count {
-        let name = reader.read_string()?;
-        let parameter_count = reader.read_u32()? as usize;
-        let mut parameters = Vec::with_capacity(parameter_count);
-        for _ in 0..parameter_count {
-            parameters.push(ParameterSpec {
-                name: reader.read_string()?,
-                ty: decode_vox_type(reader)?,
-                has_default: match reader.read_u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(ProtocolError::message("invalid default-value flag")),
-                },
-            });
-        }
-        let return_type = decode_vox_type(reader)?;
-        let purity = match reader.read_u8()? {
-            0 => Purity::Pure,
-            1 => Purity::Evil,
-            _ => return Err(ProtocolError::message("invalid purity tag")),
-        };
-        functions.push(FunctionSpec {
-            name,
-            parameters,
-            return_type,
-            purity,
-        });
-    }
-
-    Ok(PackageManifest {
-        package,
-        types,
-        functions,
-    })
-}
-
-fn encode_vox_type(writer: &mut PayloadWriter, ty: &VoxType) -> Result<(), ProtocolError> {
-    match ty {
-        VoxType::Int => writer.write_u8(0x00),
-        VoxType::Float => writer.write_u8(0x01),
-        VoxType::Bool => writer.write_u8(0x02),
-        VoxType::String => writer.write_u8(0x03),
-        VoxType::List(item) => {
-            writer.write_u8(0x04);
-            encode_vox_type(writer, item)?;
-        }
-        VoxType::Tuple(items) => {
-            writer.write_u8(0x05);
-            writer.write_u32(
-                u32::try_from(items.len()).map_err(|_| {
-                    ProtocolError::message("tuple type exceeds protocol size limit")
-                })?,
-            );
-            for item in items {
-                encode_vox_type(writer, item)?;
-            }
-        }
-        VoxType::Record(fields) => {
-            writer.write_u8(0x0b);
-            writer.write_u32(
-                u32::try_from(fields.len()).map_err(|_| {
-                    ProtocolError::message("record type exceeds protocol size limit")
-                })?,
-            );
-            for field in fields {
-                writer.write_string(&field.name)?;
-                encode_vox_type(writer, &field.ty)?;
-            }
-        }
-        VoxType::Nullable(inner) => {
-            writer.write_u8(0x06);
-            encode_vox_type(writer, inner)?;
-        }
-        VoxType::DynTrait(name) => {
-            writer.write_u8(0x07);
-            encode_qualified_type_name(writer, name)?;
-        }
-        VoxType::Named(name) => {
-            writer.write_u8(0x08);
-            encode_qualified_type_name(writer, name)?;
-        }
-        VoxType::TypeParameter(name) => {
-            writer.write_u8(0x09);
-            writer.write_string(name)?;
-        }
-        VoxType::OpaqueSurface(raw) => {
-            writer.write_u8(0x0a);
-            writer.write_string(raw)?;
-        }
-    }
-    Ok(())
-}
-
-fn decode_vox_type(reader: &mut PayloadReader<'_>) -> Result<VoxType, ProtocolError> {
-    match reader.read_u8()? {
-        0x00 => Ok(VoxType::Int),
-        0x01 => Ok(VoxType::Float),
-        0x02 => Ok(VoxType::Bool),
-        0x03 => Ok(VoxType::String),
-        0x04 => Ok(VoxType::List(Box::new(decode_vox_type(reader)?))),
-        0x05 => {
-            let count = reader.read_u32()? as usize;
-            let mut items = Vec::with_capacity(count);
-            for _ in 0..count {
-                items.push(decode_vox_type(reader)?);
-            }
-            Ok(VoxType::Tuple(items))
-        }
-        0x0b => {
-            let count = reader.read_u32()? as usize;
-            let mut fields = Vec::with_capacity(count);
-            for _ in 0..count {
-                fields.push(RecordField {
-                    name: reader.read_string()?,
-                    ty: decode_vox_type(reader)?,
-                });
-            }
-            Ok(VoxType::Record(fields))
-        }
-        0x06 => Ok(VoxType::Nullable(Box::new(decode_vox_type(reader)?))),
-        0x07 => Ok(VoxType::DynTrait(decode_qualified_type_name(reader)?)),
-        0x08 => Ok(VoxType::Named(decode_qualified_type_name(reader)?)),
-        0x09 => Ok(VoxType::TypeParameter(reader.read_string()?)),
-        0x0a => Ok(VoxType::OpaqueSurface(reader.read_string()?)),
-        _ => Err(ProtocolError::message("unknown type tag")),
-    }
-}
-
-fn encode_qualified_type_name(
-    writer: &mut PayloadWriter,
-    name: &QualifiedTypeName,
-) -> Result<(), ProtocolError> {
-    writer.write_string(&name.module.as_str())?;
-    writer.write_string(&name.name)?;
-    Ok(())
-}
-
-fn decode_qualified_type_name(
-    reader: &mut PayloadReader<'_>,
-) -> Result<QualifiedTypeName, ProtocolError> {
-    let module = ModulePath::parse(&reader.read_string()?)
-        .map_err(|diagnostic| ProtocolError::message(diagnostic.message))?;
-    let name = reader.read_string()?;
-    Ok(QualifiedTypeName { module, name })
+    decode_package_manifest(&reader.read_bytes()?).map_err(core_format_to_protocol)
 }
 
 fn encode_diagnostics(
@@ -926,4 +740,8 @@ fn decode_diagnostics(reader: &mut PayloadReader<'_>) -> Result<DiagnosticBag, P
         });
     }
     Ok(DiagnosticBag::from(diagnostics))
+}
+
+fn core_format_to_protocol(error: ExternalLibraryFormatError) -> ProtocolError {
+    ProtocolError::message(error.to_string())
 }
