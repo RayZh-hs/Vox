@@ -78,6 +78,16 @@ Common expression forms:
 - tuples use `(a, b)`.
 - lists use `[1, 2, 3]`.
 - records use `{ name = "vox", version = 1 }`.
+- `value.updated(field = next)` copies an immutable value with selected changes.
+
+```vox
+val config = {
+    cache: { enabled: true, ttlSeconds: 60 },
+    retries: [1, 2, 3],
+};
+
+val next = config.updated(cache.ttlSeconds = 120, retries.#1 = 5);
+```
 
 ## Nullability
 
@@ -118,9 +128,9 @@ fun cachedText(path: String): Econ[String] {
 }
 ```
 
-`econ[T] { ... }` creates a pure handle to a cached snapshot of an effectful
-computation. Pure code can pass the handle around without re-running the
-effect.
+`econ[T] { ... }` is a built-in intrinsic that creates a pure handle to a
+cached snapshot of an effectful computation. Pure code can pass the handle
+around without re-running the effect.
 
 Runtime support for refreshing `econ` snapshots will be implemented. For now,
 the language syntax is available, but refresh tooling should be treated as

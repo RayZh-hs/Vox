@@ -1,9 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use vox_compiler::front_end::ast::{
-    Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
-    ExprKind, LocalValueDecl, Mutability, QualifiedName, TopLevelItem, TypeKind, TypeSyntax,
-    UnaryOp,
+    Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
+    Expr, ExprKind, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName, TopLevelItem,
+    TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
 };
 use vox_core::{host::PackageManifest, source::ModulePath};
 
@@ -586,6 +586,7 @@ impl<'a> TypeEngine<'a> {
                 let callee_type = self.infer_expr(callee, scope)?;
                 self.infer_call(callee_type, arguments, scope)
             }
+            ExprKind::Intrinsic(intrinsic) => self.infer_intrinsic(intrinsic, scope),
             ExprKind::Index { target, .. } => match self.infer_expr(target, scope)? {
                 ReplType::List(item) | ReplType::Range(item) => Ok(*item),
                 ReplType::Tuple(items) => Ok(items
@@ -594,7 +595,14 @@ impl<'a> TypeEngine<'a> {
                     .unwrap_or(ReplType::Unknown("Unknown".to_owned()))),
                 other => Err(format!("cannot index value of type `{}`", other.render())),
             },
-            ExprKind::Field { target, name } => self.infer_field(target, name, scope),
+            ExprKind::Field { target, name } => {
+                if let Some(qualified) = expr_as_qualified_name(expr) {
+                    if let Ok(ty) = self.resolve_name_type(&qualified, scope) {
+                        return Ok(ty);
+                    }
+                }
+                self.infer_field(target, name, scope)
+            }
             ExprKind::SafeField { target, name } => {
                 let ty = self.infer_field(target, name, scope)?;
                 Ok(ReplType::Nullable(Box::new(ty)))
@@ -711,10 +719,17 @@ impl<'a> TypeEngine<'a> {
                 })
             }
             ExprKind::Block(block) => self.infer_block(block, scope),
-            ExprKind::Econ { ty, .. } => Ok(ReplType::Named {
-                name: "Econ".to_owned(),
-                arguments: vec![from_type_syntax(ty, &scope.generic_parameters)],
-            }),
+        }
+    }
+
+    fn infer_intrinsic(
+        &self,
+        intrinsic: &IntrinsicExpr,
+        scope: &mut TypeScope,
+    ) -> Result<ReplType, String> {
+        match intrinsic {
+            IntrinsicExpr::Updated(updated) => self.infer_updated(updated, scope),
+            IntrinsicExpr::Econ(econ) => self.infer_econ(econ, scope),
         }
     }
 
@@ -889,6 +904,99 @@ impl<'a> TypeEngine<'a> {
                 other => Err(format!("cannot access field on `{}`", other.render())),
             },
             other => Err(format!("cannot access field on `{}`", other.render())),
+        }
+    }
+
+    fn infer_updated(
+        &self,
+        updated: &UpdatedIntrinsic,
+        scope: &mut TypeScope,
+    ) -> Result<ReplType, String> {
+        let updates = &updated.updates;
+        if updates.is_empty() {
+            return Err("`updated` requires at least one field assignment".to_owned());
+        }
+
+        let target_type = self.infer_expr(&updated.target, scope)?;
+        let mut seen = BTreeSet::new();
+
+        for update in updates {
+            let path = render_updated_path(&update.path);
+            if !seen.insert(path.clone()) {
+                return Err(format!("updated path `{path}` was provided more than once"));
+            }
+
+            let expected = self.updated_path_type(&target_type, &update.path)?;
+            let actual = self.infer_expr(&update.value, scope)?;
+            if !actual.is_assignable_to(&expected) {
+                return Err(format!(
+                    "cannot assign `{}` to updated path `{}` of type `{}`",
+                    actual.render(),
+                    path,
+                    expected.render()
+                ));
+            }
+        }
+
+        Ok(target_type)
+    }
+
+    fn infer_econ(&self, econ: &EconIntrinsic, scope: &TypeScope) -> Result<ReplType, String> {
+        Ok(ReplType::Named {
+            name: "Econ".to_owned(),
+            arguments: vec![from_type_syntax(&econ.ty, &scope.generic_parameters)],
+        })
+    }
+
+    fn updated_path_type(
+        &self,
+        target: &ReplType,
+        path: &[UpdatedPathSegment],
+    ) -> Result<ReplType, String> {
+        let Some((segment, rest)) = path.split_first() else {
+            return Err("updated path cannot be empty".to_owned());
+        };
+
+        match (target, segment) {
+            (ReplType::Record(fields), UpdatedPathSegment::Field(name)) => {
+                let field = fields
+                    .iter()
+                    .find(|field| field.name == *name)
+                    .ok_or_else(|| format!("record has no field `{name}`"))?;
+                if rest.is_empty() {
+                    Ok(field.ty.clone())
+                } else {
+                    self.updated_path_type(&field.ty, rest)
+                }
+            }
+            (ReplType::Record(_), UpdatedPathSegment::Index(index)) => Err(format!(
+                "record updates require a field name, found `#{index}`"
+            )),
+            (ReplType::Tuple(items), UpdatedPathSegment::Index(index)) => {
+                let field = items
+                    .get(*index)
+                    .ok_or_else(|| format!("tuple index {index} is out of bounds"))?;
+                if rest.is_empty() {
+                    Ok(field.clone())
+                } else {
+                    self.updated_path_type(field, rest)
+                }
+            }
+            (ReplType::Tuple(_), UpdatedPathSegment::Field(name)) => Err(format!(
+                "tuple updates require an index like `#0`, found `{name}`"
+            )),
+            (ReplType::List(item), UpdatedPathSegment::Index(_)) => {
+                if rest.is_empty() {
+                    Ok((**item).clone())
+                } else {
+                    self.updated_path_type(item, rest)
+                }
+            }
+            (ReplType::List(_), UpdatedPathSegment::Field(name)) => Err(format!(
+                "list updates require an index like `#0`, found `{name}`"
+            )),
+            (ReplType::Unknown(_), _) => Ok(target.clone()),
+            (other, _) => Err(format!("updated is not supported for `{}`", other.render())),
         }
     }
 
@@ -1363,6 +1471,29 @@ fn generic_parameter_scope(
             )
         })
         .collect()
+}
+
+fn render_updated_path(path: &[UpdatedPathSegment]) -> String {
+    path.iter()
+        .map(|segment| match segment {
+            UpdatedPathSegment::Field(name) => name.clone(),
+            UpdatedPathSegment::Index(index) => format!("#{index}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(name.clone()),
+        ExprKind::Field { target, name } => {
+            let mut qualified = expr_as_qualified_name(target)?;
+            qualified.segments.push(name.clone());
+            qualified.span = expr.span.clone();
+            Some(qualified)
+        }
+        _ => None,
+    }
 }
 
 fn match_generic_parameter(

@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Write},
     rc::Rc,
 };
@@ -8,9 +8,10 @@ use std::{
 use vox_compiler::{
     TreewalkScript,
     front_end::ast::{
-        Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, Expr, ExprKind,
-        FunctionDecl, LambdaParameter, Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr,
-        RecordFieldInit, StringLiteral, StringPart, TypeKind, TypeSyntax, UnaryOp, ValueDecl,
+        Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
+        ExprKind, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability, ParamDecl, Parameter,
+        QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart, TypeKind, TypeSyntax,
+        UnaryOp, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
     },
 };
 use vox_core::{
@@ -380,8 +381,14 @@ impl<'a> EvalContext<'a> {
             ExprKind::Record(fields) => self.eval_record_literal(fields),
             ExprKind::Name(name) => self.resolve_name(name),
             ExprKind::Call { callee, arguments } => self.eval_call(callee, arguments),
+            ExprKind::Intrinsic(intrinsic) => self.eval_intrinsic(intrinsic),
             ExprKind::Index { target, index } => self.eval_index(target, index),
             ExprKind::Field { target, name } => {
+                if let Some(qualified) = expr_as_qualified_name(expr) {
+                    if let Ok(value) = self.resolve_name(&qualified) {
+                        return Ok(value);
+                    }
+                }
                 let value = self.eval_expr(target)?;
                 self.eval_field(value, name)
             }
@@ -431,9 +438,13 @@ impl<'a> EvalContext<'a> {
                 },
             )))),
             ExprKind::Block(block) => self.eval_block(block),
-            ExprKind::Econ { body, .. } => self
-                .eval_block(body)
-                .map(|value| Value::Econ(Box::new(value))),
+        }
+    }
+
+    fn eval_intrinsic(&mut self, intrinsic: &IntrinsicExpr) -> Result<Value, EvalError> {
+        match intrinsic {
+            IntrinsicExpr::Updated(updated) => self.eval_updated(updated),
+            IntrinsicExpr::Econ(econ) => self.eval_econ(econ),
         }
     }
 
@@ -517,6 +528,37 @@ impl<'a> EvalContext<'a> {
         function.call(self.runtime, evaluated_args)
     }
 
+    fn eval_updated(&mut self, updated: &UpdatedIntrinsic) -> Result<Value, EvalError> {
+        let updates = &updated.updates;
+        if updates.is_empty() {
+            return Err(EvalError::Message(
+                "`updated` requires at least one field assignment".to_owned(),
+            ));
+        }
+
+        let mut seen = BTreeSet::new();
+        for update in updates {
+            let path = render_updated_path(&update.path);
+            if !seen.insert(path.clone()) {
+                return Err(EvalError::Message(format!(
+                    "updated path `{path}` was provided more than once"
+                )));
+            }
+        }
+
+        let mut current = self.eval_expr(&updated.target)?;
+        for update in updates {
+            let value = self.eval_expr(&update.value)?;
+            current = self.apply_updated_path(current, &update.path, value)?;
+        }
+        Ok(current)
+    }
+
+    fn eval_econ(&mut self, econ: &EconIntrinsic) -> Result<Value, EvalError> {
+        self.eval_block(&econ.body)
+            .map(|value| Value::Econ(Box::new(value)))
+    }
+
     fn eval_receiver_call(
         &mut self,
         receiver: &Expr,
@@ -584,6 +626,69 @@ impl<'a> EvalContext<'a> {
             }),
             other => Err(EvalError::Message(format!(
                 "field access is not supported for {}",
+                other.type_name()
+            ))),
+        }
+    }
+
+    fn apply_updated_path(
+        &self,
+        target: Value,
+        path: &[UpdatedPathSegment],
+        replacement: Value,
+    ) -> Result<Value, EvalError> {
+        let Some((segment, rest)) = path.split_first() else {
+            return Err(EvalError::Message(
+                "updated path cannot be empty".to_owned(),
+            ));
+        };
+
+        match (target, segment) {
+            (Value::Record(mut fields), UpdatedPathSegment::Field(name)) => {
+                let current = fields.get(name).cloned().ok_or_else(|| {
+                    EvalError::Message(format!("record does not contain field `{name}`"))
+                })?;
+                let next = if rest.is_empty() {
+                    replacement
+                } else {
+                    self.apply_updated_path(current, rest, replacement)?
+                };
+                fields.insert(name.clone(), next);
+                Ok(Value::Record(fields))
+            }
+            (Value::Record(_), UpdatedPathSegment::Index(index)) => Err(EvalError::Message(
+                format!("record updates require a field name, found `#{index}`"),
+            )),
+            (Value::Tuple(mut items), UpdatedPathSegment::Index(index)) => {
+                let slot = items.get_mut(*index).ok_or_else(|| {
+                    EvalError::Message(format!("tuple index {index} is out of bounds"))
+                })?;
+                *slot = if rest.is_empty() {
+                    replacement
+                } else {
+                    self.apply_updated_path(slot.clone(), rest, replacement)?
+                };
+                Ok(Value::Tuple(items))
+            }
+            (Value::Tuple(_), UpdatedPathSegment::Field(name)) => Err(EvalError::Message(format!(
+                "tuple updates require an index like `#0`, found `{name}`"
+            ))),
+            (Value::List(mut items), UpdatedPathSegment::Index(index)) => {
+                let slot = items.get_mut(*index).ok_or_else(|| {
+                    EvalError::Message(format!("list index {index} is out of bounds"))
+                })?;
+                *slot = if rest.is_empty() {
+                    replacement
+                } else {
+                    self.apply_updated_path(slot.clone(), rest, replacement)?
+                };
+                Ok(Value::List(items))
+            }
+            (Value::List(_), UpdatedPathSegment::Field(name)) => Err(EvalError::Message(format!(
+                "list updates require an index like `#0`, found `{name}`"
+            ))),
+            (other, _) => Err(EvalError::Message(format!(
+                "updated is not supported for {}",
                 other.type_name()
             ))),
         }
@@ -2002,6 +2107,29 @@ fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<V
                 .ok_or_else(|| format!("unknown handle {}", handle.0))?;
             Ok(Value::Handle(*handle, summary))
         }
+    }
+}
+
+fn render_updated_path(path: &[UpdatedPathSegment]) -> String {
+    path.iter()
+        .map(|segment| match segment {
+            UpdatedPathSegment::Field(name) => name.clone(),
+            UpdatedPathSegment::Index(index) => format!("#{index}"),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
+    match &expr.kind {
+        ExprKind::Name(name) => Some(name.clone()),
+        ExprKind::Field { target, name } => {
+            let mut qualified = expr_as_qualified_name(target)?;
+            qualified.segments.push(name.clone());
+            qualified.span = expr.span.clone();
+            Some(qualified)
+        }
+        _ => None,
     }
 }
 

@@ -11,6 +11,7 @@ The following constructs are expressions:
 - literals;
 - name references;
 - calls;
+- built-in intrinsic forms;
 - indexing;
 - field access;
 - receiver-call sugar;
@@ -101,6 +102,7 @@ PostfixExpr
 
 PostfixOp
   ::= CallSuffix
+   |  UpdatedSuffix
    |  IndexSuffix
    |  FieldSuffix
    |  SafeFieldSuffix
@@ -118,6 +120,7 @@ PrimaryExpr
    |  IfExpr
    |  WhenExpr
    |  BlockExpr
+   |  EconExpr
 ```
 
 `ParenExpr` is defined in Chapter 2.
@@ -149,12 +152,34 @@ NonNullSuffix
 
 ReceiverCallSuffix
   ::= ".(" QualifiedIdentifier ")" "(" ArgumentList? ")"
+
+UpdatedCallExpr
+  ::= "updated" "(" Expr "," UpdatedAssignmentList ")"
+
+UpdatedSuffix
+  ::= "." "updated" "(" UpdatedAssignmentList ")"
+
+UpdatedAssignmentList
+  ::= UpdatedAssignment ("," UpdatedAssignment)* ","?
+
+UpdatedAssignment
+  ::= UpdatedPath "=" Expr
+
+UpdatedPath
+  ::= UpdatedPathSegment ("." UpdatedPathSegment)*
+
+UpdatedPathSegment
+  ::= Identifier
+   |  "#" IntegerLiteral
 ```
 
 Rules:
 
 - arguments may be positional or named;
 - named arguments use `Identifier "=" Expr`;
+- `updated(value, ...)` and `value.updated(...)` are compiler-known intrinsic
+  forms, not ordinary function calls;
+- `updated` paths use `#index` for tuple and list positions;
 - `a?.b` performs nullable-safe field access;
 - `a!!` asserts that `a` is non-null;
 - `value.(pkg.fun)(x, y)` is sugar for `pkg.fun(value, x, y)`.

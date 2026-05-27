@@ -298,6 +298,7 @@ pub enum ExprKind {
         callee: Box<Expr>,
         arguments: Vec<Argument>,
     },
+    Intrinsic(IntrinsicExpr),
     Index {
         target: Box<Expr>,
         index: Box<Expr>,
@@ -332,10 +333,24 @@ pub enum ExprKind {
     When(WhenExpr),
     Lambda(LambdaExpr),
     Block(BlockExpr),
-    Econ {
-        ty: TypeSyntax,
-        body: BlockExpr,
-    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntrinsicExpr {
+    Updated(UpdatedIntrinsic),
+    Econ(EconIntrinsic),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedIntrinsic {
+    pub target: Box<Expr>,
+    pub updates: Vec<UpdatedArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EconIntrinsic {
+    pub ty: TypeSyntax,
+    pub body: BlockExpr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,6 +381,19 @@ pub enum Argument {
         value: Expr,
         span: TextSpan,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatedArg {
+    pub path: Vec<UpdatedPathSegment>,
+    pub value: Expr,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatedPathSegment {
+    Field(String),
+    Index(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

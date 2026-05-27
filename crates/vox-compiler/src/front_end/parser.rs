@@ -6,12 +6,12 @@ use vox_core::{
 use crate::front_end::{
     ast::{
         Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentOp, CompoundAssignmentStatement, Expr, ExprKind, ForStatement,
-        FrontEndUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl, LambdaExpr,
-        LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
-        QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement, StringLiteral,
-        StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, ValueDecl, Visibility, WhenArm,
-        WhenExpr,
+        CompoundAssignmentOp, CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind,
+        ForStatement, FrontEndUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
+        IntrinsicExpr, LambdaExpr, LambdaParameter, LocalValueDecl, Mutability, PanicStatement,
+        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField,
+        ReturnStatement, StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
+        UpdatedArg, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
     },
     lexer::{LexedStringPart, Lexer, Token, TokenKind},
 };
@@ -19,6 +19,12 @@ use crate::front_end::{
 pub struct Parser {
     tokens: Vec<Token>,
     index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntrinsicName {
+    Updated,
+    Econ,
 }
 
 impl Parser {
@@ -762,6 +768,11 @@ impl Parser {
         let mut expr = self.parse_primary_expr()?;
         loop {
             if self.consume(TokenKind::LParen) {
+                if let Some(intrinsic) = self.intrinsic_name_from_expr(&expr) {
+                    expr = self.parse_intrinsic_call(expr.span.start, intrinsic)?;
+                    continue;
+                }
+
                 let arguments = self.parse_argument_list(TokenKind::RParen)?;
                 self.expect_simple(TokenKind::RParen, "expected `)` after argument list")?;
                 let end = self.previous().span.end;
@@ -813,6 +824,10 @@ impl Parser {
                 continue;
             }
             if self.consume(TokenKind::Dot) {
+                if let Some(intrinsic) = self.try_parse_receiver_intrinsic_name() {
+                    expr = self.parse_receiver_intrinsic(expr, intrinsic)?;
+                    continue;
+                }
                 if self.consume(TokenKind::LParen) {
                     let callee = self.parse_qualified_name()?;
                     self.expect_simple(
@@ -901,19 +916,13 @@ impl Parser {
                     kind: ExprKind::String(literal),
                 })
             }
-            TokenKind::Identifier(_) => {
-                let name = self.parse_qualified_name()?;
-                Ok(Expr {
-                    span: name.span.clone(),
-                    kind: ExprKind::Name(name),
-                })
-            }
+            TokenKind::Identifier(_) => self.parse_name_expr(),
             TokenKind::LBracket => self.parse_list_literal(),
             TokenKind::LParen => self.parse_paren_or_tuple_expr(),
             TokenKind::LBrace => self.parse_braced_expr(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::When => self.parse_when_expr(),
-            TokenKind::Econ => self.parse_econ_expr(),
+            TokenKind::Econ => self.parse_intrinsic_primary_expr(IntrinsicName::Econ),
             _ => self.error_here(self.expected_expression_message()),
         }
     }
@@ -1008,6 +1017,17 @@ impl Parser {
         } else {
             self.parse_block_expr_required()
         }
+    }
+
+    fn parse_name_expr(&mut self) -> Result<Expr, DiagnosticBag> {
+        let (name, span) = self.expect_identifier("expected identifier")?;
+        Ok(Expr {
+            span: span.clone(),
+            kind: ExprKind::Name(QualifiedName {
+                segments: vec![name],
+                span,
+            }),
+        })
     }
 
     fn try_parse_record_literal(&mut self) -> Result<Option<Expr>, DiagnosticBag> {
@@ -1373,7 +1393,66 @@ impl Parser {
         })
     }
 
-    fn parse_econ_expr(&mut self) -> Result<Expr, DiagnosticBag> {
+    fn parse_intrinsic_primary_expr(
+        &mut self,
+        intrinsic: IntrinsicName,
+    ) -> Result<Expr, DiagnosticBag> {
+        match intrinsic {
+            IntrinsicName::Econ => self.parse_econ_intrinsic(),
+            IntrinsicName::Updated => self.error_here("`updated` requires a target value"),
+        }
+    }
+
+    fn parse_intrinsic_call(
+        &mut self,
+        start: usize,
+        intrinsic: IntrinsicName,
+    ) -> Result<Expr, DiagnosticBag> {
+        match intrinsic {
+            IntrinsicName::Updated => {
+                let (target, updates) = self.parse_updated_call_arguments(TokenKind::RParen)?;
+                self.expect_simple(TokenKind::RParen, "expected `)` after updated arguments")?;
+                let end = self.previous().span.end;
+                Ok(Expr {
+                    kind: ExprKind::Intrinsic(IntrinsicExpr::Updated(UpdatedIntrinsic {
+                        target: Box::new(target),
+                        updates,
+                    })),
+                    span: TextSpan::new(start, end),
+                })
+            }
+            IntrinsicName::Econ => self.error_here("`econ` is not called with `(...)`"),
+        }
+    }
+
+    fn parse_receiver_intrinsic(
+        &mut self,
+        target: Expr,
+        intrinsic: IntrinsicName,
+    ) -> Result<Expr, DiagnosticBag> {
+        match intrinsic {
+            IntrinsicName::Updated => {
+                self.expect_simple(TokenKind::LParen, "expected `(` after `.updated`")?;
+                let updates = self.parse_updated_argument_list(TokenKind::RParen)?;
+                if updates.is_empty() {
+                    return self.error_here("`updated` requires at least one field assignment");
+                }
+                self.expect_simple(TokenKind::RParen, "expected `)` after updated arguments")?;
+                let end = self.previous().span.end;
+                let start = target.span.start;
+                Ok(Expr {
+                    kind: ExprKind::Intrinsic(IntrinsicExpr::Updated(UpdatedIntrinsic {
+                        target: Box::new(target),
+                        updates,
+                    })),
+                    span: TextSpan::new(start, end),
+                })
+            }
+            IntrinsicName::Econ => self.error_here("`econ` does not support receiver syntax"),
+        }
+    }
+
+    fn parse_econ_intrinsic(&mut self) -> Result<Expr, DiagnosticBag> {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::Econ, "expected `econ`")?;
         self.expect_simple(TokenKind::LBracket, "expected `[` after `econ`")?;
@@ -1384,10 +1463,10 @@ impl Parser {
             unreachable!();
         };
         Ok(Expr {
-            kind: ExprKind::Econ {
+            kind: ExprKind::Intrinsic(IntrinsicExpr::Econ(EconIntrinsic {
                 ty,
                 body: body.clone(),
-            },
+            })),
             span: TextSpan::new(start, body.span.end),
         })
     }
@@ -1419,6 +1498,122 @@ impl Parser {
             }
         }
         Ok(arguments)
+    }
+
+    fn parse_updated_call_arguments(
+        &mut self,
+        terminator: TokenKind,
+    ) -> Result<(Expr, Vec<UpdatedArg>), DiagnosticBag> {
+        let target = self.parse_expr()?;
+        if self.at(terminator.clone()) {
+            return self.error_here("`updated` requires at least one field assignment");
+        }
+        self.expect_simple(
+            TokenKind::Comma,
+            "expected `,` after the value being updated",
+        )?;
+        let arguments = self.parse_updated_argument_list(terminator)?;
+        if arguments.is_empty() {
+            return self.error_here("`updated` requires at least one field assignment");
+        }
+        Ok((target, arguments))
+    }
+
+    fn parse_updated_argument_list(
+        &mut self,
+        terminator: TokenKind,
+    ) -> Result<Vec<UpdatedArg>, DiagnosticBag> {
+        let mut arguments = Vec::new();
+        while !self.at(terminator.clone()) {
+            arguments.push(self.parse_updated_argument()?);
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(arguments)
+    }
+
+    fn parse_updated_argument(&mut self) -> Result<UpdatedArg, DiagnosticBag> {
+        let start = self.current().span.start;
+        let path = self.parse_updated_path()?;
+        self.expect_simple(TokenKind::Assign, "expected `=` after updated path")?;
+        let value = self.parse_expr()?;
+        Ok(UpdatedArg {
+            path,
+            value: value.clone(),
+            span: TextSpan::new(start, value.span.end),
+        })
+    }
+
+    fn parse_updated_path(&mut self) -> Result<Vec<UpdatedPathSegment>, DiagnosticBag> {
+        let mut path = vec![self.parse_updated_path_segment("expected updated field path")?];
+        while self.consume(TokenKind::Dot) {
+            path.push(self.parse_updated_path_segment(
+                "expected field name or index after `.` in updated path",
+            )?);
+        }
+        Ok(path)
+    }
+
+    fn parse_updated_path_segment(
+        &mut self,
+        message: &str,
+    ) -> Result<UpdatedPathSegment, DiagnosticBag> {
+        match self.current().kind.clone() {
+            TokenKind::Identifier(name) => {
+                self.index += 1;
+                Ok(UpdatedPathSegment::Field(name))
+            }
+            TokenKind::Hash => {
+                let hash_span = self.bump().span.clone();
+                let TokenKind::Integer(raw) = self.current().kind.clone() else {
+                    return Err(vec![
+                        Diagnostic::error("expected an integer index after `#`")
+                            .with_span(hash_span),
+                    ]
+                    .into());
+                };
+                let span = self.bump().span.clone();
+                let index =
+                    raw.replace('_', "")
+                        .parse::<usize>()
+                        .map_err(|_| -> DiagnosticBag {
+                            vec![
+                                Diagnostic::error("updated index is out of range")
+                                    .with_span(span.clone()),
+                            ]
+                            .into()
+                        })?;
+                Ok(UpdatedPathSegment::Index(index))
+            }
+            _ => self.error_here(message),
+        }
+    }
+
+    fn intrinsic_name_from_expr(&self, expr: &Expr) -> Option<IntrinsicName> {
+        match &expr.kind {
+            ExprKind::Name(QualifiedName { segments, .. })
+                if segments.as_slice() == ["updated"] =>
+            {
+                Some(IntrinsicName::Updated)
+            }
+            _ => None,
+        }
+    }
+
+    fn try_parse_receiver_intrinsic_name(&mut self) -> Option<IntrinsicName> {
+        let TokenKind::Identifier(name) = self.current().kind.clone() else {
+            return None;
+        };
+        if !matches!(self.peek_kind(1), Some(TokenKind::LParen)) {
+            return None;
+        }
+        let intrinsic = match name.as_str() {
+            "updated" => IntrinsicName::Updated,
+            _ => return None,
+        };
+        self.index += 1;
+        Some(intrinsic)
     }
 
     fn parse_visibility(&mut self) -> Option<Visibility> {

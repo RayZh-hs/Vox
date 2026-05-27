@@ -7,9 +7,9 @@ use crate::front_end::{
     FrontEndUnit,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, Expr, ExprKind, ForStatement, FunctionDecl, IfExpr, RangeExpr,
-        RecordFieldInit, ReturnStatement, StringLiteral, StringPart, TopLevelItem, ValueDecl,
-        WhenExpr,
+        CompoundAssignmentStatement, Expr, ExprKind, ForStatement, FunctionDecl, IfExpr,
+        IntrinsicExpr, RangeExpr, RecordFieldInit, ReturnStatement, StringLiteral, StringPart,
+        TopLevelItem, ValueDecl, WhenExpr,
     },
 };
 
@@ -121,6 +121,7 @@ fn visit_expr(expr: &Expr, features: &mut RankFeatures) {
                 visit_argument(argument, features);
             }
         }
+        ExprKind::Intrinsic(intrinsic) => visit_intrinsic(intrinsic, features),
         ExprKind::Index { target, index } => {
             visit_expr(target, features);
             visit_expr(index, features);
@@ -150,7 +151,20 @@ fn visit_expr(expr: &Expr, features: &mut RankFeatures) {
         ExprKind::When(when_expr) => visit_when(when_expr, features),
         ExprKind::Lambda(lambda) => visit_expr(&lambda.body, features),
         ExprKind::Block(block) => visit_block(block, features),
-        ExprKind::Econ { body, .. } => visit_block(body, features),
+    }
+}
+
+fn visit_intrinsic(intrinsic: &IntrinsicExpr, features: &mut RankFeatures) {
+    match intrinsic {
+        IntrinsicExpr::Updated(updated) => {
+            features.has_projection = true;
+            features.has_composite_producer = true;
+            visit_expr(&updated.target, features);
+            for update in &updated.updates {
+                visit_expr(&update.value, features);
+            }
+        }
+        IntrinsicExpr::Econ(econ) => visit_block(&econ.body, features),
     }
 }
 

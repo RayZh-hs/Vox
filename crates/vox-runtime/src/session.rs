@@ -667,8 +667,7 @@ fn environment_from_snapshot<R: RuntimeRunner>(
     );
     let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-    infer_environment(&front_end.syntax, &runner.package_manifests()?)
-        .map_err(compile_error)
+    infer_environment(&front_end.syntax, &runner.package_manifests()?).map_err(compile_error)
 }
 
 fn snapshot_items(

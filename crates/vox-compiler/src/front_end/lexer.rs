@@ -44,6 +44,7 @@ pub enum TokenKind {
     LBrace,
     RBrace,
     Comma,
+    Hash,
     Dot,
     Colon,
     Semicolon,
@@ -201,6 +202,13 @@ impl<'a> Lexer<'a> {
                     self.bump_char();
                     tokens.push(Token {
                         kind: TokenKind::Comma,
+                        span: TextSpan::new(start, self.absolute_offset()),
+                    });
+                }
+                '#' => {
+                    self.bump_char();
+                    tokens.push(Token {
+                        kind: TokenKind::Hash,
                         span: TextSpan::new(start, self.absolute_offset()),
                     });
                 }

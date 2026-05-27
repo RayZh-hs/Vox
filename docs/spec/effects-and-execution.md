@@ -44,8 +44,8 @@ An `evil script` marks the script entrypoint as effectful.
 
 ## 4. `econ`
 
-`econ` is a built-in language construct that creates a pure handle to a cached
-snapshot of an effectful computation.
+`econ` is a built-in intrinsic that creates a pure handle to a cached snapshot
+of an effectful computation.
 
 ```ebnf
 EconExpr
@@ -68,6 +68,9 @@ Semantics:
 - reading from an existing snapshot is pure;
 - pure computations that depend on an `Econ[T]` depend on the snapshot version,
   not on re-running the effect.
+
+`econ` does not use a Rust-style `!` sigil. It is a compiler-known intrinsic
+with dedicated syntax.
 
 Runtime support for refreshing `econ` snapshots will be implemented. The
 surface syntax already exists.

@@ -100,7 +100,7 @@ The language uses the following operators and punctuation:
 
 ```text
 ( ) [ ] { }
-, . : ; ? -> => 
+, . : ; ? # -> => 
 + - * / % ! 
  = += -= *= /= %=
 == != < <= > >=
