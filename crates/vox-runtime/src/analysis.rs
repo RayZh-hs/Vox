@@ -1063,6 +1063,12 @@ impl<'a> TypeEngine<'a> {
             if let Some(function) = self.functions.get(local) {
                 return Ok(self.function_repl_type(&function.summary));
             }
+            if scope.generic_parameters.contains_key(local) {
+                return Err(type_name_used_as_value_error(local, "type parameter"));
+            }
+            if let Some(kind) = predefined_type_name_kind(local) {
+                return Err(type_name_used_as_value_error(local, kind));
+            }
             return Err(format!("unknown name `{local}`"));
         }
 
@@ -1118,10 +1124,10 @@ impl<'a> TypeEngine<'a> {
                     });
                 }
                 if manifest.types.iter().any(|ty| ty.name.name == *symbol) {
-                    return Ok(ReplType::Named {
-                        name: format!("{package}.{symbol}"),
-                        arguments: Vec::new(),
-                    });
+                    return Err(type_name_used_as_value_error(
+                        &format!("{package}.{symbol}"),
+                        "type",
+                    ));
                 }
             }
         }
@@ -1524,6 +1530,20 @@ fn type_satisfies_bound(ty: &ReplType, bound: &str) -> bool {
         "Numeric" => matches!(ty, ReplType::Int | ReplType::Float),
         _ => true,
     }
+}
+
+fn predefined_type_name_kind(name: &str) -> Option<&'static str> {
+    match name {
+        "Int" | "Float" | "Bool" | "String" | "Unit" => Some("type"),
+        "List" | "Econ" => Some("type constructor"),
+        _ => None,
+    }
+}
+
+fn type_name_used_as_value_error(name: &str, kind: &str) -> String {
+    format!(
+        "`{name}` is a {kind}, not a value; use it only in type positions such as annotations or `when ... is` arms"
+    )
 }
 
 pub fn language_keywords() -> Vec<String> {
