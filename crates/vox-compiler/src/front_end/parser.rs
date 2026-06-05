@@ -306,6 +306,9 @@ impl Parser {
             if !self.consume(TokenKind::Comma) {
                 break;
             }
+            if self.at(TokenKind::RBracket) {
+                break;
+            }
         }
         self.expect_simple(TokenKind::RBracket, "expected `]` after generic parameters")?;
         Ok(parameters)
@@ -349,6 +352,9 @@ impl Parser {
                 loop {
                     parameters.push(self.parse_type()?);
                     if !self.consume(TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(TokenKind::RParen) {
                         break;
                     }
                 }
@@ -405,6 +411,9 @@ impl Parser {
                 if !self.consume(TokenKind::Comma) {
                     break;
                 }
+                if self.at(TokenKind::RBrace) {
+                    break;
+                }
             }
             self.expect_simple(TokenKind::RBrace, "expected `}` after record type")?;
             return Ok(TypeSyntax {
@@ -429,6 +438,9 @@ impl Parser {
                     if !self.consume(TokenKind::Comma) {
                         break;
                     }
+                    if self.at(TokenKind::RParen) {
+                        break;
+                    }
                 }
                 self.expect_simple(TokenKind::RParen, "expected `)` after tuple type")?;
                 return Ok(TypeSyntax {
@@ -450,6 +462,9 @@ impl Parser {
             while !self.at(TokenKind::RBracket) {
                 arguments.push(self.parse_type()?);
                 if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+                if self.at(TokenKind::RBracket) {
                     break;
                 }
             }
@@ -511,6 +526,9 @@ impl Parser {
                         span: TextSpan::new(param_start, end),
                     });
                     if !self.consume(TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(TokenKind::RParen) {
                         break;
                     }
                 }

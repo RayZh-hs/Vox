@@ -1,4 +1,4 @@
-package fixtures.semantic.package;
+package fixtures.semantic.pkg;
 
 public import fixtures.host;
 

@@ -366,6 +366,7 @@ impl<'a> TypeEngine<'a> {
         self.collect_imports()?;
         self.collect_function_headers();
         self.collect_value_placeholders();
+        self.infer_parameter_defaults()?;
         self.infer_function_bodies()?;
         self.infer_value_initializers()?;
         Ok(())
@@ -441,21 +442,61 @@ impl<'a> TypeEngine<'a> {
 
     fn collect_value_placeholders(&mut self) {
         for item in &self.unit.items {
-            if let TopLevelItem::Value(value) = item {
-                self.values.insert(
-                    value.name.clone(),
-                    ValueInfo {
-                        name: value.name.clone(),
-                        ty: value
-                            .ty
-                            .as_ref()
-                            .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
-                            .unwrap_or_else(|| ReplType::Unknown(format!("{} type", value.name))),
-                        mutable: matches!(value.mutability, Mutability::Var),
-                    },
-                );
+            match item {
+                TopLevelItem::Param(parameter) => {
+                    self.values.insert(
+                        parameter.name.clone(),
+                        ValueInfo {
+                            name: parameter.name.clone(),
+                            ty: from_type_syntax(&parameter.ty, &BTreeMap::new()),
+                            mutable: false,
+                        },
+                    );
+                }
+                TopLevelItem::Value(value) => {
+                    self.values.insert(
+                        value.name.clone(),
+                        ValueInfo {
+                            name: value.name.clone(),
+                            ty: value
+                                .ty
+                                .as_ref()
+                                .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
+                                .unwrap_or_else(|| {
+                                    ReplType::Unknown(format!("{} type", value.name))
+                                }),
+                            mutable: matches!(value.mutability, Mutability::Var),
+                        },
+                    );
+                }
+                TopLevelItem::Import(_) | TopLevelItem::Function(_) => {}
             }
         }
+    }
+
+    fn infer_parameter_defaults(&self) -> Result<(), String> {
+        for item in &self.unit.items {
+            let TopLevelItem::Param(parameter) = item else {
+                continue;
+            };
+            let Some(default) = &parameter.default else {
+                continue;
+            };
+
+            let mut scope = self.top_level_scope();
+            let inferred = self.infer_expr(default, &mut scope)?;
+            let explicit = from_type_syntax(&parameter.ty, &scope.generic_parameters);
+            if !inferred.is_assignable_to(&explicit) {
+                return Err(format!(
+                    "parameter `{}` has default type `{}`, which is not assignable to `{}`",
+                    parameter.name,
+                    inferred.render(),
+                    explicit.render()
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn infer_function_bodies(&mut self) -> Result<(), String> {

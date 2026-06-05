@@ -1,4 +1,4 @@
-package fixtures.syntax.package;
+package fixtures.syntax.pkg_surface;
 
 /// Re-exported package import.
 public import fixtures.host;
