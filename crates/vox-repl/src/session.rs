@@ -17,6 +17,8 @@ use vox_runtime::{
 use crate::{
     CompletionSnapshot,
     command::{ReplCommand, SessionCommand},
+    editing::{build_edit_buffer, validate_edited_symbols},
+    editor::{EditOutcome, edit_chunk},
 };
 
 const LAST_VALUE_NAME: &str = "__repl_last";
@@ -105,6 +107,8 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 ":reset".to_owned(),
                 ":clear".to_owned(),
                 ":env".to_owned(),
+                ":chunk".to_owned(),
+                ":edit".to_owned(),
                 ":snapshot".to_owned(),
                 ":restore".to_owned(),
                 ":run".to_owned(),
@@ -153,6 +157,8 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 Ok(environment) => ReplOutput::message(render_environment(&environment)),
                 Err(error) => ReplOutput::error(error.to_string()),
             },
+            ReplCommand::Chunk => self.edit_submission(Vec::new()),
+            ReplCommand::Edit(symbols) => self.edit_submission(parse_symbol_list(&symbols)),
             ReplCommand::Snapshot(name) => self.snapshot(&name),
             ReplCommand::Restore(name) => self.restore(&name),
             ReplCommand::TypeOf(expr) => match self.runtime.type_of(&expr) {
@@ -236,6 +242,44 @@ impl<R: RuntimeRunner> ReplSession<R> {
 
         match self.runtime.run_script_text(path, &text) {
             Ok(value) => ReplOutput::message(self.render_runtime_value(&value)),
+            Err(error) => ReplOutput::error(error.to_string()),
+        }
+    }
+
+    fn edit_submission(&mut self, symbols: Vec<String>) -> ReplOutput {
+        let snapshot = match self.runtime.snapshot_source() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return ReplOutput::error(error.to_string()),
+        };
+        let initial = match build_edit_buffer(&snapshot, &symbols) {
+            Ok(initial) => initial,
+            Err(error) => return ReplOutput::error(error),
+        };
+        let label = if symbols.is_empty() {
+            "new chunk".to_owned()
+        } else {
+            format!("definitions {}", render_backticked_names(&symbols))
+        };
+
+        let edited = match edit_chunk(&label, &initial) {
+            Ok(EditOutcome::Submitted(text)) => text,
+            Ok(EditOutcome::Cancelled) => {
+                return ReplOutput::message("editor cancelled".to_owned());
+            }
+            Err(error) => return ReplOutput::error(error),
+        };
+
+        if edited.trim().is_empty() {
+            return ReplOutput::message("no chunk submitted".to_owned());
+        }
+
+        if let Err(error) = validate_edited_symbols(&edited, &symbols) {
+            return ReplOutput::error(error);
+        }
+
+        match self.runtime.evaluate_submission(&edited) {
+            Ok(Some(value)) => ReplOutput::message(self.render_runtime_value(&value)),
+            Ok(None) => ReplOutput::message("chunk submitted".to_owned()),
             Err(error) => ReplOutput::error(error.to_string()),
         }
     }
@@ -419,6 +463,8 @@ fn render_help() -> String {
         ":reset                     - clear interactive state",
         ":clear                     - clear the screen",
         ":env                       - show visible imports, bindings, and functions",
+        ":chunk                     - open an editor for a new multi-definition chunk",
+        ":edit [symbol ...]         - edit stored definitions together as one chunk",
         ":snapshot [name]           - save the current state as a named snapshot",
         ":restore [name]            - restore a previously saved snapshot",
         ":run [file]                - run a script file in the current state",
@@ -471,6 +517,18 @@ fn render_session_status(session: &SessionSummary) -> String {
         session.attached_endpoints,
         if session.reserved { "yes" } else { "no" }
     )
+}
+
+fn parse_symbol_list(raw: &str) -> Vec<String> {
+    raw.split_whitespace().map(str::to_owned).collect()
+}
+
+fn render_backticked_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn session_completion_keys(session: &SessionSummary) -> Vec<String> {

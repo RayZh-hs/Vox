@@ -86,6 +86,19 @@ Int
 
 The REPL preserves prior successful state when a later submission fails.
 
+Interactive submissions are closed over the current session state. A committed
+submission must not leave behind dangling references to future definitions.
+
+In practice this means:
+
+- `val` references must already resolve inside the current session or inside the
+  same submitted chunk;
+- functions that call each other should be entered together in one chunk;
+- if a function signature changes, direct callers must be resubmitted in the
+  same chunk.
+
+For coupled changes, prefer `:chunk`, `:edit`, `:run`, or an external file.
+
 ## REPL Commands
 
 - `:help` shows the command list.
@@ -93,6 +106,9 @@ The REPL preserves prior successful state when a later submission fails.
 - `:reset` clears the current interactive session state.
 - `:clear` clears the terminal screen.
 - `:env` prints visible imports, bindings, and functions.
+- `:chunk` opens an editor for a new multi-definition chunk.
+- `:edit <symbol>...` opens stored definitions together for resubmission as one
+  chunk.
 - `:snapshot <name>` saves the current session source to a local snapshot file.
 - `:restore <name>` replaces the current session state with a snapshot file.
 - `:run <file>` runs a Vox script file in the current session context.
@@ -117,6 +133,20 @@ The REPL preserves prior successful state when a later submission fails.
 - `Tab` completes commands, snapshot names, handles, and visible symbols.
 - `Ctrl+C` interrupts the current input line.
 - `Ctrl+D` exits the REPL.
+
+`:chunk` and `:edit` choose an editor as follows:
+
+- if `VOX_EDITOR=builtin`, use the builtin multiline editor;
+- otherwise if `VOX_EDITOR` is set, run that command;
+- otherwise if `EDITOR` is set, run that command;
+- otherwise fall back to the builtin multiline editor.
+
+The builtin editor is a simple replacement editor:
+
+- it shows the current chunk, if any;
+- it asks for the full replacement chunk;
+- `.submit` commits the chunk;
+- `.cancel` abandons it.
 
 ## Snapshot Files
 

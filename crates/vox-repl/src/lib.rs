@@ -1,5 +1,7 @@
 mod command;
 mod completion;
+mod editing;
+mod editor;
 mod session;
 mod typing;
 

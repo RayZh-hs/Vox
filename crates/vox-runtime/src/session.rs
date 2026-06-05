@@ -1,9 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use vox_compiler::front_end::{
     analyze_source,
-    ast::{CompilationUnit, Expr, ExprKind, TopLevelItem},
+    ast::{
+        Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
+        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForStatement, FunctionDecl,
+        IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr,
+        ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic,
+        WhenArm, WhenExpr,
+    },
 };
 use vox_core::{
     host::PackageManifest,
@@ -91,6 +97,13 @@ impl StoredItem {
     fn is_hidden_last(&self) -> bool {
         matches!(&self.key, StoredItemKey::Value { name } if name == LAST_VALUE_NAME)
     }
+
+    fn function_name(&self) -> Option<&str> {
+        match &self.key {
+            StoredItemKey::Function { name } => Some(name),
+            _ => None,
+        }
+    }
 }
 
 impl StoredItemKey {
@@ -118,6 +131,12 @@ struct ParsedSubmission {
 struct RetainedLastValue {
     item: StoredItem,
     value: Option<RuntimeValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionModel {
+    unit: CompilationUnit,
+    environment: TypeEnvironment,
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +168,8 @@ impl<R: RuntimeRunner> SessionState<R> {
         if parsed.items.is_empty() && parsed.result_source.is_none() {
             return Ok(None);
         }
+
+        self.enforce_incremental_redefinition_policy(&parsed.items)?;
 
         let candidate_items = merge_items(&self.items, parsed.items.clone());
         let items_changed = candidate_items != self.items;
@@ -279,6 +300,131 @@ impl<R: RuntimeRunner> SessionState<R> {
         unit: &CompilationUnit,
     ) -> Result<TypeEnvironment, SessionError> {
         infer_environment(unit, &self.runner.package_manifests()?).map_err(compile_error)
+    }
+
+    fn analyze_items(
+        &self,
+        label: &str,
+        items: &[StoredItem],
+    ) -> Result<SessionModel, SessionError> {
+        let source = render_session_source(items, None, None);
+        let front_end = analyze_source(&SourceText::new(label, 1, &source))
+            .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
+        let environment = self.validate_environment(&front_end.syntax)?;
+        Ok(SessionModel {
+            unit: front_end.syntax,
+            environment,
+        })
+    }
+
+    fn enforce_incremental_redefinition_policy(
+        &self,
+        incoming: &[StoredItem],
+    ) -> Result<(), SessionError> {
+        let changed_functions = incoming
+            .iter()
+            .filter_map(StoredItem::function_name)
+            .filter(|name| {
+                self.items
+                    .iter()
+                    .any(|item| item.function_name() == Some(*name))
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        if changed_functions.is_empty() {
+            return Ok(());
+        }
+
+        let current = self.analyze_items("<repl-current>", &self.items)?;
+        let current_functions = current
+            .environment
+            .functions
+            .iter()
+            .map(|function| (function.name.clone(), function))
+            .collect::<BTreeMap<_, _>>();
+        let direct_callers = collect_direct_callers(&current.unit);
+        let affected_callers = changed_functions
+            .iter()
+            .flat_map(|name| direct_callers.get(name).into_iter().flatten().cloned())
+            .collect::<BTreeSet<_>>();
+        if affected_callers.is_empty() {
+            return Ok(());
+        }
+
+        let filtered_existing = self
+            .items
+            .iter()
+            .filter(|item| {
+                item.function_name().is_none_or(|name| {
+                    !changed_functions.contains(name) && !affected_callers.contains(name)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let candidate_items = merge_items(&filtered_existing, incoming.to_vec());
+        let candidate = match self.analyze_items("<repl-redefine>", &candidate_items) {
+            Ok(candidate) => candidate,
+            Err(_) => return Ok(()),
+        };
+        let candidate_functions = candidate
+            .environment
+            .functions
+            .iter()
+            .map(|function| (function.name.clone(), function))
+            .collect::<BTreeMap<_, _>>();
+        let incoming_function_names = incoming
+            .iter()
+            .filter_map(StoredItem::function_name)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        let mut violations = Vec::new();
+        for function_name in changed_functions {
+            let Some(old_summary) = current_functions.get(&function_name) else {
+                continue;
+            };
+            let Some(new_summary) = candidate_functions.get(&function_name) else {
+                continue;
+            };
+            if old_summary == new_summary {
+                continue;
+            }
+
+            let missing_callers = direct_callers
+                .get(&function_name)
+                .into_iter()
+                .flatten()
+                .filter(|caller| !incoming_function_names.contains(caller.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing_callers.is_empty() {
+                violations.push((function_name, missing_callers));
+            }
+        }
+
+        if violations.is_empty() {
+            return Ok(());
+        }
+
+        let hint_names = redefinition_edit_hint(&violations);
+        let lines = violations
+            .into_iter()
+            .map(|(function, callers)| {
+                format!(
+                    "changing signature of `{function}` requires redefining direct callers in the same chunk: {}",
+                    callers
+                        .iter()
+                        .map(|caller| format!("`{caller}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>();
+        Err(SessionError::Message(format!(
+            "{}\nuse one submission, `:run`, or `:edit {}`",
+            lines.join("\n"),
+            hint_names
+        )))
     }
 
     fn synthetic_source(
@@ -792,6 +938,314 @@ fn merge_items(existing: &[StoredItem], incoming: Vec<StoredItem>) -> Vec<Stored
         merged.push(item);
     }
     merged
+}
+
+fn collect_direct_callers(unit: &CompilationUnit) -> BTreeMap<String, BTreeSet<String>> {
+    let module_segments = REPL_MODULE
+        .split('.')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let local_functions = unit
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Function(function) => Some(function.name.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut direct_callers = BTreeMap::<String, BTreeSet<String>>::new();
+
+    for item in &unit.items {
+        let TopLevelItem::Function(function) = item else {
+            continue;
+        };
+        let callees = FunctionCallCollector::new(&local_functions, &module_segments)
+            .collect_from_function(function);
+        for callee in callees {
+            direct_callers
+                .entry(callee)
+                .or_default()
+                .insert(function.name.clone());
+        }
+    }
+
+    direct_callers
+}
+
+fn redefinition_edit_hint(violations: &[(String, Vec<String>)]) -> String {
+    let mut names = BTreeSet::new();
+    for (function, callers) in violations {
+        names.insert(function.clone());
+        names.extend(callers.iter().cloned());
+    }
+    names.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+struct FunctionCallCollector<'a> {
+    local_functions: &'a BTreeSet<String>,
+    module_segments: &'a [String],
+    scopes: Vec<BTreeSet<String>>,
+    calls: BTreeSet<String>,
+}
+
+impl<'a> FunctionCallCollector<'a> {
+    fn new(local_functions: &'a BTreeSet<String>, module_segments: &'a [String]) -> Self {
+        Self {
+            local_functions,
+            module_segments,
+            scopes: Vec::new(),
+            calls: BTreeSet::new(),
+        }
+    }
+
+    fn collect_from_function(mut self, function: &FunctionDecl) -> BTreeSet<String> {
+        self.push_scope();
+        for parameter in &function.parameters {
+            self.bind_name(&parameter.name);
+        }
+        for parameter in &function.parameters {
+            if let Some(default) = &parameter.default {
+                self.visit_expr(default);
+            }
+        }
+        self.visit_expr(&function.body);
+        self.pop_scope();
+        self.calls
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(BTreeSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind_name(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_owned());
+        }
+    }
+
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    fn resolve_local_function(&self, name: &QualifiedName) -> Option<String> {
+        match name.segments.as_slice() {
+            [local] if !self.is_shadowed(local) && self.local_functions.contains(local) => {
+                Some(local.clone())
+            }
+            segments
+                if segments.len() == self.module_segments.len() + 1
+                    && segments[..self.module_segments.len()]
+                        .iter()
+                        .zip(self.module_segments.iter())
+                        .all(|(left, right)| left == right) =>
+            {
+                let local = segments.last()?.clone();
+                self.local_functions.contains(&local).then_some(local)
+            }
+            _ => None,
+        }
+    }
+
+    fn record_call(&mut self, name: &QualifiedName) {
+        if let Some(local) = self.resolve_local_function(name) {
+            self.calls.insert(local);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Integer(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::Name(_) => {}
+            ExprKind::String(literal) => self.visit_string_literal(literal),
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                for item in items {
+                    self.visit_expr(item);
+                }
+            }
+            ExprKind::Record(fields) => {
+                for field in fields {
+                    self.visit_expr(&field.value);
+                }
+            }
+            ExprKind::Call { callee, arguments } => {
+                if let ExprKind::Name(name) = &callee.kind {
+                    self.record_call(name);
+                }
+                self.visit_expr(callee);
+                for argument in arguments {
+                    self.visit_argument(argument);
+                }
+            }
+            ExprKind::Intrinsic(intrinsic) => self.visit_intrinsic(intrinsic),
+            ExprKind::Index { target, index } => {
+                self.visit_expr(target);
+                self.visit_expr(index);
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::NonNull { target } => self.visit_expr(target),
+            ExprKind::ReceiverCall {
+                receiver,
+                callee,
+                arguments,
+            } => {
+                self.record_call(callee);
+                self.visit_expr(receiver);
+                for argument in arguments {
+                    self.visit_argument(argument);
+                }
+            }
+            ExprKind::Unary { expr, .. } => self.visit_expr(expr),
+            ExprKind::Binary { left, right, .. } => {
+                self.visit_expr(left);
+                self.visit_expr(right);
+            }
+            ExprKind::Range(range) => self.visit_range(range),
+            ExprKind::If(expr) => self.visit_if(expr),
+            ExprKind::When(expr) => self.visit_when(expr),
+            ExprKind::Lambda(expr) => self.visit_lambda(expr),
+            ExprKind::Block(block) => self.visit_block(block),
+        }
+    }
+
+    fn visit_argument(&mut self, argument: &Argument) {
+        match argument {
+            Argument::Positional(expr) => self.visit_expr(expr),
+            Argument::Named { value, .. } => self.visit_expr(value),
+        }
+    }
+
+    fn visit_intrinsic(&mut self, intrinsic: &IntrinsicExpr) {
+        match intrinsic {
+            IntrinsicExpr::Updated(updated) => self.visit_updated(updated),
+            IntrinsicExpr::Econ(EconIntrinsic { body, .. }) => self.visit_block(body),
+        }
+    }
+
+    fn visit_updated(&mut self, updated: &UpdatedIntrinsic) {
+        self.visit_expr(&updated.target);
+        for update in &updated.updates {
+            self.visit_updated_arg(update);
+        }
+    }
+
+    fn visit_updated_arg(&mut self, update: &UpdatedArg) {
+        self.visit_expr(&update.value);
+    }
+
+    fn visit_range(&mut self, range: &RangeExpr) {
+        if let Some(start) = &range.start {
+            self.visit_expr(start);
+        }
+        if let Some(end) = &range.end {
+            self.visit_expr(end);
+        }
+    }
+
+    fn visit_if(&mut self, expr: &IfExpr) {
+        for branch in &expr.branches {
+            self.visit_expr(&branch.condition);
+            self.visit_block(&branch.body);
+        }
+        if let Some(else_branch) = &expr.else_branch {
+            self.visit_block(else_branch);
+        }
+    }
+
+    fn visit_when(&mut self, expr: &WhenExpr) {
+        self.visit_expr(&expr.subject);
+        for arm in &expr.arms {
+            self.visit_when_arm(arm);
+        }
+        if let Some(else_arm) = &expr.else_arm {
+            self.visit_expr(else_arm);
+        }
+    }
+
+    fn visit_when_arm(&mut self, arm: &WhenArm) {
+        self.push_scope();
+        if let Some(binding) = &arm.binding {
+            self.bind_name(binding);
+        }
+        self.visit_expr(&arm.body);
+        self.pop_scope();
+    }
+
+    fn visit_lambda(&mut self, expr: &LambdaExpr) {
+        self.push_scope();
+        for parameter in &expr.parameters {
+            self.bind_name(&parameter.name);
+        }
+        self.visit_expr(&expr.body);
+        self.pop_scope();
+    }
+
+    fn visit_block(&mut self, block: &BlockExpr) {
+        self.push_scope();
+        self.visit_block_contents(block);
+        self.pop_scope();
+    }
+
+    fn visit_block_contents(&mut self, block: &BlockExpr) {
+        for item in &block.items {
+            match item {
+                BlockItem::LocalValue(value) => self.visit_local_value(value),
+                BlockItem::Assignment(assignment) => self.visit_assignment(assignment),
+                BlockItem::CompoundAssignment(assignment) => {
+                    self.visit_compound_assignment(assignment)
+                }
+                BlockItem::For(statement) => self.visit_for(statement),
+                BlockItem::Return(statement) => self.visit_return(statement),
+                BlockItem::Panic(statement) => self.visit_string_literal(&statement.message),
+                BlockItem::Expr(expr) => self.visit_expr(expr),
+            }
+        }
+        if let Some(trailing) = &block.trailing {
+            self.visit_expr(trailing);
+        }
+    }
+
+    fn visit_local_value(&mut self, value: &LocalValueDecl) {
+        self.visit_expr(&value.initializer);
+        self.bind_name(&value.name);
+    }
+
+    fn visit_assignment(&mut self, assignment: &AssignmentStatement) {
+        self.visit_expr(&assignment.value);
+    }
+
+    fn visit_compound_assignment(&mut self, assignment: &CompoundAssignmentStatement) {
+        self.visit_expr(&assignment.value);
+    }
+
+    fn visit_for(&mut self, statement: &ForStatement) {
+        self.visit_expr(&statement.iterable);
+        self.push_scope();
+        self.bind_name(&statement.pattern);
+        self.visit_block_contents(&statement.body);
+        self.pop_scope();
+    }
+
+    fn visit_return(&mut self, statement: &ReturnStatement) {
+        if let Some(value) = &statement.value {
+            self.visit_expr(value);
+        }
+    }
+
+    fn visit_string_literal(&mut self, literal: &StringLiteral) {
+        for part in &literal.parts {
+            if let StringPart::Interpolation(expr) = part {
+                self.visit_expr(expr);
+            }
+        }
+    }
 }
 
 fn item_key(item: &TopLevelItem) -> StoredItemKey {

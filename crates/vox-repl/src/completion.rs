@@ -399,7 +399,7 @@ fn complete_command_line(
             let start = command_token_start(prefix, argument_start);
             Ok((start, snapshot.complete_handles(&prefix[start..])))
         }
-        ":drop" | ":type" => {
+        ":drop" | ":type" | ":edit" => {
             let start = command_token_start(prefix, argument_start);
             Ok((start, snapshot.complete_symbol(&prefix[start..])))
         }
