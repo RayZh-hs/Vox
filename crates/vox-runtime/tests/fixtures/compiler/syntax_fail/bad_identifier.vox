@@ -1,0 +1,3 @@
+script fixtures.syntax.fail.identifier;
+
+val 2d = 1;

@@ -1,0 +1,4 @@
+package fixtures.syntax.fail.trailing;
+
+val x = 1;
+x

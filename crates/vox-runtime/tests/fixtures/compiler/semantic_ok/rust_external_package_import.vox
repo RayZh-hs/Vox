@@ -1,0 +1,11 @@
+package fixtures.semantic.rust_package;
+
+public import image;
+
+public fun sharpen(input: image.Image, filter: dyn image.Filter): image.Image {
+    val blurred: image.Image = image.blur(input, 0.5);
+    image.filter_apply(filter, blurred)
+}
+
+public fun histogram(input: image.Image): {shadows: Int, mids: Int, highlights: Int} =
+    image.histogram(input);

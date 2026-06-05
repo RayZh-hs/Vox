@@ -1,0 +1,7 @@
+script fixtures.syntax.fail.for_header;
+
+fun bad(items: List[Int]): Unit {
+    for item in items {
+        item;
+    }
+}

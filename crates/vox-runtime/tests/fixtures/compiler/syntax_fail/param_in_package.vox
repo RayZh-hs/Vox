@@ -1,0 +1,3 @@
+package fixtures.syntax.fail.param;
+
+param input: Int;

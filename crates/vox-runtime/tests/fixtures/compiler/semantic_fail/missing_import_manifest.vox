@@ -1,0 +1,5 @@
+script fixtures.semantic.fail.missing_import;
+
+import fixtures.missing;
+
+val x = 1;

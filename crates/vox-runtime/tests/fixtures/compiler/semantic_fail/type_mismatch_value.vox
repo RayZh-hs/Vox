@@ -1,0 +1,3 @@
+script fixtures.semantic.fail.type_mismatch;
+
+val x: Int = "not an int";

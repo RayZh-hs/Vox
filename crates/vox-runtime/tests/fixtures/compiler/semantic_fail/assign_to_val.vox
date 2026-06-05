@@ -1,0 +1,9 @@
+script fixtures.semantic.fail.assign_to_val;
+
+fun bad(): Int {
+    val x: Int = 1;
+    x = 2;
+    x
+}
+
+bad()

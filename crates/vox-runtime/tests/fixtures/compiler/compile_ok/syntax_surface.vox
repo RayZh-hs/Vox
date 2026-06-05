@@ -1,0 +1,89 @@
+evil script fixtures.syntax.surface;
+
+/// A public host import used by qualified calls.
+public import fixtures.host;
+private import fixtures.tools;
+
+// Ordinary comments and block comments may appear where whitespace is allowed.
+/* The declarations below intentionally exercise the front-end grammar. */
+param input: Int = 1;
+param callback: (Int, String?) -> List[Int];
+param tupled: (Int, String,);
+param service: dyn fixtures.host.Service;
+
+public val text: String = "line\n${input + 1} $input \u{41}";
+private var top: Int = 1_000;
+val floats: Float = 1.25e+2;
+val bools: Bool = true && !false || 1 < 2 && 2 <= 3 && 3 > 2 && 3 >= 3 && 3 == 3 && 3 != 4;
+val units: () = ();
+val unitRecord: {} = {};
+val list: List[Int] = [1, 2, 3,];
+val tuple: (Int, String,) = (1, "a",);
+val record: {name: String, count: Int, nested: {score: Float}} = {
+    name = "Ada",
+    count: Int = 1,
+    nested = { score = 2.0, },
+};
+val maybeRecord: {name: String}? = null;
+val accessed = record.name;
+val safeAccessed = maybeRecord?.name;
+val forced = maybeRecord!!.name;
+val indexed = list[0];
+val updatedA = record.updated(name = "Grace", nested.score = 3.0);
+val updatedB = updated(tuple, #0 = 2);
+val updatedC = list.updated(#1 = 4);
+val ranges = (0..10, 0.., ..10, .., 0..=10, ..=10);
+val fallback = maybeRecord?.name ?: "unknown";
+val arithmetic = -input + 2 * 3 / 4 % 5 - 6;
+val receiver = input.(fixtures.host.add)(rhs = 2);
+val lambdaOne = x -> x;
+val lambdaMany = (x: Int, y: Int,) -> {
+    val z = x + y;
+    z
+};
+val econValue = econ[Int] {
+    val n = input + 1;
+    n
+};
+val branch = if (input > 0) {
+    "positive"
+} else if (input == 0) {
+    "zero"
+} else {
+    "negative"
+};
+val dispatched = when (input) {
+    is Int as n -> n + 1;
+    is String -> { 0 }
+    else -> 0;
+};
+
+fun identity[T: Any](value: T): T = value;
+
+public evil fun effect(message: String = "ok"): Unit {
+    panic "not executed";
+}
+
+private fun statements(limit: Int): Int {
+    var total: Int = 0;
+    total = total + 1;
+    total += 2;
+    total -= 1;
+    total *= 2;
+    total /= 2;
+    total %= 3;
+    for (item in 0..limit) {
+        val seen = item;
+        seen;
+    }
+    if (total > 10) {
+        return total;
+    };
+    return;
+}
+
+{
+    val local = identity(input);
+    callback(local, "next");
+    local
+}

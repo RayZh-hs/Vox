@@ -1,0 +1,10 @@
+package fixtures.syntax.rust_surface;
+
+public import image;
+
+public fun preview(input: image.Image, filter: dyn image.Filter): image.Image {
+    val blurred = image.blur(input, radius = 1.0);
+    image.filter_apply(filter, blurred)
+}
+
+public val description: String = "rust crate import";

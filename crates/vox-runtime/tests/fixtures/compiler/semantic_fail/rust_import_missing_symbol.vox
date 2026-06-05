@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.rust_missing_symbol;
+
+import image;
+
+val source: image.Image = image.load("input.png");
+val bad = image.rotate(source, 90);

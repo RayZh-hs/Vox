@@ -1,0 +1,69 @@
+script fixtures.semantic.accepted;
+
+import fixtures.host;
+
+param input: Int = 4;
+param maybeName: String? = null;
+
+val hostSum: Int = fixtures.host.add(input, 2);
+val viaReceiver: Int = input.(fixtures.host.add)(2);
+
+fun addOne(x: Int): Int = x + 1;
+
+fun withDefault(x: Int = 1): Int = x;
+
+fun genericId[T: Any](value: T): T = value;
+
+fun blockMath(limit: Int): Int {
+    var total: Int = 0;
+    total = addOne(total);
+    total += 1;
+    total -= 1;
+    total *= 2;
+    total /= 2;
+    total %= 5;
+    for (item in 0..limit) {
+        total += item;
+    }
+    return total;
+}
+
+val numbers: List[Int] = [1, 2, 3];
+val first: Int = numbers[0];
+val rangeFirst: Int = (0..10)[0];
+val point: {x: Int, y: Int} = { x = 1, y = 2, };
+val pointX: Int = point.x;
+val moved = point.updated(x = 3);
+val pair: (Int, String) = (1, "one");
+val nextPair = updated(pair, #0 = 2);
+val nextNumbers = numbers.updated(#0 = 9);
+val nullablePoint: {x: Int}? = null;
+val maybeX = nullablePoint?.x;
+val certainX: Int = nullablePoint!!.x;
+val coalesced: String = maybeName ?: "fallback";
+val compare: Bool = input > 0 && input <= 10 || input == 100;
+val math: Int = -input + 10 * 2 / 5 % 3;
+val choose = if (input > 0) {
+    "positive"
+} else {
+    "other"
+};
+val matched = when (input) {
+    is Int as n -> n + 1;
+    else -> 0;
+};
+val lambda: (Int) -> Int = (x: Int) -> x + 1;
+val lambdaCall: Int = lambda(1);
+val econPlan = econ[Int] {
+    val local = input + 1;
+    local
+};
+val localBlock: Int = {
+    val one = 1;
+    var two = 2;
+    two += one;
+    two
+};
+val qualifiedLocal: Int = fixtures.semantic.accepted.hostSum;
+
+hostSum

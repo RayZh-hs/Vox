@@ -1,0 +1,3 @@
+script fixtures.semantic.fail.unknown_name;
+
+val x = missing;

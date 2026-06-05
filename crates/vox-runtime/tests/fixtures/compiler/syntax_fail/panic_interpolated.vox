@@ -1,0 +1,5 @@
+script fixtures.syntax.fail.panic_interpolated;
+
+fun bad(name: String): Unit {
+    panic "hello $name";
+}

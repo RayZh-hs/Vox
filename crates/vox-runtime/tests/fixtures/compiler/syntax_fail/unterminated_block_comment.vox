@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.comment;
+
+/* no end
+val x = 1;

@@ -1,0 +1,5 @@
+script fixtures.semantic.fail.rust_wrong_argument;
+
+import image;
+
+val bad = image.blur("not an image", 1.0);

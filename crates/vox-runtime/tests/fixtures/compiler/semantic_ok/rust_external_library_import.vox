@@ -1,0 +1,19 @@
+script fixtures.semantic.rust_import;
+
+import image;
+
+param filter: dyn image.Filter;
+
+val loaded: image.Image = image.load("input.png");
+val blurred: image.Image = image.blur(loaded, radius = 2.5);
+val methodBlur: image.Image = loaded.(image.blur)(2.0);
+val applied: image.Image = image.filter_apply(filter, blurred);
+val summary: {shadows: Int, mids: Int, highlights: Int} = image.histogram(applied);
+val shadows: Int = summary.shadows;
+val dims: (Int, Int) = image.dimensions(applied);
+val firstDim: Int = dims[0];
+val tags: List[String] = image.tags(applied);
+val maybe: image.Image? = image.optional("maybe.png");
+val final: image.Image = maybe!!;
+
+shadows
