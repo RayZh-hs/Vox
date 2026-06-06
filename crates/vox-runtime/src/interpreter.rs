@@ -141,6 +141,8 @@ struct ModuleState {
     functions: BTreeMap<String, FunctionDecl>,
     parameter_values: RefCell<BTreeMap<String, Value>>,
     script_bindings: RefCell<BTreeMap<String, Binding>>,
+    function_captures: RefCell<BTreeMap<String, BTreeMap<String, Value>>>,
+    finalized_script_bindings: RefCell<BTreeMap<String, BTreeSet<String>>>,
     cached_values: RefCell<BTreeMap<String, CachedTopLevelValue>>,
 }
 
@@ -171,6 +173,8 @@ impl ModuleState {
             functions,
             parameter_values: RefCell::new(BTreeMap::new()),
             script_bindings: RefCell::new(BTreeMap::new()),
+            function_captures: RefCell::new(BTreeMap::new()),
+            finalized_script_bindings: RefCell::new(BTreeMap::new()),
             cached_values: RefCell::new(BTreeMap::new()),
         }
     }
@@ -185,6 +189,8 @@ impl ModuleState {
 
     fn clear_script_bindings(&self) {
         self.script_bindings.borrow_mut().clear();
+        self.function_captures.borrow_mut().clear();
+        self.finalized_script_bindings.borrow_mut().clear();
     }
 
     fn parameter(&self, name: &str) -> Option<Value> {
@@ -195,10 +201,44 @@ impl ModuleState {
         self.script_bindings.borrow().get(name).cloned()
     }
 
-    fn define_script_binding(&self, name: String, value: Value, mutable: bool) {
+    fn script_bindings_snapshot(&self) -> BTreeMap<String, Binding> {
+        self.script_bindings.borrow().clone()
+    }
+
+    fn define_script_binding(
+        &self,
+        name: String,
+        value: Value,
+        mutable: bool,
+    ) -> Result<(), EvalError> {
+        if let Some(functions) = self.finalized_script_bindings.borrow().get(&name) {
+            return Err(EvalError::Message(captured_rebind_error(&name, functions)));
+        }
         self.script_bindings
             .borrow_mut()
             .insert(name, Binding { value, mutable });
+        Ok(())
+    }
+
+    fn define_function_capture(&self, name: String, captured: BTreeMap<String, Value>) {
+        self.function_captures
+            .borrow_mut()
+            .insert(name.clone(), captured.clone());
+        let mut finalized = self.finalized_script_bindings.borrow_mut();
+        for value_name in captured.keys() {
+            finalized
+                .entry(value_name.clone())
+                .or_default()
+                .insert(name.clone());
+        }
+    }
+
+    fn function_capture(&self, name: &str) -> BTreeMap<String, Value> {
+        self.function_captures
+            .borrow()
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn assign_script_binding(&self, name: &str, value: Value) -> Result<(), EvalError> {
@@ -256,7 +296,7 @@ impl ModuleState {
                         .map(|parameter| CallableParameter::from_parameter(parameter, &type_scope))
                         .collect(),
                     body: decl.body,
-                    captured: BTreeMap::new(),
+                    captured: self.function_capture(&decl.name),
                 })
             } else {
                 FunctionValue::Generic(GenericFunction {
@@ -286,6 +326,7 @@ impl ModuleState {
                         .map(|ty| runtime_type_from_syntax(ty, &type_scope)),
                     body: decl.body,
                     module: self.clone(),
+                    captured: self.function_capture(&decl.name),
                 })
             }
         })
@@ -384,14 +425,20 @@ impl<'a> EvalContext<'a> {
 
     fn eval_top_level_item(&mut self, item: &TopLevelItem) -> Result<(), EvalError> {
         match item {
-            TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Function(_) => Ok(()),
+            TopLevelItem::Import(_) | TopLevelItem::Param(_) => Ok(()),
+            TopLevelItem::Function(function) => {
+                let captured = self.capture_function_bindings(function)?;
+                self.module
+                    .define_function_capture(function.name.clone(), captured);
+                Ok(())
+            }
             TopLevelItem::Value(value) => {
                 let evaluated = self.eval_expr(&value.initializer)?;
                 self.module.define_script_binding(
                     value.name.clone(),
                     evaluated,
                     matches!(value.mutability, Mutability::Var),
-                );
+                )?;
                 Ok(())
             }
             TopLevelItem::Statement(statement) => self.eval_top_level_statement(statement),
@@ -406,7 +453,7 @@ impl<'a> EvalContext<'a> {
                     value.name.clone(),
                     evaluated,
                     matches!(value.mutability, Mutability::Var),
-                );
+                )?;
                 Ok(())
             }
             BlockItem::Assignment(assignment) => {
@@ -536,20 +583,23 @@ impl<'a> EvalContext<'a> {
             ExprKind::Range(range) => self.eval_range(range),
             ExprKind::If(expr) => self.eval_if(expr),
             ExprKind::When(expr) => self.eval_when(expr),
-            ExprKind::Lambda(lambda) => Ok(Value::Function(Rc::new(FunctionValue::User(
-                UserFunction {
-                    name: None,
-                    module: self.module.clone(),
-                    parameters: lambda
-                        .parameters
-                        .iter()
-                        .cloned()
-                        .map(CallableParameter::from_lambda_parameter)
-                        .collect(),
-                    body: (*lambda.body).clone(),
-                    captured: self.capture_visible_bindings(),
-                },
-            )))),
+            ExprKind::Lambda(lambda) => {
+                let captured = self.capture_lambda_bindings(lambda)?;
+                Ok(Value::Function(Rc::new(FunctionValue::User(
+                    UserFunction {
+                        name: None,
+                        module: self.module.clone(),
+                        parameters: lambda
+                            .parameters
+                            .iter()
+                            .cloned()
+                            .map(CallableParameter::from_lambda_parameter)
+                            .collect(),
+                        body: (*lambda.body).clone(),
+                        captured,
+                    },
+                ))))
+            }
             ExprKind::Block(block) => self.eval_block(block),
         }
     }
@@ -1290,14 +1340,371 @@ impl<'a> EvalContext<'a> {
         self.module.assign_script_binding(name, value)
     }
 
-    fn capture_visible_bindings(&self) -> BTreeMap<String, Value> {
+    fn capture_function_bindings(
+        &self,
+        function: &FunctionDecl,
+    ) -> Result<BTreeMap<String, Value>, EvalError> {
+        let parameter_names = function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut names = self.capture_names(&function.body, parameter_names.clone());
+        for parameter in &function.parameters {
+            if let Some(default) = &parameter.default {
+                names.extend(self.capture_names(default, parameter_names.clone()));
+            }
+        }
+        self.capture_script_bindings(&function.name, names)
+    }
+
+    fn capture_lambda_bindings(
+        &self,
+        lambda: &vox_compiler::front_end::ast::LambdaExpr,
+    ) -> Result<BTreeMap<String, Value>, EvalError> {
+        let parameter_names = lambda
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<BTreeSet<_>>();
+        let names = self.capture_all_visible_names(&lambda.body, parameter_names);
+        let mut captured = self.capture_scoped_bindings(&names);
+        captured.extend(self.capture_script_bindings("<lambda>", names)?);
+        Ok(captured)
+    }
+
+    fn capture_names(&self, body: &Expr, parameters: BTreeSet<String>) -> BTreeSet<String> {
+        let visible = self
+            .module
+            .script_bindings_snapshot()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        CaptureNameCollector::new(self.module.name.as_str(), visible, parameters).collect(body)
+    }
+
+    fn capture_all_visible_names(
+        &self,
+        body: &Expr,
+        parameters: BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut visible = self
+            .module
+            .script_bindings_snapshot()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for scope in &self.scopes {
+            for name in scope.bindings.keys() {
+                visible.insert(name.clone());
+            }
+        }
+        CaptureNameCollector::new(self.module.name.as_str(), visible, parameters).collect(body)
+    }
+
+    fn capture_scoped_bindings(&self, names: &BTreeSet<String>) -> BTreeMap<String, Value> {
         let mut captured = BTreeMap::new();
         for scope in &self.scopes {
-            for (name, binding) in &scope.bindings {
-                captured.insert(name.clone(), binding.value.clone());
+            for name in names {
+                if let Some(binding) = scope.bindings.get(name) {
+                    captured.insert(name.clone(), binding.value.clone());
+                }
             }
         }
         captured
+    }
+
+    fn capture_script_bindings(
+        &self,
+        function_name: &str,
+        names: BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Value>, EvalError> {
+        let bindings = self.module.script_bindings_snapshot();
+        let mut captured = BTreeMap::new();
+        for name in names {
+            let Some(binding) = bindings.get(&name) else {
+                continue;
+            };
+            if binding.mutable {
+                return Err(EvalError::Message(format!(
+                    "function `{function_name}` cannot capture mutable binding `{name}`; bind it to a `val` first"
+                )));
+            }
+            captured.insert(name, binding.value.clone());
+        }
+        Ok(captured)
+    }
+}
+
+struct CaptureNameCollector {
+    module_segments: Vec<String>,
+    visible: BTreeSet<String>,
+    scopes: Vec<BTreeSet<String>>,
+    captures: BTreeSet<String>,
+}
+
+impl CaptureNameCollector {
+    fn new(module: &str, visible: BTreeSet<String>, parameters: BTreeSet<String>) -> Self {
+        Self {
+            module_segments: module.split('.').map(str::to_owned).collect(),
+            visible,
+            scopes: vec![parameters],
+            captures: BTreeSet::new(),
+        }
+    }
+
+    fn collect(mut self, expr: &Expr) -> BTreeSet<String> {
+        self.visit_expr(expr);
+        self.captures
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(BTreeSet::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind_name(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_owned());
+        }
+    }
+
+    fn is_shadowed(&self, name: &str) -> bool {
+        self.scopes.iter().rev().any(|scope| scope.contains(name))
+    }
+
+    fn capture_name(&mut self, name: &QualifiedName) {
+        let local = match name.segments.as_slice() {
+            [local] => local,
+            segments
+                if segments.len() == self.module_segments.len() + 1
+                    && segments[..self.module_segments.len()]
+                        .iter()
+                        .zip(self.module_segments.iter())
+                        .all(|(left, right)| left == right) =>
+            {
+                segments.last().expect("qualified name has a local segment")
+            }
+            _ => return,
+        };
+
+        if !self.is_shadowed(local) && self.visible.contains(local) {
+            self.captures.insert(local.clone());
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Integer(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Null => {}
+            ExprKind::Name(name) => self.capture_name(name),
+            ExprKind::String(literal) => {
+                for part in &literal.parts {
+                    if let StringPart::Interpolation(expr) = part {
+                        self.visit_expr(expr);
+                    }
+                }
+            }
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                for item in items {
+                    self.visit_expr(item);
+                }
+            }
+            ExprKind::Record(fields) => {
+                for field in fields {
+                    self.visit_expr(&field.value);
+                }
+            }
+            ExprKind::Call { callee, arguments } => {
+                self.visit_expr(callee);
+                for argument in arguments {
+                    self.visit_argument(argument);
+                }
+            }
+            ExprKind::Intrinsic(intrinsic) => self.visit_intrinsic(intrinsic),
+            ExprKind::Index { target, index } => {
+                self.visit_expr(target);
+                self.visit_expr(index);
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::NonNull { target } => self.visit_expr(target),
+            ExprKind::ReceiverCall {
+                receiver,
+                callee,
+                arguments,
+            } => {
+                self.visit_expr(receiver);
+                self.capture_name(callee);
+                for argument in arguments {
+                    self.visit_argument(argument);
+                }
+            }
+            ExprKind::Unary { expr, .. } => self.visit_expr(expr),
+            ExprKind::Binary { left, right, .. } => {
+                self.visit_expr(left);
+                self.visit_expr(right);
+            }
+            ExprKind::Range(range) => {
+                if let Some(start) = &range.start {
+                    self.visit_expr(start);
+                }
+                if let Some(end) = &range.end {
+                    self.visit_expr(end);
+                }
+            }
+            ExprKind::If(expr) => {
+                for branch in &expr.branches {
+                    self.visit_expr(&branch.condition);
+                    self.visit_block(&branch.body);
+                }
+                if let Some(else_branch) = &expr.else_branch {
+                    self.visit_block(else_branch);
+                }
+            }
+            ExprKind::When(expr) => {
+                self.visit_expr(&expr.subject);
+                for arm in &expr.arms {
+                    self.push_scope();
+                    if let Some(binding) = &arm.binding {
+                        self.bind_name(binding);
+                    }
+                    self.visit_expr(&arm.body);
+                    self.pop_scope();
+                }
+                if let Some(else_arm) = &expr.else_arm {
+                    self.visit_expr(else_arm);
+                }
+            }
+            ExprKind::Lambda(lambda) => {
+                self.push_scope();
+                for parameter in &lambda.parameters {
+                    self.bind_name(&parameter.name);
+                }
+                self.visit_expr(&lambda.body);
+                self.pop_scope();
+            }
+            ExprKind::Block(block) => self.visit_block(block),
+        }
+    }
+
+    fn visit_argument(&mut self, argument: &Argument) {
+        match argument {
+            Argument::Positional(expr) => self.visit_expr(expr),
+            Argument::Named { value, .. } => self.visit_expr(value),
+        }
+    }
+
+    fn visit_intrinsic(&mut self, intrinsic: &IntrinsicExpr) {
+        match intrinsic {
+            IntrinsicExpr::Updated(updated) => {
+                self.visit_expr(&updated.target);
+                for update in &updated.updates {
+                    self.visit_expr(&update.value);
+                }
+            }
+            IntrinsicExpr::Econ(econ) => self.visit_block(&econ.body),
+        }
+    }
+
+    fn visit_block(&mut self, block: &BlockExpr) {
+        self.push_scope();
+        for item in &block.items {
+            match item {
+                BlockItem::LocalValue(value) => {
+                    self.visit_expr(&value.initializer);
+                    self.bind_name(&value.name);
+                }
+                BlockItem::Assignment(assignment) => {
+                    self.capture_name(&QualifiedName {
+                        segments: vec![assignment.name.clone()],
+                        span: assignment.span.clone(),
+                    });
+                    self.visit_expr(&assignment.value);
+                }
+                BlockItem::CompoundAssignment(assignment) => {
+                    self.capture_name(&QualifiedName {
+                        segments: vec![assignment.name.clone()],
+                        span: assignment.span.clone(),
+                    });
+                    self.visit_expr(&assignment.value);
+                }
+                BlockItem::For(statement) => {
+                    self.visit_expr(&statement.iterable);
+                    self.push_scope();
+                    self.bind_name(&statement.pattern);
+                    self.visit_block_contents(&statement.body);
+                    self.pop_scope();
+                }
+                BlockItem::Return(statement) => {
+                    if let Some(value) = &statement.value {
+                        self.visit_expr(value);
+                    }
+                }
+                BlockItem::Panic(statement) => {
+                    for part in &statement.message.parts {
+                        if let StringPart::Interpolation(expr) = part {
+                            self.visit_expr(expr);
+                        }
+                    }
+                }
+                BlockItem::Expr(expr) => self.visit_expr(expr),
+            }
+        }
+        if let Some(trailing) = &block.trailing {
+            self.visit_expr(trailing);
+        }
+        self.pop_scope();
+    }
+
+    fn visit_block_contents(&mut self, block: &BlockExpr) {
+        for item in &block.items {
+            match item {
+                BlockItem::LocalValue(value) => {
+                    self.visit_expr(&value.initializer);
+                    self.bind_name(&value.name);
+                }
+                BlockItem::Assignment(assignment) => {
+                    self.capture_name(&QualifiedName {
+                        segments: vec![assignment.name.clone()],
+                        span: assignment.span.clone(),
+                    });
+                    self.visit_expr(&assignment.value);
+                }
+                BlockItem::CompoundAssignment(assignment) => {
+                    self.capture_name(&QualifiedName {
+                        segments: vec![assignment.name.clone()],
+                        span: assignment.span.clone(),
+                    });
+                    self.visit_expr(&assignment.value);
+                }
+                BlockItem::For(statement) => {
+                    self.visit_expr(&statement.iterable);
+                    self.push_scope();
+                    self.bind_name(&statement.pattern);
+                    self.visit_block_contents(&statement.body);
+                    self.pop_scope();
+                }
+                BlockItem::Return(statement) => {
+                    if let Some(value) = &statement.value {
+                        self.visit_expr(value);
+                    }
+                }
+                BlockItem::Panic(statement) => {
+                    for part in &statement.message.parts {
+                        if let StringPart::Interpolation(expr) = part {
+                            self.visit_expr(expr);
+                        }
+                    }
+                }
+                BlockItem::Expr(expr) => self.visit_expr(expr),
+            }
+        }
+        if let Some(trailing) = &block.trailing {
+            self.visit_expr(trailing);
+        }
     }
 }
 
@@ -1328,6 +1735,22 @@ impl Scope {
 struct Binding {
     value: Value,
     mutable: bool,
+}
+
+fn captured_rebind_error(name: &str, functions: &BTreeSet<String>) -> String {
+    let functions = render_function_set(functions);
+    format!("cannot rebind `{name}` because it is captured by {functions} in this scope")
+}
+
+fn render_function_set(functions: &BTreeSet<String>) -> String {
+    let names = functions
+        .iter()
+        .map(|function| format!("`{function}`"))
+        .collect::<Vec<_>>();
+    match names.as_slice() {
+        [single] => format!("function {single}"),
+        _ => format!("functions {}", names.join(", ")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1462,6 +1885,7 @@ struct GenericFunction {
     return_type: Option<ReplType>,
     body: Expr,
     module: Rc<ModuleState>,
+    captured: BTreeMap<String, Value>,
 }
 
 impl GenericFunction {
@@ -1473,6 +1897,9 @@ impl GenericFunction {
         let mut assigned = assign_arguments(&self.name, &self.parameters, arguments)?;
         let mut substitutions = BTreeMap::new();
         let mut context = EvalContext::new(runtime, self.module.clone());
+        if !self.captured.is_empty() {
+            context.push_scope(Scope::from_values(self.captured.clone()));
+        }
         context.push_scope(Scope::default());
         for parameter in &self.parameters {
             if !assigned.contains_key(&parameter.name) {
