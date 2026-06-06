@@ -1,6 +1,9 @@
 # Statements and Control Flow
 
 This chapter defines statement forms that may appear inside block expressions.
+Script files may also use assignment, compound assignment, `for`, `panic`, and
+expression statements at top level. Package files may not use statements at top
+level.
 
 ## 1. Block Items
 
@@ -44,7 +47,9 @@ Rules:
 
 - assignment is valid only for a previously declared `var`;
 - assignment targets are identifiers only;
-- field assignment and indexed assignment are not part of Vox.
+- field assignment and indexed assignment are not part of Vox;
+- in scripts, top-level assignment may target a previously declared script
+  top-level `var`.
 
 ## 4. Compound Assignments
 

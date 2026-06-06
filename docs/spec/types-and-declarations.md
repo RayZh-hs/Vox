@@ -168,7 +168,9 @@ Rules:
 
 - `val` declares an immutable binding;
 - `var` declares a reassignable binding;
-- an omitted type annotation is inferred from the initializer.
+- an omitted type annotation is inferred from the initializer;
+- package top-level value declarations must use `val`;
+- script top-level and local value declarations may use either `val` or `var`.
 
 ## 7. Function Declarations
 
@@ -199,7 +201,11 @@ Rules:
 - a function is pure unless it is marked `evil`;
 - parameters are ordered from left to right;
 - default parameter values are part of the function signature;
-- an expression body and a block body are semantically equivalent.
+- an expression body and a block body are semantically equivalent;
+- package functions are order-independent and may not collide with another
+  package function whose callable signature can match the same call;
+- script function headers are visible throughout the whole script, including
+  before the function body appears in source order.
 
 ## 8. Visibility Modifiers
 

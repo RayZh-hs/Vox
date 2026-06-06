@@ -10,8 +10,8 @@ use vox_compiler::{
     front_end::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability, ParamDecl, Parameter,
-        QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart, TypeKind, TypeSyntax,
-        UnaryOp, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
+        QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart, TopLevelItem,
+        TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
     },
 };
 use vox_core::{
@@ -51,8 +51,18 @@ impl<'a> Interpreter<'a> {
         let parameter_values = self.bind_script_parameters(module.clone(), arguments)?;
         module.initialize_parameters(parameter_values);
         module.reset_cached_values();
+        module.clear_script_bindings();
 
         let mut context = EvalContext::new(self.runtime, module.clone());
+        for item in &script.syntax.items {
+            match context.eval_top_level_item(item) {
+                Ok(()) => {}
+                Err(EvalError::Return(_)) => {
+                    return Err("`return` may only be used inside a function body".to_owned());
+                }
+                Err(EvalError::Message(message)) => return Err(message),
+            }
+        }
         let value = match context.eval_script_result()? {
             Ok(value) => value,
             Err(EvalError::Return(_)) => {
@@ -130,17 +140,12 @@ struct ModuleState {
     values: BTreeMap<String, ValueDecl>,
     functions: BTreeMap<String, FunctionDecl>,
     parameter_values: RefCell<BTreeMap<String, Value>>,
+    script_bindings: RefCell<BTreeMap<String, Binding>>,
     cached_values: RefCell<BTreeMap<String, CachedTopLevelValue>>,
 }
 
 impl ModuleState {
     fn new(script: &TreewalkScript, artifact: &CompiledArtifact, artifact_id: ArtifactId) -> Self {
-        let values = script
-            .values
-            .iter()
-            .cloned()
-            .map(|value| (value.name.clone(), value))
-            .collect::<BTreeMap<_, _>>();
         let functions = script
             .functions
             .iter()
@@ -162,9 +167,10 @@ impl ModuleState {
                 .collect(),
             parameters: script.parameters.clone(),
             result: script.syntax.result.clone(),
-            values,
+            values: BTreeMap::new(),
             functions,
             parameter_values: RefCell::new(BTreeMap::new()),
+            script_bindings: RefCell::new(BTreeMap::new()),
             cached_values: RefCell::new(BTreeMap::new()),
         }
     }
@@ -177,8 +183,44 @@ impl ModuleState {
         self.cached_values.borrow_mut().clear();
     }
 
+    fn clear_script_bindings(&self) {
+        self.script_bindings.borrow_mut().clear();
+    }
+
     fn parameter(&self, name: &str) -> Option<Value> {
         self.parameter_values.borrow().get(name).cloned()
+    }
+
+    fn script_binding(&self, name: &str) -> Option<Binding> {
+        self.script_bindings.borrow().get(name).cloned()
+    }
+
+    fn define_script_binding(&self, name: String, value: Value, mutable: bool) {
+        self.script_bindings
+            .borrow_mut()
+            .insert(name, Binding { value, mutable });
+    }
+
+    fn assign_script_binding(&self, name: &str, value: Value) -> Result<(), EvalError> {
+        if let Some(binding) = self.script_bindings.borrow_mut().get_mut(name) {
+            if !binding.mutable {
+                return Err(EvalError::Message(format!(
+                    "cannot assign to immutable binding `{name}`"
+                )));
+            }
+            binding.value = value;
+            return Ok(());
+        }
+
+        if self.parameter_values.borrow().contains_key(name) {
+            return Err(EvalError::Message(format!(
+                "cannot assign to immutable binding `{name}`"
+            )));
+        }
+
+        Err(EvalError::Message(format!(
+            "assignment requires a previously declared `var`, but `{name}` was not found"
+        )))
     }
 
     fn resolve_qualified_local_name(&self, name: &QualifiedName) -> Option<String> {
@@ -340,6 +382,77 @@ impl<'a> EvalContext<'a> {
         }
     }
 
+    fn eval_top_level_item(&mut self, item: &TopLevelItem) -> Result<(), EvalError> {
+        match item {
+            TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Function(_) => Ok(()),
+            TopLevelItem::Value(value) => {
+                let evaluated = self.eval_expr(&value.initializer)?;
+                self.module.define_script_binding(
+                    value.name.clone(),
+                    evaluated,
+                    matches!(value.mutability, Mutability::Var),
+                );
+                Ok(())
+            }
+            TopLevelItem::Statement(statement) => self.eval_top_level_statement(statement),
+        }
+    }
+
+    fn eval_top_level_statement(&mut self, statement: &BlockItem) -> Result<(), EvalError> {
+        match statement {
+            BlockItem::LocalValue(value) => {
+                let evaluated = self.eval_expr(&value.initializer)?;
+                self.module.define_script_binding(
+                    value.name.clone(),
+                    evaluated,
+                    matches!(value.mutability, Mutability::Var),
+                );
+                Ok(())
+            }
+            BlockItem::Assignment(assignment) => {
+                let value = self.eval_expr(&assignment.value)?;
+                self.module.assign_script_binding(&assignment.name, value)
+            }
+            BlockItem::CompoundAssignment(assignment) => {
+                let current = self
+                    .module
+                    .script_binding(&assignment.name)
+                    .ok_or_else(|| {
+                        EvalError::Message(format!(
+                            "assignment requires a previously declared `var`, but `{}` was not found",
+                            assignment.name
+                        ))
+                    })?;
+                if !current.mutable {
+                    return Err(EvalError::Message(format!(
+                        "cannot assign to immutable binding `{}`",
+                        assignment.name
+                    )));
+                }
+                let rhs = self.eval_expr(&assignment.value)?;
+                let next = self.eval_compound_assignment(current.value, rhs, assignment.op)?;
+                self.module.assign_script_binding(&assignment.name, next)
+            }
+            BlockItem::For(statement) => self.eval_for(statement),
+            BlockItem::Return(statement) => Err(EvalError::Return(
+                statement
+                    .value
+                    .as_ref()
+                    .map(|value| self.eval_expr(value))
+                    .transpose()?
+                    .unwrap_or_else(Value::unit),
+            )),
+            BlockItem::Panic(statement) => Err(EvalError::Message(format!(
+                "panic: {}",
+                self.eval_string_literal(&statement.message)?
+            ))),
+            BlockItem::Expr(expr) => {
+                self.eval_expr(expr)?;
+                Ok(())
+            }
+        }
+    }
+
     fn eval_script_result(&mut self) -> Result<Result<Value, EvalError>, String> {
         let Some(result) = self.module.result.clone() else {
             return Ok(Ok(Value::unit()));
@@ -480,6 +593,10 @@ impl<'a> EvalContext<'a> {
         if let Some(local_name) = self.module.resolve_qualified_local_name(name) {
             if let Some(value) = self.lookup_local(&local_name) {
                 return Ok(value);
+            }
+
+            if let Some(binding) = self.module.script_binding(&local_name) {
+                return Ok(binding.value);
             }
 
             if let Some(value) = self.module.parameter(&local_name) {
@@ -1142,11 +1259,18 @@ impl<'a> EvalContext<'a> {
     }
 
     fn lookup_local_binding(&self, name: &str) -> Result<Binding, EvalError> {
-        self.scopes
+        if let Some(binding) = self
+            .scopes
             .iter()
             .rev()
             .find_map(|scope| scope.bindings.get(name))
             .cloned()
+        {
+            return Ok(binding);
+        }
+
+        self.module
+            .script_binding(name)
             .ok_or_else(|| EvalError::Message(format!("unknown local binding `{name}`")))
     }
 
@@ -1163,9 +1287,7 @@ impl<'a> EvalContext<'a> {
             }
         }
 
-        Err(EvalError::Message(format!(
-            "assignment requires a previously declared local `var`, but `{name}` was not found"
-        )))
+        self.module.assign_script_binding(name, value)
     }
 
     fn capture_visible_bindings(&self) -> BTreeMap<String, Value> {

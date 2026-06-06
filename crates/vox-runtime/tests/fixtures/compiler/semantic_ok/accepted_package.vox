@@ -3,7 +3,7 @@ package fixtures.semantic.pkg;
 public import fixtures.host;
 
 public val exported: Int = fixtures.host.add(1, 2);
-private var mutableName: String = "v";
+private val internalName: String = "v";
 
 public fun makePair[A: Any, B: Any](a: A, b: B): (A, B) = (a, b);
 

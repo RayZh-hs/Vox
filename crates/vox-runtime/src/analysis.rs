@@ -2,10 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vox_compiler::front_end::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
-    Expr, ExprKind, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName, TopLevelItem,
-    TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
+    Expr, ExprKind, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
+    TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
 };
-use vox_core::{host::PackageManifest, source::ModulePath};
+use vox_core::{
+    host::PackageManifest,
+    source::{ModuleKind, ModulePath},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplType {
@@ -365,10 +368,18 @@ impl<'a> TypeEngine<'a> {
     fn prime(&mut self) -> Result<(), String> {
         self.collect_imports()?;
         self.collect_function_headers();
-        self.collect_value_placeholders();
-        self.infer_parameter_defaults()?;
-        self.infer_function_bodies()?;
-        self.infer_value_initializers()?;
+        match self.unit.header.kind {
+            ModuleKind::Package => {
+                self.collect_value_placeholders();
+                self.infer_function_bodies()?;
+                self.infer_value_initializers()?;
+            }
+            ModuleKind::Script { .. } => {
+                self.collect_parameter_bindings();
+                self.infer_parameter_defaults()?;
+                self.infer_script_items()?;
+            }
+        }
         Ok(())
     }
 
@@ -470,7 +481,24 @@ impl<'a> TypeEngine<'a> {
                     );
                 }
                 TopLevelItem::Import(_) | TopLevelItem::Function(_) => {}
+                TopLevelItem::Statement(_) => {}
             }
+        }
+    }
+
+    fn collect_parameter_bindings(&mut self) {
+        for item in &self.unit.items {
+            let TopLevelItem::Param(parameter) = item else {
+                continue;
+            };
+            self.values.insert(
+                parameter.name.clone(),
+                ValueInfo {
+                    name: parameter.name.clone(),
+                    ty: from_type_syntax(&parameter.ty, &BTreeMap::new()),
+                    mutable: false,
+                },
+            );
         }
     }
 
@@ -506,36 +534,7 @@ impl<'a> TypeEngine<'a> {
             };
 
             let mut scope = self.top_level_scope();
-            scope.generic_parameters = generic_parameter_scope(&function.generic_parameters);
-            for parameter in &function.parameters {
-                scope.values.insert(
-                    parameter.name.clone(),
-                    LocalBinding {
-                        ty: from_type_syntax(&parameter.ty, &scope.generic_parameters),
-                        mutable: false,
-                    },
-                );
-            }
-
-            let inferred = self.infer_expr(&function.body, &mut scope)?;
-            let return_type = if let Some(explicit) = &function.return_type {
-                let explicit = from_type_syntax(explicit, &scope.generic_parameters);
-                if !inferred.is_assignable_to(&explicit) {
-                    return Err(format!(
-                        "function `{}` returns `{}`, which is not assignable to `{}`",
-                        function.name,
-                        inferred.render(),
-                        explicit.render()
-                    ));
-                }
-                explicit
-            } else {
-                inferred
-            };
-
-            if let Some(existing) = self.functions.get_mut(&function.name) {
-                existing.summary.return_type = return_type;
-            }
+            self.infer_function_body(function, &mut scope)?;
         }
 
         Ok(())
@@ -548,21 +547,7 @@ impl<'a> TypeEngine<'a> {
             };
 
             let mut scope = self.top_level_scope();
-            let inferred = self.infer_expr(&value.initializer, &mut scope)?;
-            let ty = if let Some(explicit) = &value.ty {
-                let explicit = from_type_syntax(explicit, &scope.generic_parameters);
-                if !inferred.is_assignable_to(&explicit) {
-                    return Err(format!(
-                        "value `{}` has initializer type `{}`, which is not assignable to `{}`",
-                        value.name,
-                        inferred.render(),
-                        explicit.render()
-                    ));
-                }
-                explicit
-            } else {
-                inferred
-            };
+            let ty = self.infer_value_initializer(value, &mut scope)?;
 
             if let Some(binding) = self.values.get_mut(&value.name) {
                 binding.ty = ty;
@@ -570,6 +555,98 @@ impl<'a> TypeEngine<'a> {
         }
 
         Ok(())
+    }
+
+    fn infer_script_items(&mut self) -> Result<(), String> {
+        let mut scope = self.top_level_scope();
+        for item in &self.unit.items {
+            match item {
+                TopLevelItem::Import(_) | TopLevelItem::Param(_) => {}
+                TopLevelItem::Function(function) => {
+                    self.infer_function_body(function, &mut scope.clone())?;
+                }
+                TopLevelItem::Value(value) => {
+                    let ty = self.infer_value_initializer(value, &mut scope)?;
+                    let binding = LocalBinding {
+                        ty: ty.clone(),
+                        mutable: matches!(value.mutability, Mutability::Var),
+                    };
+                    scope.values.insert(value.name.clone(), binding);
+                    self.values.insert(
+                        value.name.clone(),
+                        ValueInfo {
+                            name: value.name.clone(),
+                            ty,
+                            mutable: matches!(value.mutability, Mutability::Var),
+                        },
+                    );
+                }
+                TopLevelItem::Statement(statement) => {
+                    self.infer_script_statement(statement, &mut scope)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn infer_function_body(
+        &mut self,
+        function: &FunctionDecl,
+        scope: &mut TypeScope,
+    ) -> Result<(), String> {
+        scope.generic_parameters = generic_parameter_scope(&function.generic_parameters);
+        for parameter in &function.parameters {
+            scope.values.insert(
+                parameter.name.clone(),
+                LocalBinding {
+                    ty: from_type_syntax(&parameter.ty, &scope.generic_parameters),
+                    mutable: false,
+                },
+            );
+        }
+
+        let inferred = self.infer_expr(&function.body, scope)?;
+        let return_type = if let Some(explicit) = &function.return_type {
+            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
+            if !inferred.is_assignable_to(&explicit) {
+                return Err(format!(
+                    "function `{}` returns `{}`, which is not assignable to `{}`",
+                    function.name,
+                    inferred.render(),
+                    explicit.render()
+                ));
+            }
+            explicit
+        } else {
+            inferred
+        };
+
+        if let Some(existing) = self.functions.get_mut(&function.name) {
+            existing.summary.return_type = return_type;
+        }
+        Ok(())
+    }
+
+    fn infer_value_initializer(
+        &self,
+        value: &ValueDecl,
+        scope: &mut TypeScope,
+    ) -> Result<ReplType, String> {
+        let inferred = self.infer_expr(&value.initializer, scope)?;
+        if let Some(explicit) = &value.ty {
+            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
+            if !inferred.is_assignable_to(&explicit) {
+                return Err(format!(
+                    "value `{}` has initializer type `{}`, which is not assignable to `{}`",
+                    value.name,
+                    inferred.render(),
+                    explicit.render()
+                ));
+            }
+            Ok(explicit)
+        } else {
+            Ok(inferred)
+        }
     }
 
     fn top_level_scope(&self) -> TypeScope {
@@ -857,6 +934,83 @@ impl<'a> TypeEngine<'a> {
             .map(|expr| self.infer_expr(expr, &mut nested))
             .transpose()
             .map(|value| value.unwrap_or(ReplType::Unit))
+    }
+
+    fn infer_script_statement(
+        &self,
+        statement: &BlockItem,
+        scope: &mut TypeScope,
+    ) -> Result<(), String> {
+        match statement {
+            BlockItem::LocalValue(value) => self.infer_local_value(value, scope),
+            BlockItem::Assignment(assignment) => {
+                let current = scope
+                    .values
+                    .get(&assignment.name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown local `{}`", assignment.name))?;
+                if !current.mutable {
+                    return Err(format!(
+                        "cannot assign to immutable local `{}`",
+                        assignment.name
+                    ));
+                }
+                let next = self.infer_expr(&assignment.value, scope)?;
+                if !next.is_assignable_to(&current.ty) {
+                    return Err(format!(
+                        "cannot assign `{}` to `{}`",
+                        next.render(),
+                        current.ty.render()
+                    ));
+                }
+                Ok(())
+            }
+            BlockItem::CompoundAssignment(assignment) => {
+                let current = scope
+                    .values
+                    .get(&assignment.name)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown local `{}`", assignment.name))?;
+                if !current.mutable {
+                    return Err(format!(
+                        "cannot assign to immutable local `{}`",
+                        assignment.name
+                    ));
+                }
+                let rhs = self.infer_expr(&assignment.value, scope)?;
+                self.infer_compound_assignment(&current.ty, &rhs, assignment.op)
+            }
+            BlockItem::For(statement) => {
+                let iterable = self.infer_expr(&statement.iterable, scope)?;
+                let element = match iterable {
+                    ReplType::List(item) | ReplType::Range(item) => *item,
+                    other => {
+                        return Err(format!(
+                            "for-loop requires an iterable list or range, found `{}`",
+                            other.render()
+                        ));
+                    }
+                };
+                let mut loop_scope = scope.clone();
+                loop_scope.values.insert(
+                    statement.pattern.clone(),
+                    LocalBinding {
+                        ty: element,
+                        mutable: false,
+                    },
+                );
+                self.infer_block(&statement.body, &mut loop_scope)?;
+                Ok(())
+            }
+            BlockItem::Return(_) => {
+                Err("`return` may only be used inside a function body".to_owned())
+            }
+            BlockItem::Panic(_) => Ok(()),
+            BlockItem::Expr(expr) => {
+                self.infer_expr(expr, scope)?;
+                Ok(())
+            }
+        }
     }
 
     fn infer_local_value(

@@ -77,11 +77,19 @@ surface syntax already exists.
 
 ## 5. Evaluation Model
 
-Top-level values, function bodies, and scripts are evaluated on demand.
+Package top-level values and function bodies are evaluated on demand.
+
+Scripts are evaluated in source order. A script top-level `val` binds the value
+produced at that point in execution. It does not create a live alias to another
+binding.
 
 Pure results may be cached.
 
 Effectful computations are never treated as pure cached results.
+
+When a package artifact changes, cached package values from the previous
+artifact may be discarded. Precise dependency invalidation is an implementation
+optimization, not a user-visible semantic rule.
 
 ## 6. Value Semantics
 
@@ -95,6 +103,9 @@ Consequences:
 
 ## 7. Local Mutation
 
-`var` and loop reassignment are local conveniences only.
+`var` and loop reassignment are local execution conveniences only.
 
 They do not create mutable shared objects or mutable references.
+
+Top-level `var` is valid in scripts because the script top level is an
+execution-local scope. Top-level `var` is not valid in packages.

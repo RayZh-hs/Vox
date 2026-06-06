@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use vox_core::{
     diagnostics::{Diagnostic, DiagnosticBag, TextSpan},
     source::{ModuleKind, ModulePath, SurfaceHeader},
@@ -52,6 +54,11 @@ impl Parser {
                 return self.error_here("package files may contain only top-level declarations");
             }
 
+            if let Some(statement) = self.parse_script_statement()? {
+                items.push(TopLevelItem::Statement(statement));
+                continue;
+            }
+
             let result = self.parse_expr()?;
             self.expect_simple(
                 TokenKind::Eof,
@@ -65,6 +72,9 @@ impl Parser {
                 result: Some(result),
                 span,
             };
+            if matches!(header.kind, ModuleKind::Package) {
+                self.validate_package_items(&syntax)?;
+            }
             return Ok(FrontEndUnit::from_syntax(syntax));
         }
 
@@ -75,6 +85,9 @@ impl Parser {
             result: None,
             span: TextSpan::new(header.span.start, end),
         };
+        if matches!(header.kind, ModuleKind::Package) {
+            self.validate_package_items(&syntax)?;
+        }
         Ok(FrontEndUnit::from_syntax(syntax))
     }
 
@@ -128,6 +141,9 @@ impl Parser {
         }
 
         if self.at(TokenKind::Val) || self.at(TokenKind::Var) {
+            if matches!(module_kind, ModuleKind::Package) && self.at(TokenKind::Var) {
+                return self.error_here("package top-level values must use `val`");
+            }
             let value = self.parse_value_decl(docs, visibility)?;
             return Ok(Some(TopLevelItem::Value(value)));
         }
@@ -149,6 +165,97 @@ impl Parser {
         }
 
         Ok(None)
+    }
+
+    fn parse_script_statement(&mut self) -> Result<Option<BlockItem>, DiagnosticBag> {
+        if let Some(statement) = self.try_parse_assignment_statement()? {
+            return Ok(Some(statement));
+        }
+
+        if self.at(TokenKind::For) {
+            return Ok(Some(BlockItem::For(self.parse_for_statement()?)));
+        }
+
+        if self.at(TokenKind::Panic) {
+            return Ok(Some(BlockItem::Panic(self.parse_panic_statement()?)));
+        }
+
+        if self.at(TokenKind::Return) {
+            return self.error_here("`return` may only be used inside a function body");
+        }
+
+        let checkpoint = self.index;
+        let expr = self.parse_expr()?;
+        if self.consume(TokenKind::Semicolon) {
+            return Ok(Some(BlockItem::Expr(expr)));
+        }
+        self.index = checkpoint;
+        Ok(None)
+    }
+
+    fn validate_package_items(&self, unit: &CompilationUnit) -> Result<(), DiagnosticBag> {
+        let mut values = BTreeSet::new();
+        let mut functions = BTreeSet::new();
+        for item in &unit.items {
+            match item {
+                TopLevelItem::Value(value) => {
+                    if matches!(value.mutability, Mutability::Var) {
+                        return Err(DiagnosticBag::from(vec![
+                            Diagnostic::error("package top-level values must use `val`")
+                                .with_span(value.span.clone()),
+                        ]));
+                    }
+                    if !values.insert(value.name.clone()) {
+                        return Err(DiagnosticBag::from(vec![
+                            Diagnostic::error(format!(
+                                "package value `{}` is already declared",
+                                value.name
+                            ))
+                            .with_span(value.span.clone()),
+                        ]));
+                    }
+                    if functions.contains(&value.name) {
+                        return Err(DiagnosticBag::from(vec![
+                            Diagnostic::error(format!(
+                                "package value `{}` conflicts with a function of the same name",
+                                value.name
+                            ))
+                            .with_span(value.span.clone()),
+                        ]));
+                    }
+                }
+                TopLevelItem::Function(function) => {
+                    if !functions.insert(function.name.clone()) {
+                        return Err(DiagnosticBag::from(vec![
+                            Diagnostic::error(format!(
+                                "package function `{}` has a colliding declaration",
+                                function.name
+                            ))
+                            .with_span(function.span.clone()),
+                        ]));
+                    }
+                    if values.contains(&function.name) {
+                        return Err(DiagnosticBag::from(vec![
+                            Diagnostic::error(format!(
+                                "package function `{}` conflicts with a value of the same name",
+                                function.name
+                            ))
+                            .with_span(function.span.clone()),
+                        ]));
+                    }
+                }
+                TopLevelItem::Import(_) => {}
+                TopLevelItem::Param(_) | TopLevelItem::Statement(_) => {
+                    return Err(DiagnosticBag::from(vec![
+                        Diagnostic::error(
+                            "package files may contain only imports, values, and functions",
+                        )
+                        .with_span(unit.span.clone()),
+                    ]));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_import_decl(

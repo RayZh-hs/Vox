@@ -86,16 +86,32 @@ Int
 
 The REPL preserves prior successful state when a later submission fails.
 
-Interactive submissions are closed over the current session state. A committed
-submission must not leave behind dangling references to future definitions.
+Interactive submissions follow script top-level rules. Values and statements
+are processed in submission order. Function headers from the current submission
+are visible throughout that submission, and function headers from earlier
+successful submissions remain visible in later submissions. When a later
+submission redefines a function, that function becomes the active visible
+definition for the session.
 
 In practice this means:
 
-- `val` references must already resolve inside the current session or inside the
-  same submitted chunk;
-- functions that call each other should be entered together in one chunk;
-- if a function signature changes, direct callers must be resubmitted in the
-  same chunk.
+- value references must already resolve inside the current session or earlier in
+  the same submitted chunk;
+- functions may call each other when they are entered in the same compilation
+  chunk;
+- a value initializer such as `val x = foo() + bar();` may use functions from
+  earlier chunks or functions declared in the current chunk;
+- if a function signature changes, direct function callers must be resubmitted
+  in the same chunk.
+
+Assignments entered at the prompt are statements:
+
+```text
+>>> var a = 1;
+>>> a = 2;
+>>> a
+2
+```
 
 For coupled changes, prefer `:chunk`, `:edit`, `:run`, or an external file.
 

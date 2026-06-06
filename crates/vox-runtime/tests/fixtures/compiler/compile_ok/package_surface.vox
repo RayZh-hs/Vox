@@ -6,7 +6,7 @@ private import fixtures.tools;
 
 /// Exported immutable value.
 public val exported: Int = 1;
-private var internal: String = "internal";
+private val internal: String = "internal";
 
 fun defaulted(x: Int = 1, y: String = "a",): String = y;
 

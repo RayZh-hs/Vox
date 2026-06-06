@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use vox_compiler::front_end::{
     analyze_source,
-    ast::{CompilationUnit, TopLevelItem},
+    ast::{BlockItem, CompilationUnit, TopLevelItem},
 };
 use vox_core::source::SourceText;
 
@@ -12,6 +12,7 @@ const HIDDEN_LAST_NAME: &str = "__repl_last";
 pub enum EditableKey {
     Import(String),
     Symbol(String),
+    Statement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub fn build_edit_buffer(snapshot: &str, symbols: &[String]) -> Result<String, S
         let matches = match &item.key {
             EditableKey::Import(module) => unique.contains(module.as_str()),
             EditableKey::Symbol(name) => unique.contains(name.as_str()),
+            EditableKey::Statement => false,
         };
         if matches {
             match &item.key {
@@ -48,6 +50,7 @@ pub fn build_edit_buffer(snapshot: &str, symbols: &[String]) -> Result<String, S
                 EditableKey::Symbol(name) => {
                     found.insert(name.clone());
                 }
+                EditableKey::Statement => {}
             }
             chunks.push(item.source.trim().to_owned());
         }
@@ -76,9 +79,10 @@ pub fn validate_edited_symbols(raw: &str, expected: &[String]) -> Result<(), Str
     let items = parse_fragment_items(raw)?;
     let present = items
         .into_iter()
-        .map(|item| match item.key {
-            EditableKey::Import(module) => module,
-            EditableKey::Symbol(name) => name,
+        .filter_map(|item| match item.key {
+            EditableKey::Import(module) => Some(module),
+            EditableKey::Symbol(name) => Some(name),
+            EditableKey::Statement => None,
         })
         .collect::<BTreeSet<_>>();
     let missing = expected
@@ -134,6 +138,7 @@ fn item_key(item: &TopLevelItem) -> EditableKey {
         TopLevelItem::Param(param) => EditableKey::Symbol(param.name.clone()),
         TopLevelItem::Value(value) => EditableKey::Symbol(value.name.clone()),
         TopLevelItem::Function(function) => EditableKey::Symbol(function.name.clone()),
+        TopLevelItem::Statement(_) => EditableKey::Statement,
     }
 }
 
@@ -143,6 +148,15 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
         TopLevelItem::Param(param) => &param.span,
         TopLevelItem::Value(value) => &value.span,
         TopLevelItem::Function(function) => &function.span,
+        TopLevelItem::Statement(statement) => match statement {
+            BlockItem::LocalValue(value) => &value.span,
+            BlockItem::Assignment(assignment) => &assignment.span,
+            BlockItem::CompoundAssignment(assignment) => &assignment.span,
+            BlockItem::For(statement) => &statement.span,
+            BlockItem::Return(statement) => &statement.span,
+            BlockItem::Panic(statement) => &statement.span,
+            BlockItem::Expr(expr) => &expr.span,
+        },
     };
     source[span.start..span.end].to_owned()
 }

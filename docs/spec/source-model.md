@@ -41,7 +41,15 @@ PackageHeader
 Package rules:
 
 - a package file must not contain a top-level trailing expression;
-- a package file may contain top-level `val` initializers;
+- a package file may contain top-level `val` and `fun` declarations;
+- a package file must not contain top-level `var` declarations or assignment
+  statements;
+- package declarations are order-independent;
+- package top-level declarations are not redefinable;
+- package values collide when they have the same name;
+- package functions collide when their callable signatures overlap. The current
+  implementation has no overload set representation, so two package functions
+  with the same name are a collision;
 - a package exports its `public` declarations and `public import`s;
 - a package may contain `evil fun` declarations.
 
@@ -51,7 +59,7 @@ A script file declares an executable entrypoint.
 
 ```ebnf
 ScriptUnit
-  ::= ScriptHeader ";" TopLevelItem* ScriptResult?
+  ::= ScriptHeader ";" ScriptTopLevelItem* ScriptResult?
 
 ScriptHeader
   ::= "script" ModulePath
@@ -66,18 +74,47 @@ Script rules:
 - a script may declare `param` inputs;
 - a script may end with one top-level trailing expression;
 - the trailing expression, when present, is the script result;
-- declarations inside a script are script-local and are not importable.
+- declarations inside a script are script-local and are not importable;
+- script values and statements are processed in source order;
+- script value initializers and statements may reference only values already
+  introduced earlier in the script;
+- script function headers are visible throughout the whole script, so functions
+  may be mutually recursive without forward declarations;
+- script top-level values may be redefined. Later value definitions shadow
+  earlier value definitions from that point onward;
+- script functions may be redefined. Because script function headers are
+  visible throughout the script, a later colliding function declaration replaces
+  the earlier active function for that script.
 
 ## 5. Top-Level Items
 
-After the header, a compilation unit may contain the following top-level items:
+After the header, a package compilation unit may contain the following
+top-level items:
 
 ```ebnf
 TopLevelItem
   ::= ImportDecl
+   |  ValueDecl
+   |  FunctionDecl
+```
+
+After the header, a script compilation unit may contain the following top-level
+items:
+
+```ebnf
+ScriptTopLevelItem
+  ::= ImportDecl
    |  ParamDecl
    |  ValueDecl
    |  FunctionDecl
+   |  ScriptStatement
+
+ScriptStatement
+  ::= AssignmentStatement
+   |  CompoundAssignmentStatement
+   |  ForStatement
+   |  PanicStatement
+   |  ExprStatement
 ```
 
 ## 6. Visibility

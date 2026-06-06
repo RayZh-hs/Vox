@@ -71,6 +71,7 @@ enum StoredItemKey {
     Import { module: String },
     Value { name: String },
     Function { name: String },
+    Statement,
 }
 
 impl StoredItem {
@@ -78,6 +79,7 @@ impl StoredItem {
         match &self.key {
             StoredItemKey::Import { module } => module,
             StoredItemKey::Value { name } | StoredItemKey::Function { name } => name,
+            StoredItemKey::Statement => "<statement>",
         }
     }
 
@@ -91,6 +93,7 @@ impl StoredItem {
                         .is_some_and(|segment| segment == raw)
             }
             StoredItemKey::Value { name } | StoredItemKey::Function { name } => name == raw,
+            StoredItemKey::Statement => false,
         }
     }
 
@@ -110,12 +113,18 @@ impl StoredItemKey {
     fn conflicts_with(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Import { module: left }, Self::Import { module: right }) => left == right,
-            (Self::Value { name: left }, Self::Value { name: right })
-            | (Self::Value { name: left }, Self::Function { name: right })
-            | (Self::Function { name: left }, Self::Value { name: right })
-            | (Self::Function { name: left }, Self::Function { name: right }) => left == right,
+            (Self::Value { .. }, Self::Value { .. })
+            | (Self::Value { .. }, Self::Function { .. })
+            | (Self::Function { .. }, Self::Value { .. })
+            | (Self::Statement, _)
+            | (_, Self::Statement) => false,
+            (Self::Function { name: left }, Self::Function { name: right }) => left == right,
             _ => false,
         }
+    }
+
+    fn replaces_existing(&self) -> bool {
+        matches!(self, Self::Import { .. } | Self::Function { .. })
     }
 }
 
@@ -934,7 +943,9 @@ fn normalize_items(items: Vec<StoredItem>) -> Vec<StoredItem> {
 fn merge_items(existing: &[StoredItem], incoming: Vec<StoredItem>) -> Vec<StoredItem> {
     let mut merged = existing.to_vec();
     for item in incoming {
-        merged.retain(|current| !current.key.conflicts_with(&item.key));
+        if item.key.replaces_existing() {
+            merged.retain(|current| !current.key.conflicts_with(&item.key));
+        }
         merged.push(item);
     }
     merged
@@ -1262,6 +1273,7 @@ fn item_key(item: &TopLevelItem) -> StoredItemKey {
         TopLevelItem::Param(param) => StoredItemKey::Value {
             name: param.name.clone(),
         },
+        TopLevelItem::Statement(_) => StoredItemKey::Statement,
     }
 }
 
@@ -1271,6 +1283,15 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
         TopLevelItem::Param(param) => &param.span,
         TopLevelItem::Value(value) => &value.span,
         TopLevelItem::Function(function) => &function.span,
+        TopLevelItem::Statement(statement) => match statement {
+            BlockItem::LocalValue(value) => &value.span,
+            BlockItem::Assignment(assignment) => &assignment.span,
+            BlockItem::CompoundAssignment(assignment) => &assignment.span,
+            BlockItem::For(statement) => &statement.span,
+            BlockItem::Return(statement) => &statement.span,
+            BlockItem::Panic(statement) => &statement.span,
+            BlockItem::Expr(expr) => &expr.span,
+        },
     };
     source[span.start..span.end].to_owned()
 }

@@ -39,8 +39,10 @@ pub fn derive_rankings(
 fn rank_module(unit: &CompilationUnit, level: OptimizationLevel) -> OptimizationRank {
     let mut features = RankFeatures::default();
     for item in &unit.items {
-        if let TopLevelItem::Value(value) = item {
-            visit_value(value, &mut features);
+        match item {
+            TopLevelItem::Value(value) => visit_value(value, &mut features),
+            TopLevelItem::Statement(statement) => visit_block_item(statement, &mut features),
+            TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Function(_) => {}
         }
     }
     if let Some(result) = &unit.result {
@@ -218,20 +220,24 @@ fn visit_when(when_expr: &WhenExpr, features: &mut RankFeatures) {
 
 fn visit_block(block: &BlockExpr, features: &mut RankFeatures) {
     for item in &block.items {
-        match item {
-            BlockItem::LocalValue(value) => visit_expr(&value.initializer, features),
-            BlockItem::Assignment(assignment) => visit_assignment(assignment, features),
-            BlockItem::CompoundAssignment(assignment) => {
-                visit_compound_assignment(assignment, features)
-            }
-            BlockItem::For(statement) => visit_for(statement, features),
-            BlockItem::Return(statement) => visit_return(statement, features),
-            BlockItem::Panic(statement) => visit_string_literal(&statement.message, features),
-            BlockItem::Expr(expr) => visit_expr(expr, features),
-        }
+        visit_block_item(item, features);
     }
     if let Some(trailing) = &block.trailing {
         visit_expr(trailing, features);
+    }
+}
+
+fn visit_block_item(item: &BlockItem, features: &mut RankFeatures) {
+    match item {
+        BlockItem::LocalValue(value) => visit_expr(&value.initializer, features),
+        BlockItem::Assignment(assignment) => visit_assignment(assignment, features),
+        BlockItem::CompoundAssignment(assignment) => {
+            visit_compound_assignment(assignment, features)
+        }
+        BlockItem::For(statement) => visit_for(statement, features),
+        BlockItem::Return(statement) => visit_return(statement, features),
+        BlockItem::Panic(statement) => visit_string_literal(&statement.message, features),
+        BlockItem::Expr(expr) => visit_expr(expr, features),
     }
 }
 

@@ -44,12 +44,16 @@ fun scale(x: Float, factor: Float = defaultScale): Float = x * factor;
 Rules to remember:
 
 - `val` creates an immutable binding.
-- `var` allows local reassignment inside a block or file.
+- `var` allows local reassignment inside a block or script.
 - `fun` declares a function.
 - `public` exports a package declaration or re-exports an import.
 - declarations are private by default.
 - function parameters and return types use `name: Type`.
 - default argument values use `=`.
+- packages are order-independent declaration graphs with top-level `val` and
+  `fun` declarations;
+- scripts execute in source order, except that script function headers are
+  visible throughout the script.
 
 The exact modules, types, and host functions available to `import` depend on
 the host application embedding Vox.
@@ -150,6 +154,34 @@ param factor: Float = 2.0;
 fun scale(x: Float): Float = x * factor;
 
 scale(value)
+```
+
+Script values and statements are processed in source order:
+
+```vox
+script demo.counter;
+
+var b = 1;
+val a = b;
+b = 2;
+
+a
+```
+
+This script returns `1`, because `a` receives the value of `b` at the point
+where `a` is declared. It is not a live alias to `b`.
+
+Script functions are visible throughout the script:
+
+```vox
+script demo.functions;
+
+val total = even(4) + odd(3);
+
+fun even(value: Int): Int = value;
+fun odd(value: Int): Int = value;
+
+total
 ```
 
 Use scripts for entrypoints and one-off execution. Use packages for code you

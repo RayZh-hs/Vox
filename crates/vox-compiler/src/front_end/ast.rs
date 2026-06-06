@@ -92,6 +92,7 @@ pub enum TopLevelItem {
     Param(ParamDecl),
     Value(ValueDecl),
     Function(FunctionDecl),
+    Statement(BlockItem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
