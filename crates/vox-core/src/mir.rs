@@ -89,6 +89,7 @@ impl MirBody {
             },
             self.optimization_rank.as_str()
         )?;
+        self.analyses.write_text(out)?;
         for binding in &self.bindings {
             write!(
                 out,
@@ -122,6 +123,11 @@ impl MirBody {
             for op in &block.ops {
                 write!(out, "    ")?;
                 op.write_text(out)?;
+                if let Some(result) = op.result {
+                    if let Some(value) = self.values.iter().find(|value| value.id == result) {
+                        value.write_analysis_text(out)?;
+                    }
+                }
                 writeln!(out)?;
             }
             write!(out, "    ")?;
@@ -214,6 +220,61 @@ pub struct MirValue {
     pub escape: MirEscape,
     pub demand: MirDemand,
     pub storage: MirStorage,
+}
+
+impl MirValue {
+    fn write_analysis_text(&self, out: &mut String) -> fmt::Result {
+        let mut parts = Vec::new();
+        if let Some(version) = self.binding_version {
+            parts.push(format!("version=%v{}", version.0));
+        }
+        if self.lifetime.first.is_some()
+            || self.lifetime.last.is_some()
+            || self.lifetime.reusable_after_last_use
+            || !self.lifetime.live_in.is_empty()
+            || !self.lifetime.live_out.is_empty()
+        {
+            parts.push(format!(
+                "lifetime={}..{}{}",
+                render_program_point(self.lifetime.first),
+                render_program_point(self.lifetime.last),
+                if self.lifetime.reusable_after_last_use {
+                    " reusable"
+                } else {
+                    ""
+                }
+            ));
+        }
+        if self.escape.escapes() {
+            let mut escapes = Vec::new();
+            if self.escape.returned {
+                escapes.push("return");
+            }
+            if self.escape.captured {
+                escapes.push("capture");
+            }
+            if self.escape.econ {
+                escapes.push("econ");
+            }
+            if self.escape.evil_call {
+                escapes.push("evil_call");
+            }
+            if self.escape.host_boundary {
+                escapes.push("host");
+            }
+            parts.push(format!("escapes={}", escapes.join("|")));
+        }
+        if !matches!(self.demand, MirDemand::Unknown) {
+            parts.push(format!("demand={}", render_demand(&self.demand)));
+        }
+        if !matches!(self.storage, MirStorage::Fresh) {
+            parts.push(format!("storage={}", render_storage(&self.storage)));
+        }
+        if !parts.is_empty() {
+            write!(out, " ; {}", parts.join(", "))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -511,6 +572,60 @@ pub struct MirAnalysisSummary {
     pub value_slots: BTreeMap<MirValueId, u32>,
 }
 
+impl MirAnalysisSummary {
+    fn write_text(&self, out: &mut String) -> fmt::Result {
+        let mut flags = Vec::new();
+        if self.def_use_complete {
+            flags.push("def_use");
+        }
+        if self.lifetimes_complete {
+            flags.push("lifetimes");
+        }
+        if self.demand_complete {
+            flags.push("demand");
+        }
+        if self.active_value_cache_enabled {
+            flags.push("active_cache");
+        }
+        if self.sealed {
+            flags.push("sealed");
+        }
+        if flags.is_empty()
+            && self.culled_values == 0
+            && self.reused_slots == 0
+            && self.copy_on_write_values == 0
+            && self.value_slots.is_empty()
+        {
+            return Ok(());
+        }
+
+        writeln!(out, "  analyses flags=[{}]", flags.join(","))?;
+        if self.culled_values != 0
+            || self.reused_slots != 0
+            || self.copy_on_write_values != 0
+            || !self.value_slots.is_empty()
+        {
+            write!(
+                out,
+                "  analysis_counts culled={} reused_slots={} copy_on_write={}",
+                self.culled_values, self.reused_slots, self.copy_on_write_values
+            )?;
+            if !self.value_slots.is_empty() {
+                out.push_str(" slots=[");
+                for (index, (value, slot)) in self.value_slots.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    write!(out, "%{}:s{}", value.0, slot)?;
+                }
+                out.push(']');
+            }
+            writeln!(out)?;
+        }
+        Ok(())
+    }
+}
+
 fn write_value_list(out: &mut String, values: &[MirValueId]) -> fmt::Result {
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
@@ -557,5 +672,52 @@ fn render_inline_value(value: &InlineValue) -> String {
             format!("{{{fields}}}")
         }
         InlineValue::Null => "null".to_owned(),
+    }
+}
+
+fn render_program_point(point: Option<MirProgramPoint>) -> String {
+    point
+        .map(|point| format!("%bb{}:{}", point.block.0, point.index))
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+fn render_demand(demand: &MirDemand) -> String {
+    match demand {
+        MirDemand::Unknown => "unknown".to_owned(),
+        MirDemand::Full => "full".to_owned(),
+        MirDemand::None => "none".to_owned(),
+        MirDemand::Projection { fields, slots } => {
+            let mut parts = Vec::new();
+            if !fields.is_empty() {
+                parts.push(format!(
+                    "fields({})",
+                    fields.iter().cloned().collect::<Vec<_>>().join("|")
+                ));
+            }
+            if !slots.is_empty() {
+                parts.push(format!(
+                    "slots({})",
+                    slots
+                        .iter()
+                        .map(|slot| slot.to_string())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ));
+            }
+            if parts.is_empty() {
+                "projection(empty)".to_owned()
+            } else {
+                format!("projection:{}", parts.join("+"))
+            }
+        }
+    }
+}
+
+fn render_storage(storage: &MirStorage) -> String {
+    match storage {
+        MirStorage::Fresh => "fresh".to_owned(),
+        MirStorage::Reuse(value) => format!("reuse(%{})", value.0),
+        MirStorage::CopyOnWrite(value) => format!("cow(%{})", value.0),
+        MirStorage::Virtual => "virtual".to_owned(),
     }
 }

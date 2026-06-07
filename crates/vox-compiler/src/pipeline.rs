@@ -9,9 +9,10 @@ use vox_core::{
     source::SourceText,
 };
 
+use crate::backend::BackendPipeline;
 use crate::front_end::{FrontEndUnit, analyze_source};
-use crate::mir::{MirPassFn, lower_and_optimize_mir};
-use crate::optimization::derive_rankings;
+use crate::mir::{MirPassFn, lower_mir};
+use crate::optimization::{OptimizationPipeline, derive_rankings};
 use crate::treewalk::TreewalkScript;
 
 #[derive(Debug, Clone)]
@@ -55,12 +56,12 @@ impl Compiler {
                         OptimizationSubject::Function(_) => None,
                     })
                     .expect("module ranking should always be present");
-                let (mir, optimization_summary) = lower_and_optimize_mir(
-                    &front_end,
-                    request.optimization,
-                    &optimization_rankings,
-                    custom_mir_passes,
-                );
+                let mut mir = lower_mir(&front_end, request.optimization, &optimization_rankings);
+                let mut optimization_summary =
+                    OptimizationPipeline::for_level(request.optimization)
+                        .run(&mut mir, custom_mir_passes);
+                let backend = BackendPipeline::default().lower(&mir);
+                optimization_summary.extend(backend.summaries);
                 let artifact = CompiledArtifact {
                     id: ArtifactId(self.next_artifact_id.fetch_add(1, Ordering::Relaxed) + 1),
                     module: front_end.header.module.clone(),
@@ -83,7 +84,8 @@ impl Compiler {
                         Purity::Pure
                     },
                     plan: ExecutablePlan::deferred(module_rank)
-                        .with_mir(&mir, optimization_summary),
+                        .with_mir(&mir, optimization_summary)
+                        .with_wasm(backend.wasm),
                     mir: Some(mir),
                     diagnostics: DiagnosticBag::default(),
                     dependencies: collect_dependencies(&request),

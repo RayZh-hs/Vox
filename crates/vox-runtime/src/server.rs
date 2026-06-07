@@ -741,11 +741,11 @@ impl RuntimeConnection {
 
     fn handle_reload_script(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
         let artifact_id = self.resolve_script(frame.header.target_id)?;
-        let (source, _xopt) = self.decode_script_source(&frame.payload)?;
+        let (source, xopt) = self.decode_script_source(&frame.payload)?;
         let (source_revision, parameter_count) = self
             .runner
             .with_runtime(|runtime| {
-                runtime.reload_script(artifact_id, source)?;
+                runtime.reload_script_with_xopt(artifact_id, source, xopt)?;
                 let artifact = runtime
                     .artifact(artifact_id)
                     .ok_or(RuntimeError::MissingArtifact(artifact_id))?;

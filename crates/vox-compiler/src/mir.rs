@@ -19,9 +19,9 @@ use crate::front_end::{
     FrontEndUnit,
     ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
-        ExprKind, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
+        ExprKind, FunctionDecl, IfExpr, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
         StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp, UpdatedPathSegment,
-        ValueDecl,
+        ValueDecl, WhenExpr,
     },
 };
 
@@ -34,44 +34,12 @@ pub struct MirPassReport {
     pub summary: String,
 }
 
-pub fn lower_and_optimize_mir(
+pub(crate) fn lower_mir(
     front_end: &FrontEndUnit,
     optimization: OptimizationLevel,
     rankings: &[vox_core::opt::OptimizationRanking],
-    custom_passes: &[MirPassFn],
-) -> (MirModule, Vec<String>) {
-    let mut module = MirLowerer::new(front_end, optimization, rankings).lower_module();
-    let mut summaries = Vec::new();
-
-    for pass in default_passes(optimization)
-        .into_iter()
-        .chain(custom_passes.iter().copied())
-    {
-        let report = pass(&mut module);
-        if !report.summary.is_empty() {
-            summaries.push(report.summary);
-        }
-    }
-
-    (module, summaries)
-}
-
-fn default_passes(optimization: OptimizationLevel) -> Vec<MirPassFn> {
-    let mut passes: Vec<MirPassFn> = vec![build_def_use, analyze_lifetimes];
-    match optimization {
-        OptimizationLevel::NOpt => {}
-        OptimizationLevel::IOpt => {
-            passes.push(enable_active_value_cache);
-        }
-        OptimizationLevel::SOpt => {
-            passes.push(analyze_projection_demand);
-            passes.push(cull_unused_composite_outputs);
-            passes.push(mark_copy_on_write);
-            passes.push(reuse_value_slots);
-            passes.push(seal_module);
-        }
-    }
-    passes
+) -> MirModule {
+    MirLowerer::new(front_end, optimization, rankings).lower_module()
 }
 
 struct MirLowerer<'a> {
@@ -377,11 +345,29 @@ impl BodyBuilder {
                     vec![iterable],
                     Some(statement.span.clone()),
                 );
+                let header = self.new_block("for_header");
+                let body_block = self.new_block("for_body");
+                let exit = self.new_block("for_exit");
+                self.terminate(MirTerminator::Jump {
+                    target: header,
+                    args: Vec::new(),
+                });
+
+                self.current = header;
                 let item = self.emit_op(
                     MirOpKind::IteratorNext,
                     vec![iterator],
                     Some(statement.span.clone()),
                 );
+                self.terminate(MirTerminator::Branch {
+                    condition: item,
+                    then_target: body_block,
+                    then_args: Vec::new(),
+                    else_target: exit,
+                    else_args: Vec::new(),
+                });
+
+                self.current = body_block;
                 self.push_scope();
                 self.declare_binding(
                     statement.pattern.clone(),
@@ -393,6 +379,8 @@ impl BodyBuilder {
                 );
                 self.lower_block_expr(&statement.body);
                 self.pop_scope();
+                self.jump_to_join_if_open(header, Vec::new());
+                self.current = exit;
             }
             BlockItem::Return(statement) => {
                 let value = statement
@@ -580,9 +568,10 @@ impl BodyBuilder {
                     Some(expr.span.clone()),
                 )
             }
-            ExprKind::Binary { left, op, right }
-                if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Coalesce) =>
-            {
+            ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::And | BinaryOp::Or) => {
+                self.lower_short_circuit_bool(left, *op, right, Some(expr.span.clone()))
+            }
+            ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::Coalesce) => {
                 let left = self.lower_expr(left);
                 let right = self.lower_expr(right);
                 self.emit_op(
@@ -621,52 +610,8 @@ impl BodyBuilder {
                     Some(expr.span.clone()),
                 )
             }
-            ExprKind::If(if_expr) => {
-                let mut args = Vec::new();
-                for branch in &if_expr.branches {
-                    args.push(self.lower_expr(&branch.condition));
-                    self.push_scope();
-                    args.push(self.lower_block_expr(&branch.body));
-                    self.pop_scope();
-                }
-                if let Some(else_branch) = &if_expr.else_branch {
-                    self.push_scope();
-                    args.push(self.lower_block_expr(else_branch));
-                    self.pop_scope();
-                }
-                self.emit_op(
-                    MirOpKind::Unknown("if_join".to_owned()),
-                    args,
-                    Some(expr.span.clone()),
-                )
-            }
-            ExprKind::When(when_expr) => {
-                let mut args = vec![self.lower_expr(&when_expr.subject)];
-                for arm in &when_expr.arms {
-                    self.push_scope();
-                    if let Some(binding) = &arm.binding {
-                        let subject = args[0];
-                        self.declare_binding(
-                            binding.clone(),
-                            MirMutability::Val,
-                            Some(type_syntax_to_vox(&arm.ty)),
-                            Some(arm.span.clone()),
-                            subject,
-                            MirVersionSource::Initializer,
-                        );
-                    }
-                    args.push(self.lower_expr(&arm.body));
-                    self.pop_scope();
-                }
-                if let Some(else_arm) = &when_expr.else_arm {
-                    args.push(self.lower_expr(else_arm));
-                }
-                self.emit_op(
-                    MirOpKind::Unknown("when_join".to_owned()),
-                    args,
-                    Some(expr.span.clone()),
-                )
-            }
+            ExprKind::If(if_expr) => self.lower_if_expr(if_expr, Some(expr.span.clone())),
+            ExprKind::When(when_expr) => self.lower_when_expr(when_expr, Some(expr.span.clone())),
             ExprKind::Lambda(lambda) => {
                 let args = lambda
                     .parameters
@@ -703,6 +648,187 @@ impl BodyBuilder {
             .as_ref()
             .map(|expr| self.lower_expr(expr))
             .unwrap_or_else(|| self.emit_unit())
+    }
+
+    fn lower_if_expr(
+        &mut self,
+        if_expr: &IfExpr,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let join = self.new_block("if_join");
+        let result = self.new_value(None, MirValueDefinition::BlockParameter(join), span.clone());
+        self.block_mut(join).parameters.push(result);
+        let base_scopes = self.scopes.clone();
+        self.lower_if_branch(0, if_expr, join, base_scopes);
+        self.current = join;
+        result
+    }
+
+    fn lower_if_branch(
+        &mut self,
+        index: usize,
+        if_expr: &IfExpr,
+        join: MirBlockId,
+        base_scopes: Vec<BTreeMap<String, BindingRef>>,
+    ) {
+        let Some(branch) = if_expr.branches.get(index) else {
+            self.scopes = base_scopes.clone();
+            let value = if let Some(else_branch) = &if_expr.else_branch {
+                self.push_scope();
+                let value = self.lower_block_expr(else_branch);
+                self.pop_scope();
+                value
+            } else {
+                self.emit_unit()
+            };
+            self.jump_to_join_if_open(join, vec![value]);
+            self.scopes = base_scopes;
+            return;
+        };
+
+        self.scopes = base_scopes.clone();
+        let condition = self.lower_expr(&branch.condition);
+        let then_block = self.new_block("if_then");
+        let else_block = self.new_block("if_else");
+        self.terminate(MirTerminator::Branch {
+            condition,
+            then_target: then_block,
+            then_args: Vec::new(),
+            else_target: else_block,
+            else_args: Vec::new(),
+        });
+
+        self.current = then_block;
+        self.scopes = base_scopes.clone();
+        self.push_scope();
+        let then_value = self.lower_block_expr(&branch.body);
+        self.pop_scope();
+        self.jump_to_join_if_open(join, vec![then_value]);
+
+        self.current = else_block;
+        self.lower_if_branch(index + 1, if_expr, join, base_scopes);
+    }
+
+    fn lower_short_circuit_bool(
+        &mut self,
+        left: &Expr,
+        op: BinaryOp,
+        right: &Expr,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let left = self.lower_expr(left);
+        let join = self.new_block("bool_join");
+        let result = self.new_value(None, MirValueDefinition::BlockParameter(join), span.clone());
+        self.block_mut(join).parameters.push(result);
+
+        let eval_right = self.new_block("bool_rhs");
+        let constant = self.new_block("bool_short");
+        let (then_target, else_target) = match op {
+            BinaryOp::And => (eval_right, constant),
+            BinaryOp::Or => (constant, eval_right),
+            _ => unreachable!("only boolean short-circuit operators are lowered here"),
+        };
+        self.terminate(MirTerminator::Branch {
+            condition: left,
+            then_target,
+            then_args: Vec::new(),
+            else_target,
+            else_args: Vec::new(),
+        });
+
+        self.current = eval_right;
+        let right = self.lower_expr(right);
+        self.jump_to_join_if_open(join, vec![right]);
+
+        self.current = constant;
+        let value = self.emit_literal(InlineValue::Bool(matches!(op, BinaryOp::Or)), span.clone());
+        self.jump_to_join_if_open(join, vec![value]);
+
+        self.current = join;
+        result
+    }
+
+    fn lower_when_expr(
+        &mut self,
+        when_expr: &WhenExpr,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let subject = self.lower_expr(&when_expr.subject);
+        let join = self.new_block("when_join");
+        let result = self.new_value(None, MirValueDefinition::BlockParameter(join), span.clone());
+        self.block_mut(join).parameters.push(result);
+        let base_scopes = self.scopes.clone();
+        self.lower_when_arm(0, subject, when_expr, join, base_scopes);
+        self.current = join;
+        result
+    }
+
+    fn lower_when_arm(
+        &mut self,
+        index: usize,
+        subject: MirValueId,
+        when_expr: &WhenExpr,
+        join: MirBlockId,
+        base_scopes: Vec<BTreeMap<String, BindingRef>>,
+    ) {
+        let Some(arm) = when_expr.arms.get(index) else {
+            self.scopes = base_scopes.clone();
+            let value = when_expr
+                .else_arm
+                .as_ref()
+                .map(|else_arm| self.lower_expr(else_arm))
+                .unwrap_or_else(|| {
+                    self.emit_op(
+                        MirOpKind::Unknown("when_no_match".to_owned()),
+                        vec![subject],
+                        None,
+                    )
+                });
+            self.jump_to_join_if_open(join, vec![value]);
+            self.scopes = base_scopes;
+            return;
+        };
+
+        self.scopes = base_scopes.clone();
+        let matched = self.emit_op(
+            MirOpKind::TypeTest(arm.ty.to_source_string()),
+            vec![subject],
+            Some(arm.span.clone()),
+        );
+        let arm_block = self.new_block("when_arm");
+        let next_block = self.new_block("when_next");
+        self.terminate(MirTerminator::Branch {
+            condition: matched,
+            then_target: arm_block,
+            then_args: Vec::new(),
+            else_target: next_block,
+            else_args: Vec::new(),
+        });
+
+        self.current = arm_block;
+        self.scopes = base_scopes.clone();
+        self.push_scope();
+        if let Some(binding) = &arm.binding {
+            let refined = self.emit_op(
+                MirOpKind::TypeRefine(arm.ty.to_source_string()),
+                vec![subject],
+                Some(arm.span.clone()),
+            );
+            self.declare_binding(
+                binding.clone(),
+                MirMutability::Val,
+                Some(type_syntax_to_vox(&arm.ty)),
+                Some(arm.span.clone()),
+                refined,
+                MirVersionSource::Initializer,
+            );
+        }
+        let value = self.lower_expr(&arm.body);
+        self.pop_scope();
+        self.jump_to_join_if_open(join, vec![value]);
+
+        self.current = next_block;
+        self.lower_when_arm(index + 1, subject, when_expr, join, base_scopes);
     }
 
     fn lower_arguments(&mut self, arguments: &[Argument]) -> Vec<MirValueId> {
@@ -926,7 +1052,19 @@ impl BodyBuilder {
                     kind: MirUseKind::Condition,
                 },
             ),
-            MirTerminator::Jump { .. } | MirTerminator::Panic(_) | MirTerminator::Unreachable => {}
+            MirTerminator::Jump { args, .. } => {
+                for arg in args {
+                    self.add_use(
+                        *arg,
+                        MirUse {
+                            block: block_id,
+                            op_index: None,
+                            kind: MirUseKind::Operand,
+                        },
+                    );
+                }
+            }
+            MirTerminator::Panic(_) | MirTerminator::Unreachable => {}
         }
         self.current_block().terminator = terminator;
     }
@@ -991,6 +1129,29 @@ impl BodyBuilder {
             .expect("current block should exist")
     }
 
+    fn block_mut(&mut self, id: MirBlockId) -> &mut MirBlock {
+        self.blocks
+            .iter_mut()
+            .find(|block| block.id == id)
+            .expect("block should exist")
+    }
+
+    fn jump_to_join_if_open(&mut self, target: MirBlockId, args: Vec<MirValueId>) {
+        let should_jump = self
+            .blocks
+            .iter()
+            .find(|block| block.id == self.current)
+            .map(|block| {
+                matches!(block.terminator, MirTerminator::Unreachable)
+                    && !block.name.starts_with("after_return")
+                    && !block.name.starts_with("after_panic")
+            })
+            .unwrap_or(false);
+        if should_jump {
+            self.terminate(MirTerminator::Jump { target, args });
+        }
+    }
+
     fn add_use(&mut self, value: MirValueId, usage: MirUse) {
         if let Some(value) = self.values.iter_mut().find(|entry| entry.id == value) {
             value.uses.push(usage);
@@ -1004,10 +1165,11 @@ impl BodyBuilder {
     }
 }
 
-fn build_def_use(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn build_def_use(module: &mut MirModule) -> MirPassReport {
     for body in &mut module.bodies {
         for value in &mut body.values {
             value.uses.clear();
+            value.escape = MirEscape::default();
         }
         for block in &body.blocks {
             for (index, op) in block.ops.iter().enumerate() {
@@ -1032,7 +1194,12 @@ fn build_def_use(module: &mut MirModule) -> MirPassReport {
                         value.escape.returned = true;
                     }
                 }
-                MirTerminator::Branch { condition, .. } => {
+                MirTerminator::Branch {
+                    condition,
+                    then_args,
+                    else_args,
+                    ..
+                } => {
                     if let Some(value) = body.values.iter_mut().find(|entry| entry.id == *condition)
                     {
                         value.uses.push(MirUse {
@@ -1041,10 +1208,28 @@ fn build_def_use(module: &mut MirModule) -> MirPassReport {
                             kind: MirUseKind::Condition,
                         });
                     }
+                    for arg in then_args.iter().chain(else_args.iter()) {
+                        if let Some(value) = body.values.iter_mut().find(|entry| entry.id == *arg) {
+                            value.uses.push(MirUse {
+                                block: block.id,
+                                op_index: None,
+                                kind: MirUseKind::Operand,
+                            });
+                        }
+                    }
                 }
-                MirTerminator::Jump { .. }
-                | MirTerminator::Panic(_)
-                | MirTerminator::Unreachable => {}
+                MirTerminator::Jump { args, .. } => {
+                    for arg in args {
+                        if let Some(value) = body.values.iter_mut().find(|entry| entry.id == *arg) {
+                            value.uses.push(MirUse {
+                                block: block.id,
+                                op_index: None,
+                                kind: MirUseKind::Operand,
+                            });
+                        }
+                    }
+                }
+                MirTerminator::Panic(_) | MirTerminator::Unreachable => {}
             }
         }
         body.analyses.def_use_complete = true;
@@ -1056,7 +1241,57 @@ fn build_def_use(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn analyze_lifetimes(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn fold_constants(module: &mut MirModule) -> MirPassReport {
+    let mut folded = 0;
+    for body in &mut module.bodies {
+        let mut constants = BTreeMap::<MirValueId, InlineValue>::new();
+        for block in &mut body.blocks {
+            for op in &mut block.ops {
+                let folded_value = match &op.kind {
+                    MirOpKind::Literal(value) => {
+                        if let Some(result) = op.result {
+                            constants.insert(result, value.clone());
+                        }
+                        None
+                    }
+                    MirOpKind::Unit => Some(InlineValue::Tuple(Vec::new())),
+                    MirOpKind::Unary(name) => op
+                        .args
+                        .first()
+                        .and_then(|arg| constants.get(arg))
+                        .and_then(|value| fold_unary(name, value)),
+                    MirOpKind::Binary(name) => {
+                        let [left, right] = op.args.as_slice() else {
+                            continue;
+                        };
+                        constants
+                            .get(left)
+                            .zip(constants.get(right))
+                            .and_then(|(left, right)| fold_binary(name, left, right))
+                    }
+                    _ => None,
+                };
+
+                if let Some(value) = folded_value {
+                    op.kind = MirOpKind::Literal(value.clone());
+                    op.args.clear();
+                    if let Some(result) = op.result {
+                        constants.insert(result, value);
+                    }
+                    folded += 1;
+                }
+            }
+        }
+    }
+
+    MirPassReport {
+        name: "constant-fold",
+        changed: folded > 0,
+        summary: format!("constant folding rewrote {folded} op(s)"),
+    }
+}
+
+pub(crate) fn analyze_lifetimes(module: &mut MirModule) -> MirPassReport {
     for body in &mut module.bodies {
         let mut def_points = BTreeMap::new();
         for block in &body.blocks {
@@ -1102,18 +1337,40 @@ fn analyze_lifetimes(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn enable_active_value_cache(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn enable_active_value_cache(module: &mut MirModule) -> MirPassReport {
+    let mut inserted = 0;
     for body in &mut module.bodies {
+        for block in &mut body.blocks {
+            let mut next_ops = Vec::with_capacity(block.ops.len());
+            for op in block.ops.drain(..) {
+                let cache_key = op.result.and_then(|result| {
+                    pure_cache_key(&op.kind, &op.args)
+                        .filter(|_| pure_value_op(&op.kind))
+                        .map(|key| (result, key))
+                });
+                next_ops.push(op);
+                if let Some((result, key)) = cache_key {
+                    next_ops.push(MirOp {
+                        result: None,
+                        kind: MirOpKind::CachePut(key),
+                        args: vec![result],
+                        span: None,
+                    });
+                    inserted += 1;
+                }
+            }
+            block.ops = next_ops;
+        }
         body.analyses.active_value_cache_enabled = true;
     }
     MirPassReport {
         name: "active-cache",
-        changed: true,
-        summary: "active pure value caching enabled for interactive MIR".to_owned(),
+        changed: inserted > 0,
+        summary: format!("active pure value caching inserted {inserted} cache op(s)"),
     }
 }
 
-fn analyze_projection_demand(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn analyze_projection_demand(module: &mut MirModule) -> MirPassReport {
     for body in &mut module.bodies {
         for value in &mut body.values {
             if value
@@ -1146,7 +1403,7 @@ fn analyze_projection_demand(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn cull_unused_composite_outputs(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn cull_unused_composite_outputs(module: &mut MirModule) -> MirPassReport {
     let mut culled = 0;
     for body in &mut module.bodies {
         for value in &mut body.values {
@@ -1178,7 +1435,7 @@ fn cull_unused_composite_outputs(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn mark_copy_on_write(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn mark_copy_on_write(module: &mut MirModule) -> MirPassReport {
     let mut marked = 0;
     for body in &mut module.bodies {
         for block in &body.blocks {
@@ -1206,26 +1463,99 @@ fn mark_copy_on_write(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn reuse_value_slots(module: &mut MirModule) -> MirPassReport {
+pub(crate) fn remove_dead_pure_ops(module: &mut MirModule) -> MirPassReport {
+    let mut removed = 0;
+    for body in &mut module.bodies {
+        let mut body_removed = 0;
+        let drop_only_values = body
+            .values
+            .iter()
+            .filter(|value| {
+                !value.escape.escapes()
+                    && !value.uses.is_empty()
+                    && value.uses.iter().all(|usage| {
+                        usage.op_index.is_some_and(|index| {
+                            body.blocks
+                                .iter()
+                                .find(|block| block.id == usage.block)
+                                .and_then(|block| block.ops.get(index as usize))
+                                .is_some_and(|op| matches!(op.kind, MirOpKind::Drop))
+                        })
+                    })
+            })
+            .map(|value| value.id)
+            .collect::<BTreeSet<_>>();
+
+        for block in &mut body.blocks {
+            let before = block.ops.len();
+            block.ops.retain(|op| {
+                if matches!(op.kind, MirOpKind::Drop) {
+                    return false;
+                }
+                if let Some(result) = op.result {
+                    let unused = body
+                        .values
+                        .iter()
+                        .find(|value| value.id == result)
+                        .is_none_or(|value| value.uses.is_empty())
+                        || drop_only_values.contains(&result);
+                    if unused && pure_value_op(&op.kind) {
+                        return false;
+                    }
+                }
+                true
+            });
+            body_removed += before - block.ops.len();
+        }
+        body.analyses.culled_values += body_removed as u32;
+        removed += body_removed;
+    }
+
+    MirPassReport {
+        name: "dead-pure-op",
+        changed: removed > 0,
+        summary: format!("sealed dead pure-op cleanup removed {removed} op(s)"),
+    }
+}
+
+pub(crate) fn reuse_value_slots(module: &mut MirModule) -> MirPassReport {
     let mut changed = 0;
     for body in &mut module.bodies {
         let mut next_slot = 0_u32;
-        let mut reusable = Vec::<u32>::new();
+        let mut reusable = Vec::<(u32, MirValueId)>::new();
+        let mut active = Vec::<(MirProgramPoint, u32, MirValueId)>::new();
         let mut by_def = body.values.clone();
         by_def.sort_by_key(|value| value.lifetime.first);
         for value in by_def {
-            let slot = reusable.pop().unwrap_or_else(|| {
+            if let Some(first) = value.lifetime.first {
+                let mut still_active = Vec::new();
+                for (last, slot, source) in active.drain(..) {
+                    if last < first {
+                        reusable.push((slot, source));
+                    } else {
+                        still_active.push((last, slot, source));
+                    }
+                }
+                active = still_active;
+            }
+
+            let reused_from = reusable.pop();
+            let slot = reused_from.map(|(slot, _)| slot).unwrap_or_else(|| {
                 let slot = next_slot;
                 next_slot += 1;
                 slot
             });
             body.analyses.value_slots.insert(value.id, slot);
             if let Some(real) = body.values.iter_mut().find(|entry| entry.id == value.id) {
-                if real.lifetime.reusable_after_last_use {
-                    reusable.push(slot);
-                    real.storage = MirStorage::Reuse(value.id);
+                if let Some((_, source)) = reused_from {
+                    real.storage = MirStorage::Reuse(source);
                     body.analyses.reused_slots += 1;
                     changed += 1;
+                }
+                if real.lifetime.reusable_after_last_use {
+                    if let Some(last) = real.lifetime.last {
+                        active.push((last, slot, real.id));
+                    }
                 }
             }
         }
@@ -1237,7 +1567,112 @@ fn reuse_value_slots(module: &mut MirModule) -> MirPassReport {
     }
 }
 
-fn seal_module(module: &mut MirModule) -> MirPassReport {
+fn fold_unary(name: &str, value: &InlineValue) -> Option<InlineValue> {
+    match (name, value) {
+        ("negate", InlineValue::Int(value)) => Some(InlineValue::Int(-value)),
+        ("negate", InlineValue::Float(value)) => Some(InlineValue::Float(-value)),
+        ("not", InlineValue::Bool(value)) => Some(InlineValue::Bool(!value)),
+        _ => None,
+    }
+}
+
+fn fold_binary(name: &str, left: &InlineValue, right: &InlineValue) -> Option<InlineValue> {
+    match (name, left, right) {
+        ("add", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Some(InlineValue::Int(left + right))
+        }
+        ("subtract", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Some(InlineValue::Int(left - right))
+        }
+        ("multiply", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Some(InlineValue::Int(left * right))
+        }
+        ("divide", InlineValue::Int(_), InlineValue::Int(0))
+        | ("remainder", InlineValue::Int(_), InlineValue::Int(0)) => None,
+        ("divide", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Some(InlineValue::Int(left / right))
+        }
+        ("remainder", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Some(InlineValue::Int(left % right))
+        }
+        ("add", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Some(InlineValue::Float(left + right))
+        }
+        ("subtract", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Some(InlineValue::Float(left - right))
+        }
+        ("multiply", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Some(InlineValue::Float(left * right))
+        }
+        ("divide", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Some(InlineValue::Float(left / right))
+        }
+        ("remainder", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Some(InlineValue::Float(left % right))
+        }
+        ("add", InlineValue::String(left), InlineValue::String(right)) => {
+            Some(InlineValue::String(format!("{left}{right}")))
+        }
+        ("less", left, right) => compare_inline(left, right, |ordering| ordering.is_lt()),
+        ("less_equal", left, right) => compare_inline(left, right, |ordering| !ordering.is_gt()),
+        ("greater", left, right) => compare_inline(left, right, |ordering| ordering.is_gt()),
+        ("greater_equal", left, right) => compare_inline(left, right, |ordering| !ordering.is_lt()),
+        ("equal", left, right) => Some(InlineValue::Bool(left == right)),
+        ("not_equal", left, right) => Some(InlineValue::Bool(left != right)),
+        _ => None,
+    }
+}
+
+fn compare_inline(
+    left: &InlineValue,
+    right: &InlineValue,
+    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> Option<InlineValue> {
+    let ordering = match (left, right) {
+        (InlineValue::Int(left), InlineValue::Int(right)) => left.cmp(right),
+        (InlineValue::String(left), InlineValue::String(right)) => left.cmp(right),
+        _ => return None,
+    };
+    Some(InlineValue::Bool(predicate(ordering)))
+}
+
+fn pure_cache_key(kind: &MirOpKind, args: &[MirValueId]) -> Option<String> {
+    Some(format!(
+        "{}({})",
+        pure_op_name(kind)?,
+        args.iter()
+            .map(|arg| format!("%{}", arg.0))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+fn pure_op_name(kind: &MirOpKind) -> Option<String> {
+    match kind {
+        MirOpKind::Literal(value) => Some(format!("literal:{value:?}")),
+        MirOpKind::Unit => Some("unit".to_owned()),
+        MirOpKind::Unary(name) => Some(format!("unary:{name}")),
+        MirOpKind::Binary(name) => Some(format!("binary:{name}")),
+        MirOpKind::Tuple { shape } => Some(format!("tuple:{shape}")),
+        MirOpKind::Record { fields } => Some(format!("record:{}", fields.join(","))),
+        MirOpKind::List => Some("list".to_owned()),
+        MirOpKind::Project(projection) => Some(format!("project:{projection:?}")),
+        MirOpKind::Index => Some("index".to_owned()),
+        MirOpKind::Updated { path } => Some(format!("updated:{path:?}")),
+        MirOpKind::NonNull => Some("non_null".to_owned()),
+        MirOpKind::SafeProject(field) => Some(format!("safe_project:{field}")),
+        MirOpKind::TypeTest(ty) => Some(format!("type_test:{ty}")),
+        MirOpKind::TypeRefine(ty) => Some(format!("type_refine:{ty}")),
+        MirOpKind::Use(version) => Some(format!("use:{}", version.0)),
+        _ => None,
+    }
+}
+
+fn pure_value_op(kind: &MirOpKind) -> bool {
+    pure_op_name(kind).is_some()
+}
+
+pub(crate) fn seal_module(module: &mut MirModule) -> MirPassReport {
     for body in &mut module.bodies {
         body.analyses.sealed = true;
     }

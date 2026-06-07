@@ -9,6 +9,7 @@ mod artifact_store;
 mod handles;
 pub mod host_exports;
 mod interpreter;
+mod mir_executor;
 mod protocol;
 mod remote;
 mod runner;
@@ -37,6 +38,7 @@ pub use handles::{
     HandleMetadata, HandleStore, RealizationKey, RealizedFunctionHandleSummary,
 };
 use interpreter::Interpreter;
+use mir_executor::MirExecutor;
 pub use protocol::CURRENT_PROTOCOL_VERSION;
 pub use remote::RemoteRunner;
 pub use runner::{
@@ -250,6 +252,15 @@ impl Runtime {
         artifact_id: ArtifactId,
         source: SourceText,
     ) -> Result<(), RuntimeError> {
+        self.reload_script_with_xopt(artifact_id, source, self.default_xopt)
+    }
+
+    pub fn reload_script_with_xopt(
+        &mut self,
+        artifact_id: ArtifactId,
+        source: SourceText,
+        xopt: OptimizationLevel,
+    ) -> Result<(), RuntimeError> {
         let Some(previous_artifact) = self.artifacts.get(artifact_id).cloned() else {
             return Err(RuntimeError::MissingArtifact(artifact_id));
         };
@@ -257,7 +268,7 @@ impl Runtime {
 
         let request = CompileRequest {
             source,
-            optimization: self.default_xopt,
+            optimization: xopt,
             host: self.host.clone(),
         };
         let result = self.compiler.compile(request);
@@ -326,6 +337,14 @@ impl Runtime {
 
         if !matches!(artifact.kind, ModuleKind::Script { .. }) {
             return Err(RuntimeError::NotAScript(artifact_id));
+        }
+
+        if let Some(mir) = artifact.mir.clone() {
+            if let Ok(value) =
+                MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, arguments)
+            {
+                return Ok(value);
+            }
         }
 
         let treewalk = self

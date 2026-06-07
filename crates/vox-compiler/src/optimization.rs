@@ -1,6 +1,13 @@
 use vox_core::{
+    mir::MirModule,
     opt::{OptimizationLevel, OptimizationRank, OptimizationRanking, OptimizationSubject},
     source::ModuleKind,
+};
+
+use crate::mir::{
+    MirPassFn, analyze_lifetimes, analyze_projection_demand, build_def_use,
+    cull_unused_composite_outputs, enable_active_value_cache, fold_constants, mark_copy_on_write,
+    remove_dead_pure_ops, reuse_value_slots, seal_module,
 };
 
 use crate::front_end::{
@@ -12,6 +19,94 @@ use crate::front_end::{
         TopLevelItem, ValueDecl, WhenExpr,
     },
 };
+
+#[derive(Debug, Clone)]
+pub(crate) struct OptimizationPipeline {
+    stages: Vec<OptimizationStage>,
+}
+
+#[derive(Debug, Clone)]
+struct OptimizationStage {
+    name: &'static str,
+    passes: Vec<MirPassFn>,
+}
+
+impl OptimizationPipeline {
+    pub(crate) fn for_level(level: OptimizationLevel) -> Self {
+        let mut stages = vec![
+            OptimizationStage {
+                name: "analysis-prereq",
+                passes: vec![build_def_use],
+            },
+            OptimizationStage {
+                name: "cheap-canonicalization",
+                passes: vec![fold_constants, build_def_use],
+            },
+            OptimizationStage {
+                name: "baseline-analysis",
+                passes: vec![analyze_lifetimes],
+            },
+        ];
+
+        match level {
+            OptimizationLevel::NOpt => {}
+            OptimizationLevel::IOpt => {
+                stages.push(OptimizationStage {
+                    name: "interactive-cache",
+                    passes: vec![enable_active_value_cache, build_def_use],
+                });
+            }
+            OptimizationLevel::SOpt => {
+                stages.push(OptimizationStage {
+                    name: "sealed-demand",
+                    passes: vec![analyze_projection_demand, cull_unused_composite_outputs],
+                });
+                stages.push(OptimizationStage {
+                    name: "sealed-rewrite",
+                    passes: vec![
+                        mark_copy_on_write,
+                        remove_dead_pure_ops,
+                        build_def_use,
+                        analyze_lifetimes,
+                    ],
+                });
+                stages.push(OptimizationStage {
+                    name: "sealed-storage",
+                    passes: vec![reuse_value_slots, seal_module],
+                });
+            }
+        }
+
+        Self { stages }
+    }
+
+    pub(crate) fn run(
+        &self,
+        module: &mut MirModule,
+        custom_mir_passes: &[MirPassFn],
+    ) -> Vec<String> {
+        let mut summaries = Vec::new();
+        for stage in &self.stages {
+            for pass in &stage.passes {
+                let report = pass(module);
+                if !report.summary.is_empty() {
+                    summaries.push(format!("{}: {}", stage.name, report.summary));
+                }
+            }
+        }
+
+        if !custom_mir_passes.is_empty() {
+            for pass in custom_mir_passes {
+                let report = pass(module);
+                if !report.summary.is_empty() {
+                    summaries.push(format!("custom: {}", report.summary));
+                }
+            }
+        }
+
+        summaries
+    }
+}
 
 pub fn derive_rankings(
     front_end: &FrontEndUnit,

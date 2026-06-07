@@ -37,6 +37,7 @@ pub struct ExecutablePlan {
     pub optimization_rank: OptimizationRank,
     pub mir_text: Option<String>,
     pub optimization_summary: Vec<String>,
+    pub wasm: Option<WasmArtifact>,
 }
 
 impl ExecutablePlan {
@@ -47,6 +48,7 @@ impl ExecutablePlan {
             optimization_rank,
             mir_text: None,
             optimization_summary: Vec::new(),
+            wasm: None,
         }
     }
 
@@ -55,6 +57,18 @@ impl ExecutablePlan {
         self.optimization_summary = optimization_summary;
         self
     }
+
+    pub fn with_wasm(mut self, wasm: Option<WasmArtifact>) -> Self {
+        self.wasm = wasm;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmArtifact {
+    pub bytes: Vec<u8>,
+    pub entry_export: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
