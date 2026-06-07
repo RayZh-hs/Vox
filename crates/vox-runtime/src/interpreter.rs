@@ -563,9 +563,7 @@ impl<'a> EvalContext<'a> {
             ExprKind::NonNull { target } => {
                 let value = self.eval_expr(target)?;
                 if matches!(value, Value::Null) {
-                    Err(EvalError::Message(
-                        "non-null assertion failed on `null`".to_owned(),
-                    ))
+                    Err(EvalError::Message("cannot unwrap null value".to_owned()))
                 } else {
                     Ok(value)
                 }
@@ -2776,12 +2774,18 @@ fn infer_runtime_type_parameter(
             }
             Ok(())
         }
-        ReplType::Nullable(expected_inner) => {
-            let ReplType::Nullable(actual_inner) = actual else {
-                return Ok(());
-            };
-            infer_runtime_type_parameter(expected_inner, actual_inner, substitutions, function_name)
-        }
+        ReplType::Nullable(expected_inner) => match actual {
+            ReplType::Null => Ok(()),
+            ReplType::Nullable(actual_inner) => infer_runtime_type_parameter(
+                expected_inner,
+                actual_inner,
+                substitutions,
+                function_name,
+            ),
+            actual => {
+                infer_runtime_type_parameter(expected_inner, actual, substitutions, function_name)
+            }
+        },
         ReplType::Named {
             name: expected_name,
             arguments: expected_arguments,

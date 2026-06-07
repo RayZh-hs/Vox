@@ -190,6 +190,7 @@ impl ReplType {
             (Self::List(left), Self::List(right))
             | (Self::Nullable(left), Self::Nullable(right))
             | (Self::Range(left), Self::Range(right)) => left.is_assignable_to(right),
+            (left, Self::Nullable(right)) => left.is_assignable_to(right),
             (
                 Self::Function {
                     parameters: left_params,
@@ -2029,12 +2030,13 @@ fn match_generic_parameter(
             };
             match_generic_parameter(expected_item, actual_item, substitutions)
         }
-        ReplType::Nullable(expected_inner) => {
-            let ReplType::Nullable(actual_inner) = actual else {
-                return Ok(false);
-            };
-            match_generic_parameter(expected_inner, actual_inner, substitutions)
-        }
+        ReplType::Nullable(expected_inner) => match actual {
+            ReplType::Null => Ok(true),
+            ReplType::Nullable(actual_inner) => {
+                match_generic_parameter(expected_inner, actual_inner, substitutions)
+            }
+            actual => match_generic_parameter(expected_inner, actual, substitutions),
+        },
         ReplType::Tuple(expected_items) => {
             let ReplType::Tuple(actual_items) = actual else {
                 return Ok(false);
