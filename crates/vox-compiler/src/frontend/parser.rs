@@ -5,11 +5,11 @@ use vox_core::{
     source::{ModuleKind, ModulePath, SurfaceHeader},
 };
 
-use crate::front_end::{
+use crate::frontend::{
     ast::{
         Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, CompilationUnit,
         CompoundAssignmentOp, CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind,
-        ForStatement, FrontEndUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
+        ForStatement, FrontendUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
         IntrinsicExpr, LambdaExpr, LambdaParameter, LocalValueDecl, Mutability, PanicStatement,
         ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField,
         ReturnStatement, StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
@@ -34,7 +34,7 @@ impl Parser {
         Self { tokens, index: 0 }
     }
 
-    pub fn parse_unit(&mut self) -> Result<FrontEndUnit, DiagnosticBag> {
+    pub fn parse_unit(&mut self) -> Result<FrontendUnit, DiagnosticBag> {
         let header = self.parse_header()?;
         self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")?;
 
@@ -75,7 +75,7 @@ impl Parser {
             if matches!(header.kind, ModuleKind::Package) {
                 self.validate_package_items(&syntax)?;
             }
-            return Ok(FrontEndUnit::from_syntax(syntax));
+            return Ok(FrontendUnit::from_syntax(syntax));
         }
 
         let end = self.current().span.end;
@@ -88,7 +88,7 @@ impl Parser {
         if matches!(header.kind, ModuleKind::Package) {
             self.validate_package_items(&syntax)?;
         }
-        Ok(FrontEndUnit::from_syntax(syntax))
+        Ok(FrontendUnit::from_syntax(syntax))
     }
 
     fn parse_header(&mut self) -> Result<SurfaceHeader, DiagnosticBag> {
@@ -1054,7 +1054,7 @@ impl Parser {
 
     fn parse_string_literal(
         &self,
-        raw: crate::front_end::lexer::LexedStringLiteral,
+        raw: crate::frontend::lexer::LexedStringLiteral,
         span: TextSpan,
     ) -> Result<StringLiteral, DiagnosticBag> {
         let mut parts = Vec::new();

@@ -1,6 +1,8 @@
+mod wasm;
+
 use vox_core::{mir::MirModule, plan::WasmArtifact};
 
-use crate::wasm_backend::{WasmBackend, WasmLowering};
+use self::wasm::{WasmBackend, WasmLowering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackendOutput {

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use vox_compiler::{CompileRequest, Compiler, FrontEndUnit};
+use vox_compiler::{CompileRequest, Compiler, FrontendUnit};
 use vox_core::{
     host::{FunctionSpec, HostRegistry, PackageManifest, ParameterSpec, Purity, TypeSpec},
     opt::OptimizationLevel,
@@ -23,8 +23,8 @@ fn compile_ok_fixtures_compile_at_all_optimization_levels() {
 fn semantic_ok_fixtures_compile_and_infer() {
     let manifests = semantic_manifests();
     for path in fixture_paths("semantic_ok") {
-        let front_end = expect_compile_success(&path);
-        infer_environment(&front_end.syntax, &manifests).unwrap_or_else(|error| {
+        let frontend = expect_compile_success(&path);
+        infer_environment(&frontend.syntax, &manifests).unwrap_or_else(|error| {
             panic!(
                 "expected `{}` to pass semantic inference, found: {error}",
                 path.display()
@@ -40,7 +40,7 @@ fn syntax_fail_fixtures_are_rejected_by_compiler() {
             let result = compile_fixture(&path, level);
             assert!(
                 result.diagnostics.has_errors(),
-                "expected `{}` to fail compiler syntax/front-end validation at {:?}",
+                "expected `{}` to fail compiler syntax/frontend validation at {:?}",
                 path.display(),
                 level
             );
@@ -52,17 +52,17 @@ fn syntax_fail_fixtures_are_rejected_by_compiler() {
 fn semantic_fail_fixtures_compile_then_fail_inference() {
     let manifests = semantic_manifests();
     for path in fixture_paths("semantic_fail") {
-        let front_end = expect_compile_success(&path);
+        let frontend = expect_compile_success(&path);
         assert!(
-            infer_environment(&front_end.syntax, &manifests).is_err(),
+            infer_environment(&frontend.syntax, &manifests).is_err(),
             "expected `{}` to fail semantic inference",
             path.display()
         );
     }
 }
 
-fn expect_compile_success(path: &Path) -> FrontEndUnit {
-    let mut front_end = None;
+fn expect_compile_success(path: &Path) -> FrontendUnit {
+    let mut frontend = None;
     for level in optimization_levels() {
         let result = compile_fixture(path, level);
         assert!(
@@ -102,11 +102,11 @@ fn expect_compile_success(path: &Path) -> FrontEndUnit {
             level
         );
         if level == OptimizationLevel::SOpt {
-            front_end = result.front_end;
+            frontend = result.frontend;
         }
     }
 
-    front_end.unwrap_or_else(|| panic!("expected `{}` to produce a front-end unit", path.display()))
+    frontend.unwrap_or_else(|| panic!("expected `{}` to produce a frontend unit", path.display()))
 }
 
 fn compile_fixture(path: &Path, optimization: OptimizationLevel) -> vox_compiler::CompileResult {

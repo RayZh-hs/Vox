@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
-use vox_compiler::front_end::{
+use vox_compiler::frontend::{
     analyze_source,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
@@ -192,14 +192,14 @@ impl<R: RuntimeRunner> SessionState<R> {
             parsed.result_source.as_deref(),
         );
 
-        let front_end = analyze_source(&SourceText::new(
+        let frontend = analyze_source(&SourceText::new(
             "<repl-submit>",
             self.next_revision(),
             &source,
         ))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
 
-        self.validate_environment(&front_end.syntax)?;
+        self.validate_environment(&frontend.syntax)?;
 
         let value = if parsed.result_source.is_some() {
             let value = self.evaluate_script_source(&source)?;
@@ -228,9 +228,9 @@ impl<R: RuntimeRunner> SessionState<R> {
         let items = merge_items(&self.items, parsed.items);
         let source = self.synthetic_source(&items, None, parsed.result_source.as_deref());
 
-        let front_end = analyze_source(&SourceText::new(path, self.next_revision(), &source))
+        let frontend = analyze_source(&SourceText::new(path, self.next_revision(), &source))
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-        self.validate_environment(&front_end.syntax)?;
+        self.validate_environment(&frontend.syntax)?;
 
         self.evaluate_script_source(&source)
     }
@@ -274,20 +274,20 @@ impl<R: RuntimeRunner> SessionState<R> {
     }
 
     pub fn restore_snapshot_source(&mut self, label: &str, text: &str) -> Result<(), SessionError> {
-        let front_end = analyze_source(&SourceText::new(label, 1, text))
+        let frontend = analyze_source(&SourceText::new(label, 1, text))
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
 
-        if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
+        if !matches!(frontend.header.kind, ModuleKind::Script { .. }) {
             return Err(SessionError::Message(
                 "snapshot must contain a script state".to_owned(),
             ));
         }
 
-        self.validate_environment(&front_end.syntax)?;
+        self.validate_environment(&frontend.syntax)?;
         self.clear_binding_handles()?;
         self.clear_hidden_last()?;
 
-        let restored = normalize_items(rebuild_items_from_unit(text, &front_end.syntax));
+        let restored = normalize_items(rebuild_items_from_unit(text, &frontend.syntax));
         let (hidden_last, items): (Vec<_>, Vec<_>) =
             restored.into_iter().partition(StoredItem::is_hidden_last);
         self.items = items;
@@ -317,11 +317,11 @@ impl<R: RuntimeRunner> SessionState<R> {
         items: &[StoredItem],
     ) -> Result<SessionModel, SessionError> {
         let source = render_session_source(items, None, None);
-        let front_end = analyze_source(&SourceText::new(label, 1, &source))
+        let frontend = analyze_source(&SourceText::new(label, 1, &source))
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-        let environment = self.validate_environment(&front_end.syntax)?;
+        let environment = self.validate_environment(&frontend.syntax)?;
         Ok(SessionModel {
-            unit: front_end.syntax,
+            unit: frontend.syntax,
             environment,
         })
     }
@@ -682,9 +682,9 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
                 .flatten(),
             Some(&rewritten.source),
         );
-        let front_end = analyze_source(&SourceText::new("<repl-type>", 1, &source))
+        let frontend = analyze_source(&SourceText::new("<repl-type>", 1, &source))
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-        let environment = infer_environment(&front_end.syntax, &self.runner.package_manifests()?)
+        let environment = infer_environment(&frontend.syntax, &self.runner.package_manifests()?)
             .map_err(compile_error)?;
         Ok(environment.result.unwrap_or(ReplType::Unit))
     }
@@ -820,18 +820,18 @@ fn environment_from_snapshot<R: RuntimeRunner>(
         },
         None,
     );
-    let front_end = analyze_source(&SourceText::new("<repl-env>", 1, &source))
+    let frontend = analyze_source(&SourceText::new("<repl-env>", 1, &source))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-    infer_environment(&front_end.syntax, &runner.package_manifests()?).map_err(compile_error)
+    infer_environment(&frontend.syntax, &runner.package_manifests()?).map_err(compile_error)
 }
 
 fn snapshot_items(
     snapshot: &str,
     include_hidden_last: bool,
 ) -> Result<Vec<StoredItem>, SessionError> {
-    let front_end = analyze_source(&SourceText::new("<repl-snapshot>", 1, snapshot))
+    let frontend = analyze_source(&SourceText::new("<repl-snapshot>", 1, snapshot))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-    let mut items = normalize_items(rebuild_items_from_unit(snapshot, &front_end.syntax));
+    let mut items = normalize_items(rebuild_items_from_unit(snapshot, &frontend.syntax));
     if !include_hidden_last {
         items.retain(|item| !item.is_hidden_last());
     }
@@ -875,21 +875,21 @@ fn parse_submission(raw: &str) -> Result<ParsedSubmission, SessionError> {
 }
 
 fn parse_external_script(path: &str, raw: &str) -> Result<ParsedSubmission, SessionError> {
-    let front_end = analyze_source(&SourceText::new(path, 1, raw))
+    let frontend = analyze_source(&SourceText::new(path, 1, raw))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
-    if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
+    if !matches!(frontend.header.kind, ModuleKind::Script { .. }) {
         return Err(SessionError::Message(
             "`:run` requires a script file".to_owned(),
         ));
     }
     Ok(ParsedSubmission {
-        items: rebuild_items_from_unit(raw, &front_end.syntax),
-        result_source: front_end
+        items: rebuild_items_from_unit(raw, &frontend.syntax),
+        result_source: frontend
             .syntax
             .result
             .as_ref()
             .map(|expr| slice_source(raw, expr)),
-        identity_name: front_end
+        identity_name: frontend
             .syntax
             .result
             .as_ref()
@@ -901,16 +901,16 @@ fn parse_external_script(path: &str, raw: &str) -> Result<ParsedSubmission, Sess
 fn parse_script_fragment(path: &str, raw: &str) -> Result<ParsedSubmission, SessionError> {
     let rewritten = rewrite_last_shorthand(raw);
     let wrapped = format!("script {REPL_MODULE};\n{}\n", rewritten.source);
-    let front_end = analyze_source(&SourceText::new(path, 1, &wrapped))
+    let frontend = analyze_source(&SourceText::new(path, 1, &wrapped))
         .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
     Ok(ParsedSubmission {
-        items: rebuild_items_from_unit(&wrapped, &front_end.syntax),
-        result_source: front_end
+        items: rebuild_items_from_unit(&wrapped, &frontend.syntax),
+        result_source: frontend
             .syntax
             .result
             .as_ref()
             .map(|expr| slice_source(&wrapped, expr)),
-        identity_name: front_end
+        identity_name: frontend
             .syntax
             .result
             .as_ref()

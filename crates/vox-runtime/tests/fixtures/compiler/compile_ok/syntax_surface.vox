@@ -5,7 +5,7 @@ public import fixtures.host;
 private import fixtures.tools;
 
 // Ordinary comments and block comments may appear where whitespace is allowed.
-/* The declarations below intentionally exercise the front-end grammar. */
+/* The declarations below intentionally exercise the frontend grammar. */
 param input: Int = 1;
 param callback: (Int, String?) -> List[Int];
 param tupled: (Int, String,);

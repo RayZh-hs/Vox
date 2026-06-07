@@ -7,7 +7,7 @@ use std::{
 
 use vox_compiler::{
     TreewalkScript,
-    front_end::ast::{
+    frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability, ParamDecl, Parameter,
         QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart, TopLevelItem,
@@ -1020,7 +1020,7 @@ impl<'a> EvalContext<'a> {
         }))
     }
 
-    fn eval_if(&mut self, expr: &vox_compiler::front_end::ast::IfExpr) -> Result<Value, EvalError> {
+    fn eval_if(&mut self, expr: &vox_compiler::frontend::ast::IfExpr) -> Result<Value, EvalError> {
         for branch in &expr.branches {
             let condition = self.eval_expr(&branch.condition)?;
             if self.expect_bool(condition, "if condition")? {
@@ -1037,7 +1037,7 @@ impl<'a> EvalContext<'a> {
 
     fn eval_when(
         &mut self,
-        expr: &vox_compiler::front_end::ast::WhenExpr,
+        expr: &vox_compiler::frontend::ast::WhenExpr,
     ) -> Result<Value, EvalError> {
         let subject = self.eval_expr(&expr.subject)?;
         for arm in &expr.arms {
@@ -1147,7 +1147,7 @@ impl<'a> EvalContext<'a> {
 
     fn eval_for(
         &mut self,
-        statement: &vox_compiler::front_end::ast::ForStatement,
+        statement: &vox_compiler::frontend::ast::ForStatement,
     ) -> Result<(), EvalError> {
         let iterable = self.eval_expr(&statement.iterable)?;
         let items = self.expand_iterable(iterable)?;
@@ -1358,7 +1358,7 @@ impl<'a> EvalContext<'a> {
 
     fn capture_lambda_bindings(
         &self,
-        lambda: &vox_compiler::front_end::ast::LambdaExpr,
+        lambda: &vox_compiler::frontend::ast::LambdaExpr,
     ) -> Result<BTreeMap<String, Value>, EvalError> {
         let parameter_names = lambda
             .parameters
@@ -2501,7 +2501,7 @@ fn assign_host_arguments(
 }
 
 fn runtime_generic_type_scope(
-    parameters: &[vox_compiler::front_end::ast::GenericParameter],
+    parameters: &[vox_compiler::frontend::ast::GenericParameter],
 ) -> BTreeMap<String, String> {
     parameters
         .iter()

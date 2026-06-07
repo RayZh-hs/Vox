@@ -7,7 +7,7 @@ load and execute.
 
 Compilation runs through these phases:
 
-1. Parse source into the front-end syntax tree.
+1. Parse source into the frontend syntax tree.
 2. Analyze the source: resolve imports, declarations, names, calls, types,
    purity, captures, and script parameters.
 3. Lower executable bodies into [MIR](mir/README.md).
@@ -22,7 +22,7 @@ can be inspected and later lowered to wasm without changing source semantics.
 
 A successful compilation produces:
 
-- the parsed front-end representation;
+- the parsed frontend representation;
 - a compiled artifact with module identity, parameter metadata, purity, and
   optimization rankings;
 - MIR for executable script, function, and initializer bodies;

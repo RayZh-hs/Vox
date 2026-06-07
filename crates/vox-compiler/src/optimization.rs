@@ -10,8 +10,8 @@ use crate::mir::{
     remove_dead_pure_ops, reuse_value_slots, seal_module,
 };
 
-use crate::front_end::{
-    FrontEndUnit,
+use crate::frontend::{
+    FrontendUnit,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
         CompoundAssignmentStatement, Expr, ExprKind, ForStatement, FunctionDecl, IfExpr,
@@ -109,16 +109,16 @@ impl OptimizationPipeline {
 }
 
 pub fn derive_rankings(
-    front_end: &FrontEndUnit,
+    frontend: &FrontendUnit,
     level: OptimizationLevel,
 ) -> Vec<OptimizationRanking> {
     let mut rankings = Vec::new();
     rankings.push(OptimizationRanking {
         subject: OptimizationSubject::Module,
-        rank: rank_module(&front_end.syntax, level),
+        rank: rank_module(&frontend.syntax, level),
     });
 
-    for function in front_end.syntax.items.iter().filter_map(|item| match item {
+    for function in frontend.syntax.items.iter().filter_map(|item| match item {
         TopLevelItem::Function(function) => Some(function),
         _ => None,
     }) {

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use vox_compiler::front_end::{
+use vox_compiler::frontend::{
     analyze_source,
     ast::{BlockItem, CompilationUnit, TopLevelItem},
 };
@@ -118,7 +118,7 @@ fn parse_fragment_items(raw: &str) -> Result<Vec<EditableItem>, String> {
 
 fn parse_unit(label: &str, source: &str) -> Result<CompilationUnit, String> {
     analyze_source(&SourceText::new(label, 1, source))
-        .map(|front_end| front_end.syntax)
+        .map(|frontend| frontend.syntax)
         .map_err(|diagnostics| diagnostics.to_string())
 }
 

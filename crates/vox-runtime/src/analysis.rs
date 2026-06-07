@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use vox_compiler::front_end::ast::{
+use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
     Expr, ExprKind, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
     StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
@@ -1967,7 +1967,7 @@ fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
 }
 
 fn generic_parameter_scope(
-    parameters: &[vox_compiler::front_end::ast::GenericParameter],
+    parameters: &[vox_compiler::frontend::ast::GenericParameter],
 ) -> BTreeMap<String, GenericParameterSummary> {
     parameters
         .iter()

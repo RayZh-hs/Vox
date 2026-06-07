@@ -10,7 +10,7 @@ use vox_core::{
 };
 
 use crate::backend::BackendPipeline;
-use crate::front_end::{FrontEndUnit, analyze_source};
+use crate::frontend::{FrontendUnit, analyze_source};
 use crate::mir::{MirPassFn, lower_mir};
 use crate::optimization::{OptimizationPipeline, derive_rankings};
 use crate::treewalk::TreewalkScript;
@@ -25,7 +25,7 @@ pub struct CompileRequest {
 #[derive(Debug, Clone)]
 pub struct CompileResult {
     pub artifact: Option<CompiledArtifact>,
-    pub front_end: Option<FrontEndUnit>,
+    pub frontend: Option<FrontendUnit>,
     pub treewalk: Option<TreewalkScript>,
     pub diagnostics: DiagnosticBag,
 }
@@ -46,9 +46,9 @@ impl Compiler {
         custom_mir_passes: &[MirPassFn],
     ) -> CompileResult {
         match analyze_source(&request.source) {
-            Ok(front_end) => {
-                let treewalk = TreewalkScript::lower(&front_end).ok();
-                let optimization_rankings = derive_rankings(&front_end, request.optimization);
+            Ok(frontend) => {
+                let treewalk = TreewalkScript::lower(&frontend).ok();
+                let optimization_rankings = derive_rankings(&frontend, request.optimization);
                 let module_rank = optimization_rankings
                     .iter()
                     .find_map(|ranking| match &ranking.subject {
@@ -56,7 +56,7 @@ impl Compiler {
                         OptimizationSubject::Function(_) => None,
                     })
                     .expect("module ranking should always be present");
-                let mut mir = lower_mir(&front_end, request.optimization, &optimization_rankings);
+                let mut mir = lower_mir(&frontend, request.optimization, &optimization_rankings);
                 let mut optimization_summary =
                     OptimizationPipeline::for_level(request.optimization)
                         .run(&mut mir, custom_mir_passes);
@@ -64,11 +64,11 @@ impl Compiler {
                 optimization_summary.extend(backend.summaries);
                 let artifact = CompiledArtifact {
                     id: ArtifactId(self.next_artifact_id.fetch_add(1, Ordering::Relaxed) + 1),
-                    module: front_end.header.module.clone(),
-                    kind: front_end.header.kind,
+                    module: frontend.header.module.clone(),
+                    kind: frontend.header.kind,
                     optimization: request.optimization,
                     optimization_rankings,
-                    parameters: front_end
+                    parameters: frontend
                         .parameters
                         .iter()
                         .cloned()
@@ -76,7 +76,7 @@ impl Compiler {
                         .collect(),
                     result_type: None,
                     purity: if matches!(
-                        front_end.header.kind,
+                        frontend.header.kind,
                         vox_core::source::ModuleKind::Script { evil: true }
                     ) {
                         Purity::Evil
@@ -94,14 +94,14 @@ impl Compiler {
 
                 CompileResult {
                     artifact: Some(artifact),
-                    front_end: Some(front_end),
+                    frontend: Some(frontend),
                     treewalk,
                     diagnostics: DiagnosticBag::default(),
                 }
             }
             Err(diagnostics) => CompileResult {
                 artifact: None,
-                front_end: None,
+                frontend: None,
                 treewalk: None,
                 diagnostics,
             },

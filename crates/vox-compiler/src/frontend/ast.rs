@@ -49,13 +49,13 @@ impl SurfaceParameter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrontEndUnit {
+pub struct FrontendUnit {
     pub header: SurfaceHeader,
     pub parameters: Vec<SurfaceParameter>,
     pub syntax: CompilationUnit,
 }
 
-impl FrontEndUnit {
+impl FrontendUnit {
     pub fn from_syntax(syntax: CompilationUnit) -> Self {
         let parameters = syntax
             .items

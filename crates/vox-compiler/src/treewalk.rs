@@ -1,7 +1,7 @@
 use vox_core::{diagnostics::DiagnosticBag, source::ModuleKind};
 
-use crate::front_end::{
-    FrontEndUnit,
+use crate::frontend::{
+    FrontendUnit,
     ast::{CompilationUnit, FunctionDecl, ImportDecl, ParamDecl, TopLevelItem, ValueDecl},
 };
 
@@ -15,8 +15,8 @@ pub struct TreewalkScript {
 }
 
 impl TreewalkScript {
-    pub fn lower(front_end: &FrontEndUnit) -> Result<Self, DiagnosticBag> {
-        if !matches!(front_end.header.kind, ModuleKind::Script { .. }) {
+    pub fn lower(frontend: &FrontendUnit) -> Result<Self, DiagnosticBag> {
+        if !matches!(frontend.header.kind, ModuleKind::Script { .. }) {
             return Err(DiagnosticBag::from(vec![
                 vox_core::diagnostics::Diagnostic::error(
                     "tree-walk execution is only available for scripts",
@@ -29,7 +29,7 @@ impl TreewalkScript {
         let mut values = Vec::new();
         let mut functions = Vec::new();
 
-        for item in &front_end.syntax.items {
+        for item in &frontend.syntax.items {
             match item {
                 TopLevelItem::Import(import) => imports.push(import.clone()),
                 TopLevelItem::Param(param) => parameters.push(param.clone()),
@@ -40,7 +40,7 @@ impl TreewalkScript {
         }
 
         Ok(Self {
-            syntax: front_end.syntax.clone(),
+            syntax: frontend.syntax.clone(),
             imports,
             parameters,
             values,

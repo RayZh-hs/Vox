@@ -15,8 +15,8 @@ use vox_core::{
     value::InlineValue,
 };
 
-use crate::front_end::{
-    FrontEndUnit,
+use crate::frontend::{
+    FrontendUnit,
     ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
         ExprKind, FunctionDecl, IfExpr, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
@@ -35,15 +35,15 @@ pub struct MirPassReport {
 }
 
 pub(crate) fn lower_mir(
-    front_end: &FrontEndUnit,
+    frontend: &FrontendUnit,
     optimization: OptimizationLevel,
     rankings: &[vox_core::opt::OptimizationRanking],
 ) -> MirModule {
-    MirLowerer::new(front_end, optimization, rankings).lower_module()
+    MirLowerer::new(frontend, optimization, rankings).lower_module()
 }
 
 struct MirLowerer<'a> {
-    front_end: &'a FrontEndUnit,
+    frontend: &'a FrontendUnit,
     optimization: OptimizationLevel,
     rankings: &'a [vox_core::opt::OptimizationRanking],
     next_body: u32,
@@ -51,12 +51,12 @@ struct MirLowerer<'a> {
 
 impl<'a> MirLowerer<'a> {
     fn new(
-        front_end: &'a FrontEndUnit,
+        frontend: &'a FrontendUnit,
         optimization: OptimizationLevel,
         rankings: &'a [vox_core::opt::OptimizationRanking],
     ) -> Self {
         Self {
-            front_end,
+            frontend,
             optimization,
             rankings,
             next_body: 0,
@@ -65,15 +65,15 @@ impl<'a> MirLowerer<'a> {
 
     fn lower_module(mut self) -> MirModule {
         let mut bodies = Vec::new();
-        if matches!(self.front_end.header.kind, ModuleKind::Script { .. }) {
-            bodies.push(self.lower_script_entry(&self.front_end.syntax));
+        if matches!(self.frontend.header.kind, ModuleKind::Script { .. }) {
+            bodies.push(self.lower_script_entry(&self.frontend.syntax));
         }
 
-        for item in &self.front_end.syntax.items {
+        for item in &self.frontend.syntax.items {
             match item {
                 TopLevelItem::Function(function) => bodies.push(self.lower_function(function)),
                 TopLevelItem::Value(value)
-                    if matches!(self.front_end.header.kind, ModuleKind::Package) =>
+                    if matches!(self.frontend.header.kind, ModuleKind::Package) =>
                 {
                     bodies.push(self.lower_value_initializer(value));
                 }
@@ -82,8 +82,8 @@ impl<'a> MirLowerer<'a> {
         }
 
         MirModule {
-            module: self.front_end.header.module.clone(),
-            kind: self.front_end.header.kind,
+            module: self.frontend.header.module.clone(),
+            kind: self.frontend.header.kind,
             optimization: self.optimization,
             bodies,
         }
@@ -103,7 +103,7 @@ impl<'a> MirLowerer<'a> {
             Some(unit.span.clone()),
         );
 
-        for parameter in &self.front_end.parameters {
+        for parameter in &self.frontend.parameters {
             let value = body.new_value(
                 Some(parameter.ty.clone()),
                 MirValueDefinition::Parameter(parameter.name.clone()),
