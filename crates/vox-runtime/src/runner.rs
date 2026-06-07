@@ -113,6 +113,16 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RunnerError>;
 
+    fn run_script_with_xopt(
+        &self,
+        artifact_id: ArtifactId,
+        arguments: &[RuntimeValue],
+        xopt: Option<OptimizationLevel>,
+    ) -> Result<RuntimeValue, RunnerError> {
+        let _ = xopt;
+        self.run_script(artifact_id, arguments)
+    }
+
     fn retain_handle(&self, handle: HandleId) -> Result<bool, RunnerError>;
 
     fn describe_handle(&self, handle: HandleId) -> Result<Option<HandleSummary>, RunnerError>;
@@ -466,9 +476,18 @@ impl RuntimeRunner for EmbeddedRunner {
         artifact_id: ArtifactId,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RunnerError> {
+        self.run_script_with_xopt(artifact_id, arguments, None)
+    }
+
+    fn run_script_with_xopt(
+        &self,
+        artifact_id: ArtifactId,
+        arguments: &[RuntimeValue],
+        xopt: Option<OptimizationLevel>,
+    ) -> Result<RuntimeValue, RunnerError> {
         self.with_runtime(|runtime| {
             runtime
-                .run_script(artifact_id, arguments)
+                .run_script_with_xopt(artifact_id, arguments, xopt)
                 .map_err(Into::into)
         })
     }

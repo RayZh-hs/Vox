@@ -78,6 +78,29 @@ fn expect_compile_success(path: &Path) -> FrontEndUnit {
             path.display(),
             level
         );
+        let artifact = result
+            .artifact
+            .as_ref()
+            .expect("artifact presence should have been checked");
+        assert!(
+            artifact
+                .mir
+                .as_ref()
+                .is_some_and(|mir| !mir.bodies.is_empty()),
+            "expected `{}` to emit MIR at {:?}",
+            path.display(),
+            level
+        );
+        assert!(
+            artifact
+                .plan
+                .mir_text
+                .as_ref()
+                .is_some_and(|text| text.contains("body @")),
+            "expected `{}` to expose MIR text at {:?}",
+            path.display(),
+            level
+        );
         if level == OptimizationLevel::SOpt {
             front_end = result.front_end;
         }

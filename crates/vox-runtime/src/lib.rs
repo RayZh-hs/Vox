@@ -305,11 +305,24 @@ impl Runtime {
         artifact_id: ArtifactId,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RuntimeError> {
+        self.run_script_with_xopt(artifact_id, arguments, None)
+    }
+
+    pub fn run_script_with_xopt(
+        &mut self,
+        artifact_id: ArtifactId,
+        arguments: &[RuntimeValue],
+        xopt: Option<OptimizationLevel>,
+    ) -> Result<RuntimeValue, RuntimeError> {
         let artifact = self
             .artifacts
             .get(artifact_id)
             .cloned()
             .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
+        let mut artifact = artifact;
+        if let Some(xopt) = xopt {
+            artifact.optimization = xopt;
+        }
 
         if !matches!(artifact.kind, ModuleKind::Script { .. }) {
             return Err(RuntimeError::NotAScript(artifact_id));
@@ -530,6 +543,7 @@ fn qualified_host_name(package: &ModulePath, function: &str) -> String {
 mod tests {
     use super::{EmbeddedRunner, InteractiveSession, Runtime};
     use vox_core::{
+        opt::OptimizationLevel,
         source::SourceText,
         value::{InlineValue, RuntimeValue},
     };
@@ -542,6 +556,37 @@ mod tests {
             .load_script(source, None)
             .expect("script should load");
         assert!(runtime.artifact(artifact_id).is_some());
+    }
+
+    #[test]
+    fn run_script_xopt_override_preserves_behavior() {
+        let mut runtime = Runtime::default();
+        let source = SourceText::new(
+            "demo.vox",
+            1,
+            r#"script voxini.opt;
+param input: Int = 2;
+val point = { x = input, y = input + 1, };
+val moved = point.updated(x = point.y + 1);
+moved.x + moved.y
+"#,
+        );
+        let artifact_id = runtime
+            .load_script(source, Some(OptimizationLevel::IOpt))
+            .expect("script should load");
+
+        for xopt in [
+            OptimizationLevel::NOpt,
+            OptimizationLevel::IOpt,
+            OptimizationLevel::SOpt,
+        ] {
+            assert_runtime_int(
+                runtime
+                    .run_script_with_xopt(artifact_id, &[], Some(xopt))
+                    .expect("script should run with optimization override"),
+                7,
+            );
+        }
     }
 
     #[test]

@@ -12,7 +12,8 @@
     - [Effects and Execution](spec/effects-and-execution.md)
 
 - [The Vox Ecosystem](system/README.md)
-  - [Compiler](system/compiler.md)
+  - [Compiler](system/compiler/README.md)
+    - [MIR](system/compiler/mir/README.md)
   - [Runtime](system/runtime/README.md)
     - [Protocol](system/runtime/protocol.md)
   - [REPL](system/repl.md)

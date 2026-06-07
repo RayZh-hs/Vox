@@ -10,6 +10,7 @@ use vox_core::{
 };
 
 use crate::front_end::{FrontEndUnit, analyze_source};
+use crate::mir::{MirPassFn, lower_and_optimize_mir};
 use crate::optimization::derive_rankings;
 use crate::treewalk::TreewalkScript;
 
@@ -35,6 +36,14 @@ pub struct Compiler {
 
 impl Compiler {
     pub fn compile(&self, request: CompileRequest) -> CompileResult {
+        self.compile_with_mir_passes(request, &[])
+    }
+
+    pub fn compile_with_mir_passes(
+        &self,
+        request: CompileRequest,
+        custom_mir_passes: &[MirPassFn],
+    ) -> CompileResult {
         match analyze_source(&request.source) {
             Ok(front_end) => {
                 let treewalk = TreewalkScript::lower(&front_end).ok();
@@ -46,6 +55,12 @@ impl Compiler {
                         OptimizationSubject::Function(_) => None,
                     })
                     .expect("module ranking should always be present");
+                let (mir, optimization_summary) = lower_and_optimize_mir(
+                    &front_end,
+                    request.optimization,
+                    &optimization_rankings,
+                    custom_mir_passes,
+                );
                 let artifact = CompiledArtifact {
                     id: ArtifactId(self.next_artifact_id.fetch_add(1, Ordering::Relaxed) + 1),
                     module: front_end.header.module.clone(),
@@ -67,7 +82,9 @@ impl Compiler {
                     } else {
                         Purity::Pure
                     },
-                    plan: ExecutablePlan::deferred(module_rank),
+                    plan: ExecutablePlan::deferred(module_rank)
+                        .with_mir(&mir, optimization_summary),
+                    mir: Some(mir),
                     diagnostics: DiagnosticBag::default(),
                     dependencies: collect_dependencies(&request),
                     source_revision: request.source.origin.revision,

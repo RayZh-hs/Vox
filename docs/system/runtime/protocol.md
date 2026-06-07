@@ -542,8 +542,9 @@ Current runtime behavior:
 
 - `SET_XOPT` updates the connection default used by later `LOAD_SCRIPT` and
   `RELOAD_SCRIPT` requests;
-- `RUN_SCRIPT` currently supports only `xopt_override = 255`, because
-  execution uses the optimization mode compiled into the loaded artifact.
+- `RUN_SCRIPT` may use `xopt_override = 255` to execute with the artifact's
+  compiled optimization level, or `0`, `1`, or `2` for a one-off run override.
+  The tree-walk fallback preserves source behavior for all modes.
 
 ### `RUN_SCRIPT`
 

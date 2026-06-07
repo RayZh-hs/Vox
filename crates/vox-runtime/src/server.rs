@@ -820,12 +820,18 @@ impl RuntimeConnection {
         let mut payload = PayloadReader::new(&frame.payload);
         let xopt_override = payload.read_u8().map_err(WireFailure::bad_argument)?;
         self.read_reserved(&mut payload, 3)?;
-        if xopt_override != u8::MAX {
-            return Err(WireFailure::recoverable(
-                ErrorCode::UnsupportedOpcode,
-                "RUN_SCRIPT optimization overrides are not implemented yet",
-            ));
-        }
+        let xopt_override = match xopt_override {
+            u8::MAX => None,
+            0 => Some(vox_core::opt::OptimizationLevel::NOpt),
+            1 => Some(vox_core::opt::OptimizationLevel::IOpt),
+            2 => Some(vox_core::opt::OptimizationLevel::SOpt),
+            _ => {
+                return Err(WireFailure::recoverable(
+                    ErrorCode::BadArgument,
+                    "invalid RUN_SCRIPT optimization override",
+                ));
+            }
+        };
 
         let argument_count = payload.read_u32().map_err(WireFailure::bad_argument)? as usize;
         let mut arguments = Vec::with_capacity(argument_count);
@@ -836,7 +842,7 @@ impl RuntimeConnection {
 
         let result = self
             .runner
-            .run_script(artifact_id, &arguments)
+            .run_script_with_xopt(artifact_id, &arguments, xopt_override)
             .map_err(WireFailure::from_runner)?;
         self.encode_value_result(
             Opcode::RunScript,

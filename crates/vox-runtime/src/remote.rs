@@ -494,9 +494,21 @@ impl RuntimeRunner for RemoteRunner {
         artifact_id: ArtifactId,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, RunnerError> {
+        self.run_script_with_xopt(artifact_id, arguments, None)
+    }
+
+    fn run_script_with_xopt(
+        &self,
+        artifact_id: ArtifactId,
+        arguments: &[RuntimeValue],
+        xopt: Option<OptimizationLevel>,
+    ) -> Result<RuntimeValue, RunnerError> {
         let target_id = self.to_wire_id(artifact_id.0, "script")?;
         let mut payload = PayloadWriter::new();
-        payload.write_u8(u8::MAX);
+        match xopt {
+            Some(xopt) => encode_optimization(&mut payload, xopt),
+            None => payload.write_u8(u8::MAX),
+        }
         payload.write_u8(0);
         payload.write_u8(0);
         payload.write_u8(0);

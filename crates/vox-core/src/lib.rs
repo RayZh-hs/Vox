@@ -5,6 +5,7 @@ pub mod external_export;
 pub mod external_library;
 pub mod host;
 pub mod ids;
+pub mod mir;
 pub mod opt;
 pub mod plan;
 pub mod source;
