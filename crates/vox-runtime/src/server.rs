@@ -10,14 +10,15 @@ use std::{
 use thiserror::Error;
 use vox_core::{
     ids::{ArtifactId, HandleId, LibraryId, SessionId},
-    opt::OptimizationLevel,
+    opt::OptimizationRank,
     source::SourceText,
     value::{InlineValue, RuntimeValue},
 };
 
 use crate::{
-    CacheClearScope, EmbeddedRunner, RunnerError, Runtime, RuntimeError, RuntimeRunner,
-    SessionOpenMode, SessionOpenRequest, SessionSelector,
+    CacheClearScope, EmbeddedRunner, OptimizationDump, OptimizationDumpKind, OptimizationSettings,
+    OptimizationStatus, RunnerError, Runtime, RuntimeError, RuntimeRunner, SessionOpenMode,
+    SessionOpenRequest, SessionSelector,
     protocol::{
         CURRENT_PROTOCOL_VERSION, DEFAULT_INLINE_VALUE_BYTES, ErrorCode, FLAG_HANDLE_RESULT,
         FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter, ProtocolError,
@@ -106,6 +107,65 @@ struct NegotiatedProtocol {
 struct HandleLease {
     actual: HandleId,
     owned_refs: u32,
+}
+
+fn encode_optimization_statuses(
+    writer: &mut PayloadWriter,
+    statuses: &[OptimizationStatus],
+) -> Result<(), ProtocolError> {
+    writer.write_u32(
+        u32::try_from(statuses.len())
+            .map_err(|_| ProtocolError::message("optimization status count exceeds u32"))?,
+    );
+    for status in statuses {
+        writer.write_string(&status.object)?;
+        crate::protocol::encode_optimization(writer, status.requested);
+        writer.write_u8(match status.rank {
+            None => 0,
+            Some(OptimizationRank::Baseline) => 1,
+            Some(OptimizationRank::Interactive) => 2,
+            Some(OptimizationRank::SealedOwnership) => 3,
+            Some(OptimizationRank::SealedDemand) => 4,
+            Some(OptimizationRank::SealedMaterialization) => 5,
+        });
+        writer.write_u8(u8::from(status.artifact.is_some()));
+        writer.write_u8(u8::from(status.mir_available));
+        writer.write_u8(u8::from(status.wasm_available));
+        if let Some(artifact) = status.artifact {
+            writer.write_u32(u32::try_from(artifact.0).map_err(|_| {
+                ProtocolError::message("artifact id exceeds the 32-bit protocol range")
+            })?);
+        }
+    }
+    Ok(())
+}
+
+fn encode_optimization_dump(
+    writer: &mut PayloadWriter,
+    dump: Option<&OptimizationDump>,
+) -> Result<(), ProtocolError> {
+    let Some(dump) = dump else {
+        writer.write_u8(0);
+        writer.write_u8(0);
+        writer.write_u8(0);
+        writer.write_u8(0);
+        return Ok(());
+    };
+
+    writer.write_u8(1);
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_u8(match dump.kind {
+        OptimizationDumpKind::Mir => 0,
+        OptimizationDumpKind::Wasm => 1,
+    });
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_string(&dump.object)?;
+    writer.write_string(&dump.text)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -242,6 +302,9 @@ impl RuntimeConnection {
             Opcode::RestoreSession => self.handle_restore_session(frame),
             Opcode::RunSessionScript => self.handle_run_session_script(frame),
             Opcode::SetSessionXOpt => self.handle_set_session_xopt(frame),
+            Opcode::SetSessionOpt => self.handle_set_session_opt(frame),
+            Opcode::GetSessionOpt => self.handle_get_session_opt(frame),
+            Opcode::DumpSessionOpt => self.handle_dump_session_opt(frame),
             Opcode::CloseSession => self.handle_close_session(frame),
             Opcode::ListSessions => self.handle_list_sessions(frame),
             Opcode::SetSessionReserved => self.handle_set_session_reserved(frame),
@@ -255,6 +318,8 @@ impl RuntimeConnection {
             Opcode::UnloadScript => self.handle_unload_script(frame),
             Opcode::SetXOpt => self.handle_set_xopt(frame),
             Opcode::RunScript => self.handle_run_script(frame),
+            Opcode::GetOpt => self.handle_get_opt(frame),
+            Opcode::DumpOpt => self.handle_dump_opt(frame),
             Opcode::RetainHandle => self.handle_retain_handle(frame),
             Opcode::DescribeHandle => self.handle_describe_handle(frame),
             Opcode::ReleaseHandle => self.handle_release_handle(frame),
@@ -660,6 +725,79 @@ impl RuntimeConnection {
         .map_err(WireFailure::bad_argument)
     }
 
+    fn handle_set_session_opt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let xopt = decode_optimization(&mut payload).map_err(WireFailure::bad_argument)?;
+        self.read_reserved(&mut payload, 3)?;
+        let objects = self.decode_string_list(&mut payload)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        self.runner
+            .set_session_optimization(session_id, xopt, &objects)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::SetSessionOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_get_session_opt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let has_object = payload.read_u8().map_err(WireFailure::bad_argument)? != 0;
+        self.read_reserved(&mut payload, 3)?;
+        let object = if has_object {
+            Some(payload.read_string().map_err(WireFailure::bad_argument)?)
+        } else {
+            None
+        };
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        let statuses = self
+            .runner
+            .session_optimization_status(session_id, object.as_deref())
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        encode_optimization_statuses(&mut response, &statuses)
+            .map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::GetSessionOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_dump_session_opt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let session_id = self.resolve_session(frame.header.target_id)?;
+        let (kind, object) = self.decode_dump_request(&frame.payload)?;
+        let dump = self
+            .runner
+            .session_optimization_dump(session_id, &object, kind)
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        encode_optimization_dump(&mut response, dump.as_ref())
+            .map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::DumpSessionOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
     fn handle_mount_library(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
         let mut payload = PayloadReader::new(&frame.payload);
         let source_kind = payload.read_u8().map_err(WireFailure::bad_argument)?;
@@ -707,11 +845,11 @@ impl RuntimeConnection {
     }
 
     fn handle_load_script(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
-        let (source, xopt) = self.decode_script_source(&frame.payload)?;
+        let (source, settings) = self.decode_script_source(&frame.payload)?;
         let (artifact_id, source_revision, parameter_count) = self
             .runner
             .with_runtime(|runtime| {
-                let artifact_id = runtime.load_script(source, Some(xopt))?;
+                let artifact_id = runtime.load_script_with_settings(source, settings)?;
                 let artifact = runtime
                     .artifact(artifact_id)
                     .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
@@ -741,11 +879,11 @@ impl RuntimeConnection {
 
     fn handle_reload_script(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
         let artifact_id = self.resolve_script(frame.header.target_id)?;
-        let (source, xopt) = self.decode_script_source(&frame.payload)?;
+        let (source, settings) = self.decode_script_source(&frame.payload)?;
         let (source_revision, parameter_count) = self
             .runner
             .with_runtime(|runtime| {
-                runtime.reload_script_with_xopt(artifact_id, source, xopt)?;
+                runtime.reload_script_with_settings(artifact_id, source, settings)?;
                 let artifact = runtime
                     .artifact(artifact_id)
                     .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
@@ -850,6 +988,48 @@ impl RuntimeConnection {
             frame.header.target_id,
             result,
         )
+    }
+
+    fn handle_get_opt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let artifact_id = self.resolve_script(frame.header.target_id)?;
+        let settings = self.decode_optimization_settings(&frame.payload)?;
+        let statuses = self
+            .runner
+            .optimization_status(artifact_id, &settings)
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        encode_optimization_statuses(&mut response, &statuses)
+            .map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::GetOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_dump_opt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let artifact_id = self.resolve_script(frame.header.target_id)?;
+        let (kind, object) = self.decode_dump_request(&frame.payload)?;
+        let dump = self
+            .runner
+            .optimization_dump(artifact_id, &object, kind)
+            .map_err(WireFailure::from_runner)?;
+        let mut response = PayloadWriter::new();
+        encode_optimization_dump(&mut response, dump.as_ref())
+            .map_err(WireFailure::bad_argument)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::DumpOpt,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
     }
 
     fn handle_retain_handle(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
@@ -1070,11 +1250,13 @@ impl RuntimeConnection {
     fn decode_script_source(
         &mut self,
         payload_bytes: &[u8],
-    ) -> Result<(SourceText, OptimizationLevel), WireFailure> {
+    ) -> Result<(SourceText, OptimizationSettings), WireFailure> {
         let mut payload = PayloadReader::new(payload_bytes);
         let source_kind = payload.read_u8().map_err(WireFailure::bad_argument)?;
         let xopt = decode_optimization(&mut payload).map_err(WireFailure::bad_argument)?;
         self.read_reserved(&mut payload, 2)?;
+        let mut settings = self.decode_optimization_settings_from_reader(&mut payload)?;
+        settings.default = xopt;
         let logical_path = payload.read_string().map_err(WireFailure::bad_argument)?;
         let source = payload.read_bytes().map_err(WireFailure::bad_argument)?;
         payload.finish().map_err(WireFailure::bad_argument)?;
@@ -1092,8 +1274,68 @@ impl RuntimeConnection {
         self.next_source_revision += 1;
         Ok((
             SourceText::new(logical_path, self.next_source_revision, source),
-            xopt,
+            settings,
         ))
+    }
+
+    fn decode_optimization_settings(
+        &self,
+        payload_bytes: &[u8],
+    ) -> Result<OptimizationSettings, WireFailure> {
+        let mut payload = PayloadReader::new(payload_bytes);
+        let settings = self.decode_optimization_settings_from_reader(&mut payload)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+        Ok(settings)
+    }
+
+    fn decode_optimization_settings_from_reader(
+        &self,
+        payload: &mut PayloadReader<'_>,
+    ) -> Result<OptimizationSettings, WireFailure> {
+        let default = decode_optimization(payload).map_err(WireFailure::bad_argument)?;
+        self.read_reserved(payload, 3)?;
+        let count = payload.read_u32().map_err(WireFailure::bad_argument)?;
+        let mut overrides = BTreeMap::new();
+        for _ in 0..count {
+            let object = payload.read_string().map_err(WireFailure::bad_argument)?;
+            let xopt = decode_optimization(payload).map_err(WireFailure::bad_argument)?;
+            self.read_reserved(payload, 3)?;
+            overrides.insert(object, xopt);
+        }
+        Ok(OptimizationSettings { default, overrides })
+    }
+
+    fn decode_string_list(
+        &self,
+        payload: &mut PayloadReader<'_>,
+    ) -> Result<Vec<String>, WireFailure> {
+        let count = payload.read_u32().map_err(WireFailure::bad_argument)? as usize;
+        let mut values = Vec::with_capacity(count);
+        for _ in 0..count {
+            values.push(payload.read_string().map_err(WireFailure::bad_argument)?);
+        }
+        Ok(values)
+    }
+
+    fn decode_dump_request(
+        &self,
+        payload_bytes: &[u8],
+    ) -> Result<(OptimizationDumpKind, String), WireFailure> {
+        let mut payload = PayloadReader::new(payload_bytes);
+        let kind = match payload.read_u8().map_err(WireFailure::bad_argument)? {
+            0 => OptimizationDumpKind::Mir,
+            1 => OptimizationDumpKind::Wasm,
+            _ => {
+                return Err(WireFailure::recoverable(
+                    ErrorCode::BadArgument,
+                    "invalid optimization dump kind",
+                ));
+            }
+        };
+        self.read_reserved(&mut payload, 3)?;
+        let object = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+        Ok((kind, object))
     }
 
     fn decode_runtime_value(

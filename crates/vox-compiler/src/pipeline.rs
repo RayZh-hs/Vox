@@ -1,4 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use vox_core::{
     diagnostics::DiagnosticBag,
@@ -19,6 +22,7 @@ use crate::treewalk::TreewalkScript;
 pub struct CompileRequest {
     pub source: SourceText,
     pub optimization: OptimizationLevel,
+    pub optimization_overrides: BTreeMap<String, OptimizationLevel>,
     pub host: HostRegistry,
 }
 
@@ -48,7 +52,16 @@ impl Compiler {
         match analyze_source(&request.source) {
             Ok(frontend) => {
                 let treewalk = TreewalkScript::lower(&frontend).ok();
-                let optimization_rankings = derive_rankings(&frontend, request.optimization);
+                let pipeline_optimization = request
+                    .optimization_overrides
+                    .values()
+                    .copied()
+                    .fold(request.optimization, Ord::max);
+                let optimization_rankings = derive_rankings(
+                    &frontend,
+                    request.optimization,
+                    &request.optimization_overrides,
+                );
                 let module_rank = optimization_rankings
                     .iter()
                     .find_map(|ranking| match &ranking.subject {
@@ -58,7 +71,7 @@ impl Compiler {
                     .expect("module ranking should always be present");
                 let mut mir = lower_mir(&frontend, request.optimization, &optimization_rankings);
                 let mut optimization_summary =
-                    OptimizationPipeline::for_level(request.optimization)
+                    OptimizationPipeline::for_level(pipeline_optimization)
                         .run(&mut mir, custom_mir_passes);
                 let backend = BackendPipeline::default().lower(&mir);
                 optimization_summary.extend(backend.summaries);

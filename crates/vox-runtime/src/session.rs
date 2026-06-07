@@ -20,7 +20,8 @@ use vox_core::{
 };
 
 use crate::{
-    HandleDataChunk, ReplType, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    HandleDataChunk, OptimizationDump, OptimizationDumpKind, OptimizationSettings,
+    OptimizationStatus, ReplType, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
     SessionSelector, SessionSummary, TypeEnvironment, extend_manifest_symbols, infer_environment,
     language_keywords,
 };
@@ -157,6 +158,7 @@ pub(crate) struct SessionState<R: RuntimeRunner> {
     next_source_revision: u64,
     active_artifact: Option<ArtifactId>,
     default_xopt: OptimizationLevel,
+    opt_overrides: BTreeMap<String, OptimizationLevel>,
 }
 
 impl<R: RuntimeRunner> SessionState<R> {
@@ -169,6 +171,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             next_source_revision: 0,
             active_artifact: None,
             default_xopt: OptimizationLevel::IOpt,
+            opt_overrides: BTreeMap::new(),
         }
     }
 
@@ -257,6 +260,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         };
         if before != self.items.len() {
             self.clear_binding_handles()?;
+            self.retain_known_optimization_overrides();
         }
         Ok(before != self.items.len() || removed_hidden)
     }
@@ -265,6 +269,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         self.clear_binding_handles()?;
         self.clear_hidden_last()?;
         self.items.clear();
+        self.opt_overrides.clear();
         self.unload_active_artifact()?;
         Ok(())
     }
@@ -295,6 +300,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             .into_iter()
             .next()
             .map(|item| RetainedLastValue { item, value: None });
+        self.retain_known_optimization_overrides();
         Ok(())
     }
 
@@ -302,6 +308,71 @@ impl<R: RuntimeRunner> SessionState<R> {
         self.default_xopt = xopt;
         self.unload_active_artifact()?;
         Ok(())
+    }
+
+    pub fn set_optimization(
+        &mut self,
+        xopt: OptimizationLevel,
+        objects: &[String],
+    ) -> Result<(), SessionError> {
+        if objects.is_empty() {
+            self.default_xopt = xopt;
+        } else {
+            let known_functions = self
+                .items
+                .iter()
+                .filter_map(StoredItem::function_name)
+                .collect::<BTreeSet<_>>();
+            for object in objects {
+                let object = normalize_optimization_object(object);
+                if object == "module" {
+                    self.default_xopt = xopt;
+                } else if known_functions.contains(object.as_str()) {
+                    if xopt == self.default_xopt {
+                        self.opt_overrides.remove(&object);
+                    } else {
+                        self.opt_overrides.insert(object, xopt);
+                    }
+                } else {
+                    return Err(SessionError::Message(format!(
+                        "unknown optimization object `{object}`"
+                    )));
+                }
+            }
+        }
+
+        self.recompile_active_artifact()
+    }
+
+    pub fn optimization_status(
+        &mut self,
+        object: Option<&str>,
+    ) -> Result<Vec<OptimizationStatus>, SessionError> {
+        let mut statuses = self.session_optimization_statuses()?;
+        if let Some(object) = object {
+            let object = normalize_optimization_object(object);
+            statuses.retain(|status| status.object == object);
+            if statuses.is_empty() {
+                return Err(SessionError::Message(format!(
+                    "unknown optimization object `{object}`"
+                )));
+            }
+        }
+        Ok(statuses)
+    }
+
+    pub fn optimization_dump(
+        &mut self,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, SessionError> {
+        let object = normalize_optimization_object(object);
+        let Some(artifact_id) = self.active_artifact else {
+            return Ok(None);
+        };
+        self.runner
+            .optimization_dump(artifact_id, &object, kind)
+            .map_err(SessionError::from)
     }
 
     fn validate_environment(
@@ -448,12 +519,14 @@ impl<R: RuntimeRunner> SessionState<R> {
     fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, SessionError> {
         let revision = self.next_revision();
         let compiled = SourceText::new("<repl-eval>", revision, source);
+        let settings = self.optimization_settings();
 
         let artifact_id = if let Some(artifact_id) = self.active_artifact {
-            self.runner.reload_script(artifact_id, compiled)?;
+            self.runner
+                .reload_script_with_settings(artifact_id, compiled, settings)?;
             artifact_id
         } else {
-            let artifact_id = self.runner.load_script(compiled, Some(self.default_xopt))?;
+            let artifact_id = self.runner.load_script_with_settings(compiled, settings)?;
             self.active_artifact = Some(artifact_id);
             artifact_id
         };
@@ -468,6 +541,78 @@ impl<R: RuntimeRunner> SessionState<R> {
             self.runner.unload_script(artifact_id)?;
         }
         Ok(())
+    }
+
+    fn recompile_active_artifact(&mut self) -> Result<(), SessionError> {
+        let Some(artifact_id) = self.active_artifact else {
+            return Ok(());
+        };
+        let source = self.snapshot_source();
+        let revision = self.next_revision();
+        let compiled = SourceText::new("<repl-opt>", revision, source);
+        self.runner.reload_script_with_settings(
+            artifact_id,
+            compiled,
+            self.optimization_settings(),
+        )?;
+        Ok(())
+    }
+
+    fn session_optimization_statuses(&mut self) -> Result<Vec<OptimizationStatus>, SessionError> {
+        if let Some(artifact_id) = self.active_artifact {
+            return self
+                .runner
+                .optimization_status(artifact_id, &self.optimization_settings())
+                .map_err(SessionError::from);
+        }
+
+        let functions = self
+            .items
+            .iter()
+            .filter_map(StoredItem::function_name)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut statuses = vec![OptimizationStatus {
+            object: "module".to_owned(),
+            requested: self.default_xopt,
+            rank: None,
+            artifact: None,
+            mir_available: false,
+            wasm_available: false,
+        }];
+        statuses.extend(functions.into_iter().map(|function| {
+            OptimizationStatus {
+                requested: self
+                    .opt_overrides
+                    .get(&function)
+                    .copied()
+                    .unwrap_or(self.default_xopt),
+                object: function,
+                rank: None,
+                artifact: None,
+                mir_available: false,
+                wasm_available: false,
+            }
+        }));
+        Ok(statuses)
+    }
+
+    fn optimization_settings(&self) -> OptimizationSettings {
+        OptimizationSettings {
+            default: self.default_xopt,
+            overrides: self.opt_overrides.clone(),
+        }
+    }
+
+    fn retain_known_optimization_overrides(&mut self) {
+        let known_functions = self
+            .items
+            .iter()
+            .filter_map(StoredItem::function_name)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        self.opt_overrides
+            .retain(|object, _| known_functions.contains(object));
     }
 
     fn next_revision(&mut self) -> u64 {
@@ -726,6 +871,35 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             .map_err(SessionError::from)
     }
 
+    pub fn set_optimization(
+        &mut self,
+        xopt: OptimizationLevel,
+        objects: &[String],
+    ) -> Result<(), SessionError> {
+        self.runner
+            .set_session_optimization(self.session_id, xopt, objects)
+            .map_err(SessionError::from)
+    }
+
+    pub fn optimization_status(
+        &self,
+        object: Option<&str>,
+    ) -> Result<Vec<OptimizationStatus>, SessionError> {
+        self.runner
+            .session_optimization_status(self.session_id, object)
+            .map_err(SessionError::from)
+    }
+
+    pub fn optimization_dump(
+        &self,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, SessionError> {
+        self.runner
+            .session_optimization_dump(self.session_id, object, kind)
+            .map_err(SessionError::from)
+    }
+
     pub fn live_handles(&self) -> Result<Vec<HandleId>, SessionError> {
         Ok(self.runner.live_handles()?)
     }
@@ -755,6 +929,17 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
 impl<R: RuntimeRunner> Drop for InteractiveSession<R> {
     fn drop(&mut self) {
         let _ = self.runner.close_session(self.session_id);
+    }
+}
+
+fn normalize_optimization_object(object: &str) -> String {
+    let trimmed = object.trim();
+    if trimmed.is_empty() || matches!(trimmed, "module" | ".") {
+        "module".to_owned()
+    } else if trimmed == "$" {
+        LAST_VALUE_NAME.to_owned()
+    } else {
+        trimmed.to_owned()
     }
 }
 

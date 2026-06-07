@@ -16,8 +16,15 @@ pub enum ReplCommand {
     Handles,
     Show(String),
     Drop(String),
-    XOpt(String),
+    Opt(OptCommand),
     Session(SessionCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptCommand {
+    Get(Option<String>),
+    Set { mode: String, objects: Vec<String> },
+    Dump(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,10 +60,41 @@ impl FromStr for ReplCommand {
             ":run" => Ok(Self::Run(parts.collect::<Vec<_>>().join(" "))),
             ":show" => Ok(Self::Show(parts.collect::<Vec<_>>().join(" "))),
             ":drop" => Ok(Self::Drop(parts.collect::<Vec<_>>().join(" "))),
-            ":xopt" => Ok(Self::XOpt(parts.collect::<Vec<_>>().join(" "))),
+            ":opt" => parse_opt_command(parts.collect::<Vec<_>>()),
             ":session" => parse_session_command(parts.collect::<Vec<_>>()),
             other => Err(format!("unknown REPL command `{other}`")),
         }
+    }
+}
+
+fn parse_opt_command(parts: Vec<&str>) -> Result<ReplCommand, String> {
+    let Some(action) = parts.first().copied() else {
+        return Err("`:opt` requires a subcommand".to_owned());
+    };
+
+    match action {
+        "get" => {
+            let object = parts[1..].join(" ");
+            Ok(ReplCommand::Opt(OptCommand::Get(
+                (!object.trim().is_empty()).then_some(object),
+            )))
+        }
+        "set" => {
+            let Some(mode) = parts.get(1).copied() else {
+                return Err("`:opt set` requires a mode".to_owned());
+            };
+            Ok(ReplCommand::Opt(OptCommand::Set {
+                mode: mode.to_owned(),
+                objects: parts[2..].iter().map(|part| (*part).to_owned()).collect(),
+            }))
+        }
+        "dump" => {
+            let object = parts[1..].join(" ");
+            Ok(ReplCommand::Opt(OptCommand::Dump(
+                (!object.trim().is_empty()).then_some(object),
+            )))
+        }
+        other => Err(format!("unknown `:opt` subcommand `{other}`")),
     }
 }
 

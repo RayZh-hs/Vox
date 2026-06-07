@@ -15,7 +15,7 @@ use vox_core::{
 };
 
 pub const MAGIC: u32 = 0x5658_5254;
-pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
 pub const MAX_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_INLINE_VALUE_BYTES: u32 = 1024 * 1024;
 
@@ -60,6 +60,9 @@ pub enum Opcode {
     CloseSession = 0x0b,
     ListSessions = 0x0c,
     SetSessionReserved = 0x0d,
+    SetSessionOpt = 0x0e,
+    GetSessionOpt = 0x0f,
+    DumpSessionOpt = 0x14,
     MountLibrary = 0x10,
     UnmountLibrary = 0x11,
     LoadScript = 0x20,
@@ -67,6 +70,8 @@ pub enum Opcode {
     UnloadScript = 0x22,
     SetXOpt = 0x23,
     RunScript = 0x24,
+    GetOpt = 0x25,
+    DumpOpt = 0x26,
     RetainHandle = 0x30,
     DescribeHandle = 0x31,
     ReleaseHandle = 0x32,
@@ -93,6 +98,9 @@ impl Opcode {
             0x0b => Self::CloseSession,
             0x0c => Self::ListSessions,
             0x0d => Self::SetSessionReserved,
+            0x0e => Self::SetSessionOpt,
+            0x0f => Self::GetSessionOpt,
+            0x14 => Self::DumpSessionOpt,
             0x10 => Self::MountLibrary,
             0x11 => Self::UnmountLibrary,
             0x20 => Self::LoadScript,
@@ -100,6 +108,8 @@ impl Opcode {
             0x22 => Self::UnloadScript,
             0x23 => Self::SetXOpt,
             0x24 => Self::RunScript,
+            0x25 => Self::GetOpt,
+            0x26 => Self::DumpOpt,
             0x30 => Self::RetainHandle,
             0x31 => Self::DescribeHandle,
             0x32 => Self::ReleaseHandle,

@@ -55,16 +55,20 @@ If compilation fails, the compiler returns diagnostics instead of an artifact.
 - allow copy-on-write and slot reuse when a value's lifetime has ended;
 - prepare compact MIR for backend lowering.
 
-Runtime callers can choose the optimization level when loading a script, set a
-connection or session default, or request a one-off run override. REPL sessions
-use their own default and do not need to expose every sealed optimization
-control.
+Runtime callers can choose the default optimization level when loading a script,
+attach per-object optimization overrides for functions, set a connection or
+session default, or request a one-off run override. REPL sessions expose these
+controls through `:opt get`, `:opt set`, and `:opt dump`.
+
+When a function override requests a stronger mode than the module default, the
+compiler runs the artifact's optimization pipeline at the strongest requested
+mode and records the per-object requested mode and rank separately.
 
 ## Runtime Contract
 
-The compiled artifact records the requested optimization level and the rank
-chosen for each executable body. The runtime executes the best representation it
-supports:
+The compiled artifact records the requested module optimization level,
+per-function override metadata, and the rank chosen for each executable body.
+The runtime executes the best representation it supports:
 
 - tree-walk execution remains the fallback for scripts;
 - MIR metadata is available for inspection, optimization accounting, and future

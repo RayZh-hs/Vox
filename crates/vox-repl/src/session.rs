@@ -10,15 +10,15 @@ use vox_core::{
     value::{InlineValue, RuntimeValue},
 };
 use vox_runtime::{
-    EmbeddedRunner, InteractiveSession, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
-    SessionSelector, SessionSummary, TypeEnvironment,
+    EmbeddedRunner, InteractiveSession, OptimizationDumpKind, OptimizationStatus, RuntimeRunner,
+    SessionOpenMode, SessionOpenRequest, SessionSelector, SessionSummary, TypeEnvironment,
 };
 
 use crate::{
     CompletionSnapshot,
-    command::{ReplCommand, SessionCommand},
+    command::{OptCommand, ReplCommand, SessionCommand},
     editing::{build_edit_buffer, validate_edited_symbols},
-    editor::{EditOutcome, edit_chunk},
+    editor::{EditOutcome, edit_chunk, view_text},
 };
 
 const LAST_VALUE_NAME: &str = "__repl_last";
@@ -116,11 +116,12 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 ":type".to_owned(),
                 ":handles".to_owned(),
                 ":drop".to_owned(),
-                ":xopt".to_owned(),
+                ":opt".to_owned(),
                 ":session".to_owned(),
             ],
             snapshots: available_snapshot_names(),
             xopts: vec!["NOpt".to_owned(), "IOpt".to_owned(), "SOpt".to_owned()],
+            opt_commands: vec!["get".to_owned(), "set".to_owned(), "dump".to_owned()],
             handles,
             sessions,
             session_commands: vec![
@@ -132,8 +133,11 @@ impl<R: RuntimeRunner> ReplSession<R> {
             symbols,
         };
 
+        snapshot.symbols.push("module".to_owned());
         snapshot.snapshots.sort();
         snapshot.snapshots.dedup();
+        snapshot.symbols.sort();
+        snapshot.symbols.dedup();
         snapshot
     }
 
@@ -178,23 +182,56 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 }
                 Err(error) => ReplOutput::error(error.to_string()),
             },
-            ReplCommand::XOpt(mode) => {
-                let xopt = match mode.as_str() {
-                    "NOpt" => OptimizationLevel::NOpt,
-                    "IOpt" => OptimizationLevel::IOpt,
-                    "SOpt" => OptimizationLevel::SOpt,
-                    _ => {
-                        return ReplOutput::error(format!("unknown optimization mode `{mode}`"));
-                    }
+            ReplCommand::Opt(command) => self.handle_opt_command(command),
+            ReplCommand::Session(command) => self.handle_session_command(command),
+        }
+    }
+
+    fn handle_opt_command(&mut self, command: OptCommand) -> ReplOutput {
+        match command {
+            OptCommand::Get(object) => match self.runtime.optimization_status(object.as_deref()) {
+                Ok(statuses) => ReplOutput::message(render_optimization_statuses(&statuses)),
+                Err(error) => ReplOutput::error(error.to_string()),
+            },
+            OptCommand::Set { mode, objects } => {
+                let Some(xopt) = parse_optimization_level(&mode) else {
+                    return ReplOutput::error(format!("unknown optimization mode `{mode}`"));
                 };
-                match self.runtime.set_default_xopt(xopt) {
-                    Ok(()) => {
+                match self.runtime.set_optimization(xopt, &objects) {
+                    Ok(()) if objects.is_empty() => {
                         ReplOutput::message(format!("default optimization mode set to {mode}"))
                     }
+                    Ok(()) => ReplOutput::message(format!(
+                        "optimization mode set to {mode} for {}",
+                        render_backticked_names(&objects)
+                    )),
                     Err(error) => ReplOutput::error(error.to_string()),
                 }
             }
-            ReplCommand::Session(command) => self.handle_session_command(command),
+            OptCommand::Dump(object) => {
+                let object = object.unwrap_or_else(|| "module".to_owned());
+                let (kind, object) = parse_dump_target(&object);
+                match self.runtime.optimization_dump(&object, kind) {
+                    Ok(Some(dump)) => match view_text(
+                        &format!("{}-{}", render_dump_kind(kind).to_ascii_lowercase(), object),
+                        &dump.text,
+                    ) {
+                        Ok(true) => ReplOutput::message(format!(
+                            "opened {} dump for `{}`",
+                            render_dump_kind(kind),
+                            object
+                        )),
+                        Ok(false) => ReplOutput::message(dump.text),
+                        Err(error) => ReplOutput::error(error),
+                    },
+                    Ok(None) => ReplOutput::error(format!(
+                        "no {} dump is available for `{}`",
+                        render_dump_kind(kind),
+                        object
+                    )),
+                    Err(error) => ReplOutput::error(error.to_string()),
+                }
+            }
         }
     }
 
@@ -472,13 +509,83 @@ fn render_help() -> String {
         ":type [expr]               - show the inferred type of an expression",
         ":handles                   - list live handles visible to this session",
         ":drop [name]               - remove a binding or definition from interactive state",
-        ":xopt [mode]               - set the default optimization mode (NOpt, IOpt, SOpt)",
+        ":opt get [object]          - show optimization state for objects",
+        ":opt set [mode] [object...] - set default or per-object optimization mode",
+        ":opt dump [object]         - print a MIR dump; use wasm:module for wasm bytes",
         ":session connect (target)  - attach to an existing session by id or name",
         ":session new [name]        - create a fresh anonymous or named session",
         ":session reserve           - toggle whether the current session is retained at 0 users",
         ":session list              - list available sessions",
     ]
     .join("\n")
+}
+
+fn parse_optimization_level(raw: &str) -> Option<OptimizationLevel> {
+    match raw.trim() {
+        "NOpt" => Some(OptimizationLevel::NOpt),
+        "IOpt" => Some(OptimizationLevel::IOpt),
+        "SOpt" => Some(OptimizationLevel::SOpt),
+        _ => None,
+    }
+}
+
+fn parse_dump_target(raw: &str) -> (OptimizationDumpKind, String) {
+    let trimmed = raw.trim();
+    if let Some(object) = trimmed.strip_prefix("wasm:") {
+        (OptimizationDumpKind::Wasm, object.trim().to_owned())
+    } else if let Some(object) = trimmed.strip_prefix("mir:") {
+        (OptimizationDumpKind::Mir, object.trim().to_owned())
+    } else {
+        (OptimizationDumpKind::Mir, trimmed.to_owned())
+    }
+}
+
+fn render_dump_kind(kind: OptimizationDumpKind) -> &'static str {
+    match kind {
+        OptimizationDumpKind::Mir => "MIR",
+        OptimizationDumpKind::Wasm => "Wasm",
+    }
+}
+
+fn render_optimization_statuses(statuses: &[OptimizationStatus]) -> String {
+    if statuses.is_empty() {
+        return "no optimization objects".to_owned();
+    }
+
+    statuses
+        .iter()
+        .map(|status| {
+            let rank = status
+                .rank
+                .map(|rank| rank.as_str().to_owned())
+                .unwrap_or_else(|| "pending".to_owned());
+            let artifact = status
+                .artifact
+                .map(|artifact| artifact.0.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let dumps = [
+                status.mir_available.then_some("mir"),
+                status.wasm_available.then_some("wasm"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let dumps = if dumps.is_empty() {
+                "-".to_owned()
+            } else {
+                dumps.join(",")
+            };
+            format!(
+                "{} mode={} rank={} artifact={} dumps={}",
+                status.object,
+                status.requested.as_str(),
+                rank,
+                artifact,
+                dumps
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_session_selector(raw: &str) -> Result<SessionSelector, String> {

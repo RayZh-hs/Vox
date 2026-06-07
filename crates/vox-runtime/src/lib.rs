@@ -21,7 +21,7 @@ use vox_compiler::{CompileRequest, Compiler};
 use vox_core::{
     host::{HostRegistry, PackageManifest},
     ids::{ArtifactId, HandleId, LibraryId},
-    opt::OptimizationLevel,
+    opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
     plan::CompiledArtifact,
     source::{ModuleKind, ModulePath, SourceText},
     value::{HandleData, HandleSummary, RuntimeValue},
@@ -69,6 +69,44 @@ pub struct HandleDataChunk {
     pub offset: u64,
     pub total_bytes: u64,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizationSettings {
+    pub default: OptimizationLevel,
+    pub overrides: BTreeMap<String, OptimizationLevel>,
+}
+
+impl OptimizationSettings {
+    pub fn new(default: OptimizationLevel) -> Self {
+        Self {
+            default,
+            overrides: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizationStatus {
+    pub object: String,
+    pub requested: OptimizationLevel,
+    pub rank: Option<OptimizationRank>,
+    pub artifact: Option<ArtifactId>,
+    pub mir_available: bool,
+    pub wasm_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptimizationDumpKind {
+    Mir,
+    Wasm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizationDump {
+    pub object: String,
+    pub kind: OptimizationDumpKind,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +266,7 @@ impl Runtime {
         let request = CompileRequest {
             source,
             optimization: xopt.unwrap_or(self.default_xopt),
+            optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
         };
         let result = self.compiler.compile(request);
@@ -269,6 +308,7 @@ impl Runtime {
         let request = CompileRequest {
             source,
             optimization: xopt,
+            optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
         };
         let result = self.compiler.compile(request);
@@ -298,6 +338,105 @@ impl Runtime {
 
     pub fn artifact(&self, artifact_id: ArtifactId) -> Option<&CompiledArtifact> {
         self.artifacts.get(artifact_id)
+    }
+
+    pub fn load_script_with_settings(
+        &mut self,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<ArtifactId, RuntimeError> {
+        let request = CompileRequest {
+            source,
+            optimization: settings.default,
+            optimization_overrides: settings.overrides,
+            host: self.host.clone(),
+        };
+        let result = self.compiler.compile(request);
+
+        if result.diagnostics.has_errors() {
+            return Err(RuntimeError::CompilationFailed(
+                result.diagnostics.to_string(),
+            ));
+        }
+
+        let artifact = result
+            .artifact
+            .expect("successful compilation should produce an artifact");
+        let treewalk = result.treewalk;
+        let id = artifact.id;
+        self.artifacts.insert(artifact, treewalk);
+        Ok(id)
+    }
+
+    pub fn reload_script_with_settings(
+        &mut self,
+        artifact_id: ArtifactId,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<(), RuntimeError> {
+        let Some(previous_artifact) = self.artifacts.get(artifact_id).cloned() else {
+            return Err(RuntimeError::MissingArtifact(artifact_id));
+        };
+        let previous_treewalk = self.artifacts.treewalk(artifact_id).cloned();
+
+        let request = CompileRequest {
+            source,
+            optimization: settings.default,
+            optimization_overrides: settings.overrides,
+            host: self.host.clone(),
+        };
+        let result = self.compiler.compile(request);
+
+        if result.diagnostics.has_errors() {
+            return Err(RuntimeError::CompilationFailed(
+                result.diagnostics.to_string(),
+            ));
+        }
+
+        let mut artifact = result
+            .artifact
+            .expect("successful compilation should produce an artifact");
+        artifact.id = artifact_id;
+        let generic_signatures_changed = previous_artifact.module != artifact.module
+            || previous_artifact.optimization != artifact.optimization
+            || previous_treewalk
+                .as_ref()
+                .map(|treewalk| &treewalk.functions)
+                != result.treewalk.as_ref().map(|treewalk| &treewalk.functions);
+        self.artifacts.insert(artifact, result.treewalk);
+        if generic_signatures_changed {
+            self.clear_generic_handles(Some(artifact_id));
+        }
+        Ok(())
+    }
+
+    pub fn optimization_statuses(
+        &self,
+        artifact_id: ArtifactId,
+        settings: &OptimizationSettings,
+    ) -> Result<Vec<OptimizationStatus>, RuntimeError> {
+        let artifact = self
+            .artifacts
+            .get(artifact_id)
+            .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
+        Ok(artifact_optimization_statuses(
+            artifact,
+            artifact_id,
+            settings,
+        ))
+    }
+
+    pub fn optimization_dump(
+        &self,
+        artifact_id: ArtifactId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RuntimeError> {
+        let artifact = self
+            .artifacts
+            .get(artifact_id)
+            .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
+        Ok(artifact_optimization_dump(artifact, object, kind))
     }
 
     pub fn library(&self, library_id: LibraryId) -> Option<&MountedLibrary> {
@@ -556,6 +695,115 @@ impl Runtime {
 
 fn qualified_host_name(package: &ModulePath, function: &str) -> String {
     format!("{}.{}", package.as_str(), function)
+}
+
+fn artifact_optimization_statuses(
+    artifact: &CompiledArtifact,
+    artifact_id: ArtifactId,
+    settings: &OptimizationSettings,
+) -> Vec<OptimizationStatus> {
+    let mut statuses = Vec::new();
+    statuses.push(OptimizationStatus {
+        object: "module".to_owned(),
+        requested: settings.default,
+        rank: artifact
+            .optimization_rankings
+            .iter()
+            .find_map(|ranking| match &ranking.subject {
+                OptimizationSubject::Module => Some(ranking.rank),
+                OptimizationSubject::Function(_) => None,
+            }),
+        artifact: Some(artifact_id),
+        mir_available: artifact.mir.is_some() || artifact.plan.mir_text.is_some(),
+        wasm_available: artifact.plan.wasm.is_some(),
+    });
+
+    for ranking in &artifact.optimization_rankings {
+        let OptimizationSubject::Function(name) = &ranking.subject else {
+            continue;
+        };
+        statuses.push(OptimizationStatus {
+            object: name.clone(),
+            requested: settings
+                .overrides
+                .get(name)
+                .copied()
+                .unwrap_or(settings.default),
+            rank: Some(ranking.rank),
+            artifact: Some(artifact_id),
+            mir_available: artifact
+                .mir
+                .as_ref()
+                .is_some_and(|mir| mir.bodies.iter().any(|body| body.name == *name)),
+            wasm_available: false,
+        });
+    }
+
+    statuses
+}
+
+fn artifact_optimization_dump(
+    artifact: &CompiledArtifact,
+    object: &str,
+    kind: OptimizationDumpKind,
+) -> Option<OptimizationDump> {
+    let object = normalize_optimization_object(object);
+    match kind {
+        OptimizationDumpKind::Mir => {
+            let text = if object == "module" {
+                artifact
+                    .plan
+                    .mir_text
+                    .clone()
+                    .or_else(|| artifact.mir.as_ref().map(|mir| mir.to_text()))?
+            } else {
+                let mut text = String::new();
+                let mir = artifact.mir.as_ref()?;
+                let body = mir.bodies.iter().find(|body| body.name == object)?;
+                body.write_text(&mut text).ok()?;
+                text
+            };
+            Some(OptimizationDump { object, kind, text })
+        }
+        OptimizationDumpKind::Wasm => {
+            if object != "module" {
+                return None;
+            }
+            let wasm = artifact.plan.wasm.as_ref()?;
+            let bytes = wasm
+                .bytes
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| {
+                    if index % 16 == 0 {
+                        format!("\n{:08x}: {:02x}", index, byte)
+                    } else {
+                        format!(" {:02x}", byte)
+                    }
+                })
+                .collect::<String>();
+            Some(OptimizationDump {
+                object,
+                kind,
+                text: format!(
+                    "wasm export={} summary={} bytes={}{}",
+                    wasm.entry_export,
+                    wasm.summary,
+                    wasm.bytes.len(),
+                    bytes
+                ),
+            })
+        }
+    }
+}
+
+fn normalize_optimization_object(object: &str) -> String {
+    let trimmed = object.trim();
+    if trimmed.is_empty() || matches!(trimmed, "module" | ".") {
+        "module".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
 }
 
 #[cfg(test)]

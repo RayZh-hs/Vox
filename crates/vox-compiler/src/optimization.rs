@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use vox_core::{
     mir::MirModule,
     opt::{OptimizationLevel, OptimizationRank, OptimizationRanking, OptimizationSubject},
@@ -111,6 +113,7 @@ impl OptimizationPipeline {
 pub fn derive_rankings(
     frontend: &FrontendUnit,
     level: OptimizationLevel,
+    overrides: &BTreeMap<String, OptimizationLevel>,
 ) -> Vec<OptimizationRanking> {
     let mut rankings = Vec::new();
     rankings.push(OptimizationRanking {
@@ -122,9 +125,10 @@ pub fn derive_rankings(
         TopLevelItem::Function(function) => Some(function),
         _ => None,
     }) {
+        let function_level = overrides.get(&function.name).copied().unwrap_or(level);
         rankings.push(OptimizationRanking {
             subject: OptimizationSubject::Function(function.name.clone()),
-            rank: rank_function(function, level),
+            rank: rank_function(function, function_level),
         });
     }
 

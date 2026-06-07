@@ -16,13 +16,15 @@ use vox_core::{
 };
 
 use crate::{
-    CacheStats, HandleDataChunk, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
+    CacheStats, HandleDataChunk, OptimizationDump, OptimizationDumpKind, OptimizationSettings,
+    OptimizationStatus, RunnerError, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
     SessionSelector, SessionSummary,
     protocol::{
         CURRENT_PROTOCOL_VERSION, DEFAULT_INLINE_VALUE_BYTES, ErrorCode, FLAG_HANDLE_RESULT,
         FLAG_INLINE_VALUE, Frame, FrameKind, Opcode, PayloadReader, PayloadWriter, ProtocolError,
-        decode_error_frame, decode_handle_data, decode_inline_value, encode_inline_value,
-        encode_manifest, encode_optimization, read_frame, success_frame, write_frame,
+        decode_error_frame, decode_handle_data, decode_inline_value, decode_optimization,
+        encode_inline_value, encode_manifest, encode_optimization, read_frame, success_frame,
+        write_frame,
     },
 };
 
@@ -205,12 +207,23 @@ impl RemoteRunner {
         source: SourceText,
         xopt: Option<OptimizationLevel>,
     ) -> Result<Vec<u8>, RunnerError> {
-        let effective_xopt = xopt.unwrap_or(self.current_default_xopt()?);
+        self.encode_script_payload_with_settings(
+            source,
+            OptimizationSettings::new(xopt.unwrap_or(self.current_default_xopt()?)),
+        )
+    }
+
+    fn encode_script_payload_with_settings(
+        &self,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<Vec<u8>, RunnerError> {
         let mut payload = PayloadWriter::new();
         payload.write_u8(0);
-        encode_optimization(&mut payload, effective_xopt);
+        encode_optimization(&mut payload, settings.default);
         payload.write_u8(0);
         payload.write_u8(0);
+        encode_optimization_settings(&mut payload, &settings).map_err(protocol_to_runner)?;
         payload
             .write_string(source.origin.path.as_str())
             .map_err(protocol_to_runner)?;
@@ -423,6 +436,58 @@ impl RuntimeRunner for RemoteRunner {
         Ok(())
     }
 
+    fn set_session_optimization(
+        &self,
+        session: SessionId,
+        xopt: OptimizationLevel,
+        objects: &[String],
+    ) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        encode_optimization(&mut payload, xopt);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        write_string_list(&mut payload, objects).map_err(protocol_to_runner)?;
+        let _ = self.invoke(Opcode::SetSessionOpt, target_id, 0, payload.into_inner())?;
+        Ok(())
+    }
+
+    fn session_optimization_status(
+        &self,
+        session: SessionId,
+        object: Option<&str>,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_u8(u8::from(object.is_some()));
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        if let Some(object) = object {
+            payload.write_string(object).map_err(protocol_to_runner)?;
+        }
+        let frame = self.invoke(Opcode::GetSessionOpt, target_id, 0, payload.into_inner())?;
+        decode_optimization_statuses(&frame.payload)
+    }
+
+    fn session_optimization_dump(
+        &self,
+        session: SessionId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError> {
+        let target_id = self.to_wire_id(session.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        encode_dump_kind(&mut payload, kind);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_string(object).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::DumpSessionOpt, target_id, 0, payload.into_inner())?;
+        decode_optimization_dump(&frame.payload)
+    }
+
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError> {
         let mut manifest_payload = PayloadWriter::new();
         encode_manifest(&mut manifest_payload, &manifest).map_err(protocol_to_runner)?;
@@ -467,6 +532,22 @@ impl RuntimeRunner for RemoteRunner {
         Ok(ArtifactId(script_id as u64))
     }
 
+    fn load_script_with_settings(
+        &self,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<ArtifactId, RunnerError> {
+        let payload = self.encode_script_payload_with_settings(source, settings)?;
+        let frame = self.invoke(Opcode::LoadScript, 0, 0, payload)?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let script_id = response.read_u32().map_err(protocol_to_runner)?;
+        let _revision = response.read_u64().map_err(protocol_to_runner)?;
+        let _parameter_count = response.read_u32().map_err(protocol_to_runner)?;
+        let _result_is_handle_capable = response.read_u8().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(ArtifactId(script_id as u64))
+    }
+
     fn reload_script(
         &self,
         artifact_id: ArtifactId,
@@ -474,6 +555,23 @@ impl RuntimeRunner for RemoteRunner {
     ) -> Result<(), RunnerError> {
         let target_id = self.to_wire_id(artifact_id.0, "script")?;
         let payload = self.encode_script_payload(source, None)?;
+        let frame = self.invoke(Opcode::ReloadScript, target_id, 0, payload)?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let _revision = response.read_u64().map_err(protocol_to_runner)?;
+        let _parameter_count = response.read_u32().map_err(protocol_to_runner)?;
+        let _result_is_handle_capable = response.read_u8().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+        Ok(())
+    }
+
+    fn reload_script_with_settings(
+        &self,
+        artifact_id: ArtifactId,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(artifact_id.0, "script")?;
+        let payload = self.encode_script_payload_with_settings(source, settings)?;
         let frame = self.invoke(Opcode::ReloadScript, target_id, 0, payload)?;
         let mut response = PayloadReader::new(&frame.payload);
         let _revision = response.read_u64().map_err(protocol_to_runner)?;
@@ -674,6 +772,35 @@ impl RuntimeRunner for RemoteRunner {
         Ok(())
     }
 
+    fn optimization_status(
+        &self,
+        artifact_id: ArtifactId,
+        settings: &OptimizationSettings,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError> {
+        let target_id = self.to_wire_id(artifact_id.0, "script")?;
+        let mut payload = PayloadWriter::new();
+        encode_optimization_settings(&mut payload, settings).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::GetOpt, target_id, 0, payload.into_inner())?;
+        decode_optimization_statuses(&frame.payload)
+    }
+
+    fn optimization_dump(
+        &self,
+        artifact_id: ArtifactId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError> {
+        let target_id = self.to_wire_id(artifact_id.0, "script")?;
+        let mut payload = PayloadWriter::new();
+        encode_dump_kind(&mut payload, kind);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_string(object).map_err(protocol_to_runner)?;
+        let frame = self.invoke(Opcode::DumpOpt, target_id, 0, payload.into_inner())?;
+        decode_optimization_dump(&frame.payload)
+    }
+
     fn cache_stats(&self) -> Result<CacheStats, RunnerError> {
         let frame = self.invoke(Opcode::CacheStats, 0, 0, Vec::new())?;
         let mut response = PayloadReader::new(&frame.payload);
@@ -719,6 +846,9 @@ fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
                 | Opcode::RestoreSession
                 | Opcode::RunSessionScript
                 | Opcode::SetSessionXOpt
+                | Opcode::SetSessionOpt
+                | Opcode::GetSessionOpt
+                | Opcode::DumpSessionOpt
                 | Opcode::CloseSession
                 | Opcode::ListSessions
                 | Opcode::SetSessionReserved
@@ -751,6 +881,125 @@ fn decode_handle_data_bytes(bytes: &[u8]) -> Result<HandleData, RunnerError> {
     let value = decode_handle_data(&mut reader).map_err(protocol_to_runner)?;
     reader.finish().map_err(protocol_to_runner)?;
     Ok(value)
+}
+
+fn write_string_list(writer: &mut PayloadWriter, values: &[String]) -> Result<(), ProtocolError> {
+    writer.write_u32(
+        u32::try_from(values.len())
+            .map_err(|_| ProtocolError::message("string list exceeds protocol range"))?,
+    );
+    for value in values {
+        writer.write_string(value)?;
+    }
+    Ok(())
+}
+
+fn encode_optimization_settings(
+    writer: &mut PayloadWriter,
+    settings: &OptimizationSettings,
+) -> Result<(), ProtocolError> {
+    encode_optimization(writer, settings.default);
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_u8(0);
+    writer.write_u32(
+        u32::try_from(settings.overrides.len())
+            .map_err(|_| ProtocolError::message("optimization override count exceeds u32"))?,
+    );
+    for (object, xopt) in &settings.overrides {
+        writer.write_string(object)?;
+        encode_optimization(writer, *xopt);
+        writer.write_u8(0);
+        writer.write_u8(0);
+        writer.write_u8(0);
+    }
+    Ok(())
+}
+
+fn encode_dump_kind(writer: &mut PayloadWriter, kind: OptimizationDumpKind) {
+    writer.write_u8(match kind {
+        OptimizationDumpKind::Mir => 0,
+        OptimizationDumpKind::Wasm => 1,
+    });
+}
+
+fn decode_dump_kind(raw: u8) -> Result<OptimizationDumpKind, RunnerError> {
+    match raw {
+        0 => Ok(OptimizationDumpKind::Mir),
+        1 => Ok(OptimizationDumpKind::Wasm),
+        _ => Err(RunnerError::Protocol(
+            "invalid optimization dump kind".to_owned(),
+        )),
+    }
+}
+
+fn decode_optimization_statuses(bytes: &[u8]) -> Result<Vec<OptimizationStatus>, RunnerError> {
+    let mut reader = PayloadReader::new(bytes);
+    let count = reader.read_u32().map_err(protocol_to_runner)? as usize;
+    let mut statuses = Vec::with_capacity(count);
+    for _ in 0..count {
+        let object = reader.read_string().map_err(protocol_to_runner)?;
+        let requested = decode_optimization(&mut reader).map_err(protocol_to_runner)?;
+        let rank = decode_optimization_rank(reader.read_u8().map_err(protocol_to_runner)?)?;
+        let has_artifact = reader.read_u8().map_err(protocol_to_runner)? != 0;
+        let mir_available = reader.read_u8().map_err(protocol_to_runner)? != 0;
+        let wasm_available = reader.read_u8().map_err(protocol_to_runner)? != 0;
+        let artifact = if has_artifact {
+            Some(ArtifactId(
+                reader.read_u32().map_err(protocol_to_runner)? as u64
+            ))
+        } else {
+            None
+        };
+        statuses.push(OptimizationStatus {
+            object,
+            requested,
+            rank,
+            artifact,
+            mir_available,
+            wasm_available,
+        });
+    }
+    reader.finish().map_err(protocol_to_runner)?;
+    Ok(statuses)
+}
+
+fn decode_optimization_rank(
+    raw: u8,
+) -> Result<Option<vox_core::opt::OptimizationRank>, RunnerError> {
+    use vox_core::opt::OptimizationRank;
+
+    match raw {
+        0 => Ok(None),
+        1 => Ok(Some(OptimizationRank::Baseline)),
+        2 => Ok(Some(OptimizationRank::Interactive)),
+        3 => Ok(Some(OptimizationRank::SealedOwnership)),
+        4 => Ok(Some(OptimizationRank::SealedDemand)),
+        5 => Ok(Some(OptimizationRank::SealedMaterialization)),
+        _ => Err(RunnerError::Protocol(
+            "invalid optimization rank".to_owned(),
+        )),
+    }
+}
+
+fn decode_optimization_dump(bytes: &[u8]) -> Result<Option<OptimizationDump>, RunnerError> {
+    let mut reader = PayloadReader::new(bytes);
+    let present = reader.read_u8().map_err(protocol_to_runner)? != 0;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    if !present {
+        reader.finish().map_err(protocol_to_runner)?;
+        return Ok(None);
+    }
+    let kind = decode_dump_kind(reader.read_u8().map_err(protocol_to_runner)?)?;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    reader.read_u8().map_err(protocol_to_runner)?;
+    let object = reader.read_string().map_err(protocol_to_runner)?;
+    let text = reader.read_string().map_err(protocol_to_runner)?;
+    reader.finish().map_err(protocol_to_runner)?;
+    Ok(Some(OptimizationDump { object, kind, text }))
 }
 
 trait FrameExt {

@@ -6,6 +6,16 @@ pub enum OptimizationLevel {
     SOpt,
 }
 
+impl OptimizationLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NOpt => "NOpt",
+            Self::IOpt => "IOpt",
+            Self::SOpt => "SOpt",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OptimizationRank {
     Baseline,

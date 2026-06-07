@@ -115,6 +115,7 @@ fn compile_fixture(path: &Path, optimization: OptimizationLevel) -> vox_compiler
     Compiler::default().compile(CompileRequest {
         source: SourceText::new(path.display().to_string(), 1, source),
         optimization,
+        optimization_overrides: Default::default(),
         host: host_registry(),
     })
 }

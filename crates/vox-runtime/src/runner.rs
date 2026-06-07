@@ -13,6 +13,7 @@ use vox_core::{
 };
 
 use crate::{CacheStats, HandleDataChunk, Runtime, RuntimeError, SessionState};
+use crate::{OptimizationDump, OptimizationDumpKind, OptimizationSettings, OptimizationStatus};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -94,6 +95,26 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         xopt: OptimizationLevel,
     ) -> Result<(), RunnerError>;
 
+    fn set_session_optimization(
+        &self,
+        session: SessionId,
+        xopt: OptimizationLevel,
+        objects: &[String],
+    ) -> Result<(), RunnerError>;
+
+    fn session_optimization_status(
+        &self,
+        session: SessionId,
+        object: Option<&str>,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError>;
+
+    fn session_optimization_dump(
+        &self,
+        session: SessionId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError>;
+
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError>;
 
     fn load_script(
@@ -102,8 +123,21 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         xopt: Option<OptimizationLevel>,
     ) -> Result<ArtifactId, RunnerError>;
 
+    fn load_script_with_settings(
+        &self,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<ArtifactId, RunnerError>;
+
     fn reload_script(&self, artifact_id: ArtifactId, source: SourceText)
     -> Result<(), RunnerError>;
+
+    fn reload_script_with_settings(
+        &self,
+        artifact_id: ArtifactId,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<(), RunnerError>;
 
     fn unload_script(&self, artifact_id: ArtifactId) -> Result<bool, RunnerError>;
 
@@ -143,6 +177,19 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
     fn package_manifests(&self) -> Result<Vec<PackageManifest>, RunnerError>;
 
     fn set_default_xopt(&self, xopt: OptimizationLevel) -> Result<(), RunnerError>;
+
+    fn optimization_status(
+        &self,
+        artifact_id: ArtifactId,
+        settings: &OptimizationSettings,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError>;
+
+    fn optimization_dump(
+        &self,
+        artifact_id: ArtifactId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError>;
 
     fn cache_stats(&self) -> Result<CacheStats, RunnerError>;
 
@@ -443,6 +490,47 @@ impl RuntimeRunner for EmbeddedRunner {
         })
     }
 
+    fn set_session_optimization(
+        &self,
+        session: SessionId,
+        xopt: OptimizationLevel,
+        objects: &[String],
+    ) -> Result<(), RunnerError> {
+        self.with_session(session, |state| {
+            state
+                .state
+                .set_optimization(xopt, objects)
+                .map_err(map_session_error)
+        })
+    }
+
+    fn session_optimization_status(
+        &self,
+        session: SessionId,
+        object: Option<&str>,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError> {
+        self.with_session(session, |state| {
+            state
+                .state
+                .optimization_status(object)
+                .map_err(map_session_error)
+        })
+    }
+
+    fn session_optimization_dump(
+        &self,
+        session: SessionId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError> {
+        self.with_session(session, |state| {
+            state
+                .state
+                .optimization_dump(object, kind)
+                .map_err(map_session_error)
+        })
+    }
+
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError> {
         self.with_runtime(|runtime| Ok(runtime.mount_library(manifest)))
     }
@@ -455,6 +543,18 @@ impl RuntimeRunner for EmbeddedRunner {
         self.with_runtime(|runtime| runtime.load_script(source, xopt).map_err(Into::into))
     }
 
+    fn load_script_with_settings(
+        &self,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<ArtifactId, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .load_script_with_settings(source, settings)
+                .map_err(Into::into)
+        })
+    }
+
     fn reload_script(
         &self,
         artifact_id: ArtifactId,
@@ -463,6 +563,19 @@ impl RuntimeRunner for EmbeddedRunner {
         self.with_runtime(|runtime| {
             runtime
                 .reload_script(artifact_id, source)
+                .map_err(Into::into)
+        })
+    }
+
+    fn reload_script_with_settings(
+        &self,
+        artifact_id: ArtifactId,
+        source: SourceText,
+        settings: OptimizationSettings,
+    ) -> Result<(), RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .reload_script_with_settings(artifact_id, source, settings)
                 .map_err(Into::into)
         })
     }
@@ -576,6 +689,31 @@ impl RuntimeRunner for EmbeddedRunner {
         self.with_runtime(|runtime| {
             runtime.set_default_xopt(xopt);
             Ok(())
+        })
+    }
+
+    fn optimization_status(
+        &self,
+        artifact_id: ArtifactId,
+        settings: &OptimizationSettings,
+    ) -> Result<Vec<OptimizationStatus>, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .optimization_statuses(artifact_id, settings)
+                .map_err(Into::into)
+        })
+    }
+
+    fn optimization_dump(
+        &self,
+        artifact_id: ArtifactId,
+        object: &str,
+        kind: OptimizationDumpKind,
+    ) -> Result<Option<OptimizationDump>, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .optimization_dump(artifact_id, object, kind)
+                .map_err(Into::into)
         })
     }
 

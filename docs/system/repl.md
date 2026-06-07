@@ -132,8 +132,12 @@ For coupled changes, prefer `:chunk`, `:edit`, `:run`, or an external file.
 - `:type <expr>` prints the inferred type of an expression.
 - `:handles` lists live handles visible through the runtime.
 - `:drop <name>` removes a binding or definition from the session.
-- `:xopt <mode>` sets the session default optimization mode to `NOpt`, `IOpt`,
-  or `SOpt`.
+- `:opt get [object]` prints optimization state for the module and functions.
+- `:opt set <mode> [object]...` sets the session default mode, or forces the
+  mode for `module` and named functions. Modes are `NOpt`, `IOpt`, and `SOpt`.
+- `:opt dump [object]` prints a MIR dump for `module` or a function when an
+  optimized artifact exists. Prefix the object with `wasm:` to dump module wasm
+  bytes, for example `:opt dump wasm:module`.
 - `:session connect <id-or-name>` switches to an existing session.
 - `:session new [name]` creates a fresh anonymous or named session and switches
   to it.
@@ -163,6 +167,10 @@ The builtin editor is a simple replacement editor:
 - it asks for the full replacement chunk;
 - `.submit` commits the chunk;
 - `.cancel` abandons it.
+
+`:opt dump` prints the dump to the REPL by default. If `VOX_VIEWER` is set, the
+REPL writes the dump to a temporary read-only text file and runs that viewer
+command with the file path.
 
 ## Snapshot Files
 

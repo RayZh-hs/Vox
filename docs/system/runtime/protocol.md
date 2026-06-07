@@ -118,6 +118,9 @@ All other bits are reserved and must be sent as `0`.
 - `0x0b`: `CLOSE_SESSION`
 - `0x0c`: `LIST_SESSIONS`
 - `0x0d`: `SET_SESSION_RESERVED`
+- `0x0e`: `SET_SESSION_OPT`
+- `0x0f`: `GET_SESSION_OPT`
+- `0x14`: `DUMP_SESSION_OPT`
 - `0x10`: `MOUNT_LIBRARY`
 - `0x11`: `UNMOUNT_LIBRARY`
 - `0x20`: `LOAD_SCRIPT`
@@ -125,6 +128,8 @@ All other bits are reserved and must be sent as `0`.
 - `0x22`: `UNLOAD_SCRIPT`
 - `0x23`: `SET_XOPT`
 - `0x24`: `RUN_SCRIPT`
+- `0x25`: `GET_OPT`
+- `0x26`: `DUMP_OPT`
 - `0x30`: `RETAIN_HANDLE`
 - `0x31`: `DESCRIBE_HANDLE`
 - `0x32`: `RELEASE_HANDLE`
@@ -147,6 +152,45 @@ The protocol uses only these primitive encodings:
 - `string`: `bytes` containing UTF-8
 
 There is no map or self-describing object envelope at the frame level.
+
+Optimization modes use these `u8` values:
+
+- `0`: `NOpt`
+- `1`: `IOpt`
+- `2`: `SOpt`
+
+Optimization settings are encoded as:
+
+```text
+u8 default_xopt      // 0=NOpt, 1=IOpt, 2=SOpt
+u8 reserved[3]
+u32 override_count
+repeated override_count:
+  string object      // function name; "module" is reserved for the module
+  u8 object_xopt     // 0=NOpt, 1=IOpt, 2=SOpt
+  u8 reserved[3]
+```
+
+Optimization status rows are encoded as:
+
+```text
+u32 status_count
+repeated status_count:
+  string object
+  u8 requested_xopt  // 0=NOpt, 1=IOpt, 2=SOpt
+  u8 rank            // 0=pending, 1=baseline, 2=interactive,
+                     // 3=sealed-ownership, 4=sealed-demand,
+                     // 5=sealed-materialization
+  u8 has_artifact
+  u8 mir_available
+  u8 wasm_available
+  u32 artifact_id    // present only when has_artifact != 0
+```
+
+Optimization dump kinds use these `u8` values:
+
+- `0`: MIR text
+- `1`: wasm bytes rendered as diagnostic text
 
 ## Value Encoding
 
@@ -443,6 +487,9 @@ Success response payload:
 
 `target_id` is `session_id`.
 
+Compatibility command for setting only the session default optimization mode.
+New clients should use `SET_SESSION_OPT`.
+
 Request payload:
 
 ```text
@@ -451,6 +498,69 @@ u8 reserved[3]
 ```
 
 Success response payload: empty.
+
+### `SET_SESSION_OPT`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+u8 xopt             // 0=NOpt, 1=IOpt, 2=SOpt
+u8 reserved[3]
+u32 object_count
+string objects[object_count]
+```
+
+If `object_count` is `0`, the runtime updates the session default mode. If
+objects are supplied, `module` updates the module/default mode and function
+names update per-function overrides. The session recompiles its active artifact
+when one exists.
+
+Success response payload: empty.
+
+### `GET_SESSION_OPT`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+u8 has_object
+u8 reserved[3]
+string object       // present only when has_object != 0
+```
+
+Success response payload:
+
+```text
+OptimizationStatus[]
+```
+
+With no object, the response includes the module and all known function objects.
+
+### `DUMP_SESSION_OPT`
+
+`target_id` is `session_id`.
+
+Request payload:
+
+```text
+u8 dump_kind        // 0=MIR, 1=wasm
+u8 reserved[3]
+string object       // empty or "module" for the module
+```
+
+Success response payload:
+
+```text
+u8 present
+u8 reserved[3]
+u8 dump_kind        // present only when present != 0
+u8 reserved[3]
+string object       // present only when present != 0
+string text         // present only when present != 0
+```
 
 ### `MOUNT_LIBRARY`
 
@@ -487,9 +597,14 @@ Request payload:
 u8 source_kind       // 0=source text, 1=precompiled artifact
 u8 default_xopt      // 0=NOpt, 1=IOpt, 2=SOpt
 u8 reserved[2]
+OptimizationSettings optimization_settings
 string logical_path
 bytes source
 ```
+
+`default_xopt` and `optimization_settings.default_xopt` must match. The
+duplicated byte keeps the module/default mode visible in the fixed part of the
+payload while allowing per-object overrides to travel with the same request.
 
 Success response payload:
 
@@ -565,6 +680,51 @@ Success response payload:
 - when the result is large: `u32 handle_id`.
 
 The server must return exactly one result value.
+
+### `GET_OPT`
+
+`target_id` is `script_id`.
+
+Request payload:
+
+```text
+OptimizationSettings optimization_settings
+```
+
+Success response payload:
+
+```text
+OptimizationStatus[]
+```
+
+This lets clients query the optimization state of a loaded artifact using the
+same metadata they submitted at compile time.
+
+### `DUMP_OPT`
+
+`target_id` is `script_id`.
+
+Request payload:
+
+```text
+u8 dump_kind        // 0=MIR, 1=wasm
+u8 reserved[3]
+string object       // empty or "module" for the module; function name for MIR
+```
+
+Success response payload:
+
+```text
+u8 present
+u8 reserved[3]
+u8 dump_kind        // present only when present != 0
+u8 reserved[3]
+string object       // present only when present != 0
+string text         // present only when present != 0
+```
+
+MIR dumps are available for the module and function bodies when the artifact
+contains MIR. Wasm dumps are currently module-level only.
 
 ### `RETAIN_HANDLE`
 
