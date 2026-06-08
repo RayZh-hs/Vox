@@ -9,7 +9,7 @@ use vox_core::{
     },
     plan::CompiledArtifact,
     source::ModulePath,
-    value::{InlineValue, RuntimeValue},
+    value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
 use crate::{HostCallArgument, Runtime};
@@ -196,9 +196,7 @@ impl<'a> MirExecutor<'a> {
                     fields.iter().cloned().zip(values).collect(),
                 ))
             }
-            MirOpKind::List => {
-                return Err("MIR execution does not materialize list handles yet".to_owned());
-            }
+            MirOpKind::List => Some(self.materialize_list(self.arg_values(op)?)),
             MirOpKind::StringInterpolate { text } => {
                 Some(eval_string_interpolation(text, self.arg_values(op)?)?)
             }
@@ -339,6 +337,20 @@ impl<'a> MirExecutor<'a> {
         Err(format!("MIR call target `{callee}` is not executable yet"))
     }
 
+    fn materialize_list(&mut self, values: Vec<InlineValue>) -> InlineValue {
+        let summary = HandleSummary {
+            type_name: "List".to_owned(),
+            summary: render_delimited_inline("[", "]", &values),
+            bytes: None,
+        };
+        let handle = if let Some(data) = handle_data_from_inline_list(&values) {
+            self.runtime.allocate_serializable_handle(summary, data)
+        } else {
+            self.runtime.allocate_handle(summary)
+        };
+        InlineValue::Handle(handle)
+    }
+
     fn arg_values(&self, op: &MirOp) -> Result<Vec<InlineValue>, String> {
         op.args
             .iter()
@@ -403,6 +415,35 @@ fn runtime_value_from_inline(value: InlineValue) -> RuntimeValue {
     match value {
         InlineValue::Handle(handle) => RuntimeValue::Handle(handle),
         value => RuntimeValue::Inline(value),
+    }
+}
+
+fn handle_data_from_inline_list(values: &[InlineValue]) -> Option<HandleData> {
+    values
+        .iter()
+        .map(handle_data_from_inline)
+        .collect::<Option<Vec<_>>>()
+        .map(HandleData::List)
+}
+
+fn handle_data_from_inline(value: &InlineValue) -> Option<HandleData> {
+    match value {
+        InlineValue::Null => Some(HandleData::Null),
+        InlineValue::Bool(value) => Some(HandleData::Bool(*value)),
+        InlineValue::Int(value) => Some(HandleData::Int(*value)),
+        InlineValue::Float(value) => Some(HandleData::Float(*value)),
+        InlineValue::String(value) => Some(HandleData::String(value.clone())),
+        InlineValue::Tuple(values) => values
+            .iter()
+            .map(handle_data_from_inline)
+            .collect::<Option<Vec<_>>>()
+            .map(HandleData::Tuple),
+        InlineValue::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Some((name.clone(), handle_data_from_inline(value)?)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(HandleData::Record),
+        InlineValue::Handle(_) => None,
     }
 }
 
