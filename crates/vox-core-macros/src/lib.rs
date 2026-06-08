@@ -1,9 +1,9 @@
 use proc_macro::TokenStream;
 
-use quote::{ToTokens, format_ident, quote};
+use quote::{format_ident, quote, ToTokens};
 use syn::{
-    Attribute, DeriveInput, Error, FnArg, ItemFn, ItemTrait, LitStr, Meta, Pat, ReturnType, Token,
-    TraitItem, parse::Parser, parse_macro_input, punctuated::Punctuated,
+    parse::Parser, parse_macro_input, punctuated::Punctuated, Attribute, DeriveInput, Error, FnArg,
+    ItemFn, ItemTrait, LitStr, Meta, Pat, ReturnType, Token, TraitItem,
 };
 
 #[proc_macro_derive(VoxExport, attributes(vox))]
@@ -75,6 +75,21 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             );
         }
     });
+    let exported_fields = fields.iter().map(|field| {
+        let field_ident = field
+            .ident
+            .as_ref()
+            .expect("named fields should have identifiers");
+        let field_name = field_ident.to_string();
+        let field_ty = &field.ty;
+        let field_ty_text = field_ty.to_token_stream().to_string();
+        quote! {
+            ::vox_core::external_export::ExportedSurfaceField {
+                name: #field_name,
+                rust_type: #field_ty_text,
+            }
+        }
+    });
     Ok(quote! {
         impl ::vox_runtime::host_exports::VoxHandleValue for #ident {
             fn vox_type_name() -> &'static str {
@@ -109,6 +124,7 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 rust_name: stringify!(#ident),
                 vox_name: #vox_name,
                 kind: ::vox_core::external_export::ExportedSurfaceKind::Struct,
+                fields: &[#(#exported_fields),*],
                 order: line!(),
             }
         }
@@ -119,8 +135,9 @@ fn expand_vox_trait(
     args: syn::Result<Vec<Meta>>,
     item: &mut ItemTrait,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    strip_nested_vox_attrs_from_trait(item);
     let vox_name = exported_name_from_meta(&args?)?.unwrap_or_else(|| item.ident.to_string());
+    let method_exports = exported_trait_method_exports(&vox_name, item)?;
+    strip_nested_vox_attrs_from_trait(item);
     let ident = &item.ident;
     Ok(quote! {
         #item
@@ -130,9 +147,12 @@ fn expand_vox_trait(
                 rust_name: stringify!(#ident),
                 vox_name: #vox_name,
                 kind: ::vox_core::external_export::ExportedSurfaceKind::Trait,
+                fields: &[],
                 order: line!(),
             }
         }
+
+        #(#method_exports)*
     })
 }
 
@@ -285,6 +305,76 @@ fn parse_nested_meta(attr: &Attribute) -> syn::Result<Vec<Meta>> {
         .map(|items| items.into_iter().collect::<Vec<_>>())
 }
 
+fn exported_trait_method_exports(
+    trait_vox_name: &str,
+    item: &mut ItemTrait,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut exports = Vec::new();
+    for member in &mut item.items {
+        let TraitItem::Fn(method) = member else {
+            continue;
+        };
+        let Some(attr) = method.attrs.iter().find(|attr| attr.path().is_ident("vox")) else {
+            continue;
+        };
+        let options = TraitMethodOptions::from_meta(&parse_nested_meta(attr)?)?;
+        let method_ident = &method.sig.ident;
+        let vox_name = options
+            .name
+            .clone()
+            .unwrap_or_else(|| method_ident.to_string());
+        let lowered_by = options.lowered_by;
+        let purity = options.purity.tokens();
+        let return_type = match &method.sig.output {
+            ReturnType::Default => "()".to_owned(),
+            ReturnType::Type(_, ty) => ty.to_token_stream().to_string(),
+        };
+
+        let mut parameters = Vec::new();
+        for input in &mut method.sig.inputs {
+            match input {
+                FnArg::Receiver(_) => {}
+                FnArg::Typed(parameter) => {
+                    let name = match &*parameter.pat {
+                        Pat::Ident(ident) => ident.ident.to_string(),
+                        other => {
+                            return Err(Error::new_spanned(
+                                other,
+                                "vox trait method parameters must use simple identifiers",
+                            ));
+                        }
+                    };
+                    let has_default = take_default_marker(&mut parameter.attrs)?;
+                    let ty_text = parameter.ty.to_token_stream().to_string();
+                    parameters.push(quote! {
+                        ::vox_core::external_export::ExportedFunctionParameter {
+                            name: #name,
+                            rust_type: #ty_text,
+                            has_default: #has_default,
+                        }
+                    });
+                }
+            }
+        }
+
+        exports.push(quote! {
+            ::vox_core::external_export::inventory::submit! {
+                ::vox_core::external_export::ExportedTraitMethodRegistration {
+                    trait_vox_name: #trait_vox_name,
+                    rust_name: stringify!(#method_ident),
+                    vox_name: #vox_name,
+                    lowered_by: #lowered_by,
+                    purity: #purity,
+                    parameters: &[#(#parameters),*],
+                    return_rust_type: #return_type,
+                    order: line!(),
+                }
+            }
+        });
+    }
+    Ok(exports)
+}
+
 fn strip_nested_vox_attrs_from_trait(item: &mut ItemTrait) {
     for member in &mut item.items {
         let TraitItem::Fn(method) = member else {
@@ -362,6 +452,53 @@ impl FunctionOptions {
     }
 }
 
+struct TraitMethodOptions {
+    name: Option<String>,
+    lowered_by: String,
+    purity: PurityValue,
+}
+
+impl TraitMethodOptions {
+    fn from_meta(meta: &[Meta]) -> syn::Result<Self> {
+        let mut name = None;
+        let mut lowered_by = None;
+        let mut purity = PurityValue::Pure;
+
+        for entry in meta {
+            let Meta::NameValue(value) = entry else {
+                return Err(Error::new_spanned(entry, "expected name = value"));
+            };
+            if value.path.is_ident("name") {
+                name = Some(expect_lit_str(&value.value, "name")?.value());
+                continue;
+            }
+            if value.path.is_ident("lowered_by") {
+                lowered_by = Some(expect_ident_or_lit_str(&value.value, "lowered_by")?);
+                continue;
+            }
+            if value.path.is_ident("purity") {
+                purity = PurityValue::parse(expect_lit_str(&value.value, "purity")?)?;
+                continue;
+            }
+            return Err(Error::new_spanned(
+                value,
+                "unsupported trait method vox option",
+            ));
+        }
+
+        Ok(Self {
+            name,
+            lowered_by: lowered_by.ok_or_else(|| {
+                Error::new(
+                    proc_macro2::Span::call_site(),
+                    "trait method #[vox(...)] requires lowered_by",
+                )
+            })?,
+            purity,
+        })
+    }
+}
+
 fn expect_lit_str<'a>(expr: &'a syn::Expr, field: &str) -> syn::Result<&'a LitStr> {
     let syn::Expr::Lit(value) = expr else {
         return Err(Error::new_spanned(
@@ -376,6 +513,23 @@ fn expect_lit_str<'a>(expr: &'a syn::Expr, field: &str) -> syn::Result<&'a LitSt
         ));
     };
     Ok(value)
+}
+
+fn expect_ident_or_lit_str(expr: &syn::Expr, field: &str) -> syn::Result<String> {
+    if let syn::Expr::Path(path) = expr {
+        if let Some(ident) = path.path.get_ident() {
+            return Ok(ident.to_string());
+        }
+    }
+    if let syn::Expr::Lit(value) = expr {
+        if let syn::Lit::Str(value) = &value.lit {
+            return Ok(value.value());
+        }
+    }
+    Err(Error::new_spanned(
+        expr,
+        format!("{field} expects an identifier or string literal"),
+    ))
 }
 
 enum PurityValue {

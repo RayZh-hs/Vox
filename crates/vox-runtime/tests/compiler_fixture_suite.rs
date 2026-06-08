@@ -5,7 +5,10 @@ use std::{
 
 use vox_compiler::{CompileRequest, Compiler, FrontendUnit};
 use vox_core::{
-    host::{FunctionSpec, HostRegistry, PackageManifest, ParameterSpec, Purity, TypeSpec},
+    host::{
+        FieldSpec, FunctionExportKind, FunctionSpec, HostRegistry, PackageManifest, ParameterSpec,
+        Purity, TraitMethodSpec, TraitSpec, TypeSpec,
+    },
     opt::OptimizationLevel,
     source::{ModulePath, SourceText},
     types::{QualifiedTypeName, VoxType},
@@ -183,7 +186,9 @@ fn host_manifest() -> PackageManifest {
                 module: package.clone(),
                 name: "Service".to_owned(),
             },
+            fields: Vec::new(),
         }],
+        traits: Vec::new(),
         functions: vec![FunctionSpec {
             name: "add".to_owned(),
             parameters: vec![
@@ -200,6 +205,7 @@ fn host_manifest() -> PackageManifest {
             ],
             return_type: VoxType::Int,
             purity: Purity::Pure,
+            export: FunctionExportKind::Function,
         }],
     }
 }
@@ -208,6 +214,7 @@ fn tools_manifest() -> PackageManifest {
     PackageManifest {
         package: ModulePath::parse("fixtures.tools").expect("valid tools package path"),
         types: Vec::new(),
+        traits: Vec::new(),
         functions: Vec::new(),
     }
 }
@@ -219,14 +226,33 @@ fn image_manifest() -> PackageManifest {
 
     PackageManifest {
         package: package.clone(),
-        types: vec![
-            TypeSpec {
-                name: qualified_type(&package, "Image"),
-            },
-            TypeSpec {
-                name: qualified_type(&package, "Filter"),
-            },
-        ],
+        types: vec![TypeSpec {
+            name: qualified_type(&package, "Image"),
+            fields: vec![
+                FieldSpec {
+                    name: "width".to_owned(),
+                    ty: VoxType::Int,
+                },
+                FieldSpec {
+                    name: "height".to_owned(),
+                    ty: VoxType::Int,
+                },
+            ],
+        }],
+        traits: vec![TraitSpec {
+            name: qualified_type(&package, "Filter"),
+            methods: vec![TraitMethodSpec {
+                name: "apply".to_owned(),
+                lowered_by: "filter_apply".to_owned(),
+                parameters: vec![ParameterSpec {
+                    name: "input".to_owned(),
+                    ty: image_type.clone(),
+                    has_default: false,
+                }],
+                return_type: image_type.clone(),
+                purity: Purity::Pure,
+            }],
+        }],
         functions: vec![
             FunctionSpec {
                 name: "load".to_owned(),
@@ -237,6 +263,7 @@ fn image_manifest() -> PackageManifest {
                 }],
                 return_type: image_type.clone(),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
             FunctionSpec {
                 name: "blur".to_owned(),
@@ -254,6 +281,7 @@ fn image_manifest() -> PackageManifest {
                 ],
                 return_type: image_type.clone(),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
             FunctionSpec {
                 name: "filter_apply".to_owned(),
@@ -271,6 +299,10 @@ fn image_manifest() -> PackageManifest {
                 ],
                 return_type: image_type.clone(),
                 purity: Purity::Pure,
+                export: FunctionExportKind::LoweredTraitMethod {
+                    trait_name: qualified_type(&package, "Filter"),
+                    method_name: "apply".to_owned(),
+                },
             },
             FunctionSpec {
                 name: "histogram".to_owned(),
@@ -294,6 +326,7 @@ fn image_manifest() -> PackageManifest {
                     },
                 ]),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
             FunctionSpec {
                 name: "dimensions".to_owned(),
@@ -304,6 +337,7 @@ fn image_manifest() -> PackageManifest {
                 }],
                 return_type: VoxType::Tuple(vec![VoxType::Int, VoxType::Int]),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
             FunctionSpec {
                 name: "tags".to_owned(),
@@ -314,6 +348,7 @@ fn image_manifest() -> PackageManifest {
                 }],
                 return_type: VoxType::List(Box::new(VoxType::String)),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
             FunctionSpec {
                 name: "optional".to_owned(),
@@ -324,6 +359,7 @@ fn image_manifest() -> PackageManifest {
                 }],
                 return_type: VoxType::Nullable(Box::new(image_type)),
                 purity: Purity::Pure,
+                export: FunctionExportKind::Function,
             },
         ],
     }

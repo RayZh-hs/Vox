@@ -24,17 +24,56 @@ pub struct FunctionSpec {
     pub parameters: Vec<ParameterSpec>,
     pub return_type: VoxType,
     pub purity: Purity,
+    pub export: FunctionExportKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionExportKind {
+    Function,
+    LoweredTraitMethod {
+        trait_name: QualifiedTypeName,
+        method_name: String,
+    },
+}
+
+impl Default for FunctionExportKind {
+    fn default() -> Self {
+        Self::Function
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldSpec {
+    pub name: String,
+    pub ty: VoxType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeSpec {
     pub name: QualifiedTypeName,
+    pub fields: Vec<FieldSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMethodSpec {
+    pub name: String,
+    pub lowered_by: String,
+    pub parameters: Vec<ParameterSpec>,
+    pub return_type: VoxType,
+    pub purity: Purity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitSpec {
+    pub name: QualifiedTypeName,
+    pub methods: Vec<TraitMethodSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub package: ModulePath,
     pub types: Vec<TypeSpec>,
+    pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
 }
 

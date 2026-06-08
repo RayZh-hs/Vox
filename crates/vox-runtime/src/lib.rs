@@ -19,6 +19,7 @@ mod session;
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler};
 use vox_core::{
+    external_library::ExternalLibrary,
     host::{HostRegistry, PackageManifest},
     ids::{ArtifactId, HandleId, LibraryId},
     opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
@@ -186,6 +187,13 @@ impl Runtime {
             manifest,
         });
         id
+    }
+
+    pub fn mount_external_library(
+        &mut self,
+        library: ExternalLibrary,
+    ) -> Result<LibraryId, String> {
+        library.build().map(|manifest| self.mount_library(manifest))
     }
 
     pub fn mount_host_library<I>(

@@ -1469,6 +1469,63 @@ impl<'a> TypeEngine<'a> {
                         "type",
                     ));
                 }
+                if manifest
+                    .traits
+                    .iter()
+                    .any(|trait_spec| trait_spec.name.name == *symbol)
+                {
+                    return Err(type_name_used_as_value_error(
+                        &format!("{package}.{symbol}"),
+                        "trait",
+                    ));
+                }
+            }
+
+            if name.segments.len() == length + 2 {
+                let trait_symbol = &name.segments[length];
+                let method_symbol = &name.segments[length + 1];
+                if let Some(trait_spec) = manifest
+                    .traits
+                    .iter()
+                    .find(|trait_spec| trait_spec.name.name == *trait_symbol)
+                {
+                    if let Some(method) = trait_spec
+                        .methods
+                        .iter()
+                        .find(|method| method.name == *method_symbol)
+                    {
+                        if let Some(function) = manifest
+                            .functions
+                            .iter()
+                            .find(|function| function.name == method.lowered_by)
+                        {
+                            return Ok(ReplType::Function {
+                                parameters: function
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| from_vox_host_type(&parameter.ty))
+                                    .collect(),
+                                result: Box::new(from_vox_host_type(&function.return_type)),
+                            });
+                        }
+
+                        let mut parameters = vec![ReplType::DynTrait(format!(
+                            "{}.{}",
+                            trait_spec.name.module.as_str(),
+                            trait_spec.name.name
+                        ))];
+                        parameters.extend(
+                            method
+                                .parameters
+                                .iter()
+                                .map(|parameter| from_vox_host_type(&parameter.ty)),
+                        );
+                        return Ok(ReplType::Function {
+                            parameters,
+                            result: Box::new(from_vox_host_type(&method.return_type)),
+                        });
+                    }
+                }
             }
         }
 
@@ -2189,6 +2246,17 @@ pub fn extend_manifest_symbols(symbols: &mut Vec<String>, manifest: &PackageMani
 
     for ty in &manifest.types {
         symbols.push(format!("{package}.{}", ty.name.name));
+    }
+
+    for trait_spec in &manifest.traits {
+        symbols.push(format!("{package}.{}", trait_spec.name.name));
+        for method in &trait_spec.methods {
+            symbols.push(format!(
+                "{package}.{}.{}",
+                trait_spec.name.name, method.name
+            ));
+            symbols.push(format!("{package}.{}", method.lowered_by));
+        }
     }
 }
 

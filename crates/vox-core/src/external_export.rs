@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    host::{FunctionSpec, PackageManifest, ParameterSpec, Purity, TypeSpec},
+    host::{
+        FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
+        TraitMethodSpec, TraitSpec, TypeSpec,
+    },
     source::ModulePath,
     types::{QualifiedTypeName, RecordField, VoxType},
 };
@@ -19,7 +22,14 @@ pub struct ExportedSurfaceRegistration {
     pub rust_name: &'static str,
     pub vox_name: &'static str,
     pub kind: ExportedSurfaceKind,
+    pub fields: &'static [ExportedSurfaceField],
     pub order: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExportedSurfaceField {
+    pub name: &'static str,
+    pub rust_type: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,18 +50,26 @@ pub struct ExportedFunctionRegistration {
     pub order: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExportedTraitMethodRegistration {
+    pub trait_vox_name: &'static str,
+    pub rust_name: &'static str,
+    pub vox_name: &'static str,
+    pub lowered_by: &'static str,
+    pub purity: Purity,
+    pub parameters: &'static [ExportedFunctionParameter],
+    pub return_rust_type: &'static str,
+    pub order: u32,
+}
+
 inventory::collect!(ExportedSurfaceRegistration);
 inventory::collect!(ExportedFunctionRegistration);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectedSurface {
-    pub name: String,
-    pub kind: Option<ExportedSurfaceKind>,
-}
+inventory::collect!(ExportedTraitMethodRegistration);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedPackageExports {
-    pub surfaces: Vec<CollectedSurface>,
+    pub types: Vec<TypeSpec>,
+    pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
 }
 
@@ -59,19 +77,10 @@ pub fn extend_manifest_with_registered_exports(
     manifest: PackageManifest,
 ) -> Result<PackageManifest, String> {
     let collected = collect_registered_package_exports(&manifest)?;
-    let package = manifest.package.clone();
     Ok(PackageManifest {
-        package: package.clone(),
-        types: collected
-            .surfaces
-            .into_iter()
-            .map(|surface| TypeSpec {
-                name: QualifiedTypeName {
-                    module: package.clone(),
-                    name: surface.name,
-                },
-            })
-            .collect(),
+        package: manifest.package.clone(),
+        types: collected.types,
+        traits: collected.traits,
         functions: collected.functions,
     })
 }
@@ -129,32 +138,93 @@ pub fn collect_registered_package_exports(
         functions.push(build_function_spec(package, function)?);
     }
 
+    let mut registered_methods = inventory::iter::<ExportedTraitMethodRegistration>
+        .into_iter()
+        .copied()
+        .collect::<Vec<_>>();
+    registered_methods.sort_by(|left, right| {
+        left.order
+            .cmp(&right.order)
+            .then(left.trait_vox_name.cmp(right.trait_vox_name))
+            .then(left.vox_name.cmp(right.vox_name))
+            .then(left.rust_name.cmp(right.rust_name))
+    });
+
+    let mut methods_by_trait = BTreeMap::<&str, Vec<TraitMethodSpec>>::new();
+    let mut seen_methods = BTreeSet::new();
+    for method in &registered_methods {
+        if !seen_methods.insert((method.trait_vox_name, method.vox_name)) {
+            return Err(format!(
+                "duplicate exported trait method `{}.{}` from `{}`",
+                method.trait_vox_name, method.vox_name, method.rust_name
+            ));
+        }
+
+        let trait_name = qualified(package, method.trait_vox_name);
+        let Some(function) = functions
+            .iter_mut()
+            .find(|function| function.name == method.lowered_by)
+        else {
+            return Err(format!(
+                "lowered function `{}` for trait method `{}.{}` is not exported",
+                method.lowered_by, method.trait_vox_name, method.vox_name
+            ));
+        };
+        function.export = FunctionExportKind::LoweredTraitMethod {
+            trait_name,
+            method_name: method.vox_name.to_owned(),
+        };
+
+        methods_by_trait
+            .entry(method.trait_vox_name)
+            .or_default()
+            .push(build_trait_method_spec(package, method)?);
+    }
+
     let mut referenced_surface_names = manifest
         .types
         .iter()
         .map(|ty| ty.name.name.clone())
         .collect::<BTreeSet<_>>();
+    referenced_surface_names.extend(manifest.traits.iter().map(|ty| ty.name.name.clone()));
+    referenced_surface_names.extend(methods_by_trait.keys().map(|name| (*name).to_owned()));
     for function in &functions {
         collect_surface_names(&function.return_type, &mut referenced_surface_names);
         for parameter in &function.parameters {
             collect_surface_names(&parameter.ty, &mut referenced_surface_names);
         }
     }
-
-    let mut manual_surfaces = Vec::with_capacity(manifest.types.len());
-    let mut seen_surface_names = BTreeSet::new();
-    for ty in &manifest.types {
-        if seen_surface_names.insert(ty.name.name.clone()) {
-            manual_surfaces.push(CollectedSurface {
-                name: ty.name.name.clone(),
-                kind: None,
-            });
+    for methods in methods_by_trait.values() {
+        for method in methods {
+            collect_surface_names(&method.return_type, &mut referenced_surface_names);
+            for parameter in &method.parameters {
+                collect_surface_names(&parameter.ty, &mut referenced_surface_names);
+            }
         }
     }
 
-    let mut surfaces = manual_surfaces;
+    let mut types = Vec::with_capacity(manifest.types.len());
+    let mut seen_type_names = BTreeSet::new();
+    for ty in &manifest.types {
+        if seen_type_names.insert(ty.name.name.clone()) {
+            types.push(ty.clone());
+        }
+    }
+
+    let mut traits = Vec::with_capacity(manifest.traits.len());
+    let mut seen_trait_names = BTreeSet::new();
+    for trait_spec in &manifest.traits {
+        if seen_trait_names.insert(trait_spec.name.name.clone()) {
+            let mut trait_spec = trait_spec.clone();
+            if let Some(mut methods) = methods_by_trait.remove(trait_spec.name.name.as_str()) {
+                trait_spec.methods.append(&mut methods);
+            }
+            traits.push(trait_spec);
+        }
+    }
+
     for name in &referenced_surface_names {
-        if seen_surface_names.contains(name) {
+        if seen_type_names.contains(name) || seen_trait_names.contains(name) {
             continue;
         }
         let Some(surface) = surface_registry.get(name.as_str()) else {
@@ -162,15 +232,29 @@ pub fn collect_registered_package_exports(
                 "exported function surface `{name}` is not registered as a Vox struct or trait"
             ));
         };
-        surfaces.push(CollectedSurface {
-            name: surface.vox_name.to_owned(),
-            kind: Some(surface.kind),
-        });
-        seen_surface_names.insert(surface.vox_name.to_owned());
+        match surface.kind {
+            ExportedSurfaceKind::Struct => {
+                types.push(TypeSpec {
+                    name: qualified(package, surface.vox_name),
+                    fields: build_field_specs(package, surface)?,
+                });
+                seen_type_names.insert(surface.vox_name.to_owned());
+            }
+            ExportedSurfaceKind::Trait => {
+                traits.push(TraitSpec {
+                    name: qualified(package, surface.vox_name),
+                    methods: methods_by_trait
+                        .remove(surface.vox_name)
+                        .unwrap_or_default(),
+                });
+                seen_trait_names.insert(surface.vox_name.to_owned());
+            }
+        }
     }
 
     Ok(CollectedPackageExports {
-        surfaces,
+        types,
+        traits,
         functions,
     })
 }
@@ -197,7 +281,47 @@ fn build_function_spec(
             None => parse_rust_type(package, function.return_rust_type)?,
         },
         purity: function.purity,
+        export: FunctionExportKind::Function,
     })
+}
+
+fn build_trait_method_spec(
+    package: &ModulePath,
+    method: &ExportedTraitMethodRegistration,
+) -> Result<TraitMethodSpec, String> {
+    Ok(TraitMethodSpec {
+        name: method.vox_name.to_owned(),
+        lowered_by: method.lowered_by.to_owned(),
+        parameters: method
+            .parameters
+            .iter()
+            .map(|parameter| {
+                Ok(ParameterSpec {
+                    name: parameter.name.to_owned(),
+                    ty: parse_rust_type(package, parameter.rust_type)?,
+                    has_default: parameter.has_default,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        return_type: parse_rust_type(package, method.return_rust_type)?,
+        purity: method.purity,
+    })
+}
+
+fn build_field_specs(
+    package: &ModulePath,
+    surface: &ExportedSurfaceRegistration,
+) -> Result<Vec<FieldSpec>, String> {
+    surface
+        .fields
+        .iter()
+        .map(|field| {
+            Ok(FieldSpec {
+                name: field.name.to_owned(),
+                ty: parse_rust_type(package, field.rust_type)?,
+            })
+        })
+        .collect()
 }
 
 fn collect_surface_names(ty: &VoxType, out: &mut BTreeSet<String>) {

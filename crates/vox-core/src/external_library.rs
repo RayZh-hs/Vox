@@ -6,13 +6,16 @@ use std::{
 use crate::{
     diagnostics::Diagnostic,
     external_export::extend_manifest_with_registered_exports,
-    host::{FunctionSpec, PackageManifest, ParameterSpec, Purity, TypeSpec},
+    host::{
+        FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
+        TraitMethodSpec, TraitSpec, TypeSpec,
+    },
     source::ModulePath,
     types::{QualifiedTypeName, RecordField, VoxType},
 };
 
 pub const EXTERNAL_LIBRARY_HEADER_MAGIC: [u8; 4] = *b"VXLH";
-pub const EXTERNAL_LIBRARY_HEADER_VERSION: u16 = 1;
+pub const EXTERNAL_LIBRARY_HEADER_VERSION: u16 = 2;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +55,7 @@ impl ExternalLibrary {
             manifest: PackageManifest {
                 package: ModulePath::parse(package)?,
                 types: Vec::new(),
+                traits: Vec::new(),
                 functions: Vec::new(),
             },
         })
@@ -200,6 +204,27 @@ pub fn encode_package_manifest(
     writer.write_len(manifest.types.len(), "type list")?;
     for ty in &manifest.types {
         encode_qualified_type_name(&mut writer, &ty.name)?;
+        writer.write_len(ty.fields.len(), "field list")?;
+        for field in &ty.fields {
+            writer.write_string(&field.name)?;
+            encode_vox_type(&mut writer, &field.ty)?;
+        }
+    }
+
+    writer.write_len(manifest.traits.len(), "trait list")?;
+    for trait_spec in &manifest.traits {
+        encode_qualified_type_name(&mut writer, &trait_spec.name)?;
+        writer.write_len(trait_spec.methods.len(), "trait method list")?;
+        for method in &trait_spec.methods {
+            writer.write_string(&method.name)?;
+            writer.write_string(&method.lowered_by)?;
+            writer.write_len(method.parameters.len(), "trait method parameter list")?;
+            for parameter in &method.parameters {
+                encode_parameter_spec(&mut writer, parameter)?;
+            }
+            encode_vox_type(&mut writer, &method.return_type)?;
+            encode_purity(&mut writer, method.purity);
+        }
     }
 
     writer.write_len(manifest.functions.len(), "function list")?;
@@ -207,15 +232,11 @@ pub fn encode_package_manifest(
         writer.write_string(&function.name)?;
         writer.write_len(function.parameters.len(), "parameter list")?;
         for parameter in &function.parameters {
-            writer.write_string(&parameter.name)?;
-            encode_vox_type(&mut writer, &parameter.ty)?;
-            writer.write_u8(u8::from(parameter.has_default));
+            encode_parameter_spec(&mut writer, parameter)?;
         }
         encode_vox_type(&mut writer, &function.return_type)?;
-        writer.write_u8(match function.purity {
-            Purity::Pure => 0,
-            Purity::Evil => 1,
-        });
+        encode_purity(&mut writer, function.purity);
+        encode_function_export_kind(&mut writer, &function.export)?;
     }
 
     Ok(writer.into_inner())
@@ -231,9 +252,43 @@ pub fn decode_package_manifest(
     let type_count = reader.read_u32()? as usize;
     let mut types = Vec::with_capacity(type_count);
     for _ in 0..type_count {
-        types.push(TypeSpec {
-            name: decode_qualified_type_name(&mut reader)?,
-        });
+        let name = decode_qualified_type_name(&mut reader)?;
+        let field_count = reader.read_u32()? as usize;
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            fields.push(FieldSpec {
+                name: reader.read_string()?,
+                ty: decode_vox_type(&mut reader)?,
+            });
+        }
+        types.push(TypeSpec { name, fields });
+    }
+
+    let trait_count = reader.read_u32()? as usize;
+    let mut traits = Vec::with_capacity(trait_count);
+    for _ in 0..trait_count {
+        let name = decode_qualified_type_name(&mut reader)?;
+        let method_count = reader.read_u32()? as usize;
+        let mut methods = Vec::with_capacity(method_count);
+        for _ in 0..method_count {
+            let method_name = reader.read_string()?;
+            let lowered_by = reader.read_string()?;
+            let parameter_count = reader.read_u32()? as usize;
+            let mut parameters = Vec::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                parameters.push(decode_parameter_spec(&mut reader)?);
+            }
+            let return_type = decode_vox_type(&mut reader)?;
+            let purity = decode_purity(&mut reader)?;
+            methods.push(TraitMethodSpec {
+                name: method_name,
+                lowered_by,
+                parameters,
+                return_type,
+                purity,
+            });
+        }
+        traits.push(TraitSpec { name, methods });
     }
 
     let function_count = reader.read_u32()? as usize;
@@ -243,35 +298,17 @@ pub fn decode_package_manifest(
         let parameter_count = reader.read_u32()? as usize;
         let mut parameters = Vec::with_capacity(parameter_count);
         for _ in 0..parameter_count {
-            parameters.push(ParameterSpec {
-                name: reader.read_string()?,
-                ty: decode_vox_type(&mut reader)?,
-                has_default: match reader.read_u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => {
-                        return Err(ExternalLibraryFormatError::Message(
-                            "invalid default-value flag".to_owned(),
-                        ));
-                    }
-                },
-            });
+            parameters.push(decode_parameter_spec(&mut reader)?);
         }
         let return_type = decode_vox_type(&mut reader)?;
-        let purity = match reader.read_u8()? {
-            0 => Purity::Pure,
-            1 => Purity::Evil,
-            _ => {
-                return Err(ExternalLibraryFormatError::Message(
-                    "invalid purity tag".to_owned(),
-                ));
-            }
-        };
+        let purity = decode_purity(&mut reader)?;
+        let export = decode_function_export_kind(&mut reader)?;
         functions.push(FunctionSpec {
             name,
             parameters,
             return_type,
             purity,
+            export,
         });
     }
 
@@ -279,8 +316,87 @@ pub fn decode_package_manifest(
     Ok(PackageManifest {
         package,
         types,
+        traits,
         functions,
     })
+}
+
+fn encode_parameter_spec(
+    writer: &mut BinaryWriter,
+    parameter: &ParameterSpec,
+) -> Result<(), ExternalLibraryFormatError> {
+    writer.write_string(&parameter.name)?;
+    encode_vox_type(writer, &parameter.ty)?;
+    writer.write_u8(u8::from(parameter.has_default));
+    Ok(())
+}
+
+fn decode_parameter_spec(
+    reader: &mut BinaryReader<'_>,
+) -> Result<ParameterSpec, ExternalLibraryFormatError> {
+    Ok(ParameterSpec {
+        name: reader.read_string()?,
+        ty: decode_vox_type(reader)?,
+        has_default: match reader.read_u8()? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(ExternalLibraryFormatError::Message(
+                    "invalid default-value flag".to_owned(),
+                ));
+            }
+        },
+    })
+}
+
+fn encode_purity(writer: &mut BinaryWriter, purity: Purity) {
+    writer.write_u8(match purity {
+        Purity::Pure => 0,
+        Purity::Evil => 1,
+    });
+}
+
+fn decode_purity(reader: &mut BinaryReader<'_>) -> Result<Purity, ExternalLibraryFormatError> {
+    match reader.read_u8()? {
+        0 => Ok(Purity::Pure),
+        1 => Ok(Purity::Evil),
+        _ => Err(ExternalLibraryFormatError::Message(
+            "invalid purity tag".to_owned(),
+        )),
+    }
+}
+
+fn encode_function_export_kind(
+    writer: &mut BinaryWriter,
+    export: &FunctionExportKind,
+) -> Result<(), ExternalLibraryFormatError> {
+    match export {
+        FunctionExportKind::Function => writer.write_u8(0),
+        FunctionExportKind::LoweredTraitMethod {
+            trait_name,
+            method_name,
+        } => {
+            writer.write_u8(1);
+            encode_qualified_type_name(writer, trait_name)?;
+            writer.write_string(method_name)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_function_export_kind(
+    reader: &mut BinaryReader<'_>,
+) -> Result<FunctionExportKind, ExternalLibraryFormatError> {
+    match reader.read_u8()? {
+        0 => Ok(FunctionExportKind::Function),
+        1 => Ok(FunctionExportKind::LoweredTraitMethod {
+            trait_name: decode_qualified_type_name(reader)?,
+            method_name: reader.read_string()?,
+        }),
+        _ => Err(ExternalLibraryFormatError::Message(
+            "invalid function export tag".to_owned(),
+        )),
+    }
 }
 
 fn encode_vox_type(

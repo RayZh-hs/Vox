@@ -1,6 +1,9 @@
 extern crate self as vox_core;
 
 pub mod diagnostics;
+pub mod embedded_library {
+    pub use crate::external_library::*;
+}
 pub mod external_export;
 pub mod external_library;
 pub mod host;
