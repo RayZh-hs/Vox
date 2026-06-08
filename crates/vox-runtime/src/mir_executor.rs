@@ -224,9 +224,7 @@ impl<'a> MirExecutor<'a> {
             MirOpKind::Call { callee, purity } => {
                 Some(self.eval_call(body, callee, *purity, &op.args)?)
             }
-            MirOpKind::Econ { .. } => {
-                return Err("MIR execution does not materialize econ handles yet".to_owned());
-            }
+            MirOpKind::Econ { .. } => Some(self.materialize_econ(self.single_arg(op)?)),
             MirOpKind::NonNull => {
                 let value = self.single_arg(op)?;
                 if matches!(value, InlineValue::Null) {
@@ -349,6 +347,15 @@ impl<'a> MirExecutor<'a> {
             self.runtime.allocate_handle(summary)
         };
         InlineValue::Handle(handle)
+    }
+
+    fn materialize_econ(&mut self, value: InlineValue) -> InlineValue {
+        let summary = HandleSummary {
+            type_name: "Econ".to_owned(),
+            summary: format!("econ({})", render_inline_value(&value)),
+            bytes: None,
+        };
+        InlineValue::Handle(self.runtime.allocate_handle(summary))
     }
 
     fn arg_values(&self, op: &MirOp) -> Result<Vec<InlineValue>, String> {
