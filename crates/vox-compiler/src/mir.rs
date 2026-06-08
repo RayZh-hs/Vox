@@ -324,6 +324,20 @@ impl BodyBuilder {
                 );
             }
             BlockItem::CompoundAssignment(assignment) => {
+                let Some(previous) = self.resolve_binding(&assignment.name) else {
+                    self.terminate_with_panic(format!(
+                        "assignment requires a previously declared `var`, but `{}` was not found",
+                        assignment.name
+                    ));
+                    return;
+                };
+                if !previous.mutable {
+                    self.terminate_with_panic(format!(
+                        "cannot assign to immutable binding `{}`",
+                        assignment.name
+                    ));
+                    return;
+                }
                 let lhs = self.use_name(&assignment.name, Some(assignment.span.clone()));
                 let rhs = self.lower_expr(&assignment.value);
                 let value = self.emit_op(
@@ -961,21 +975,13 @@ impl BodyBuilder {
         _span: Option<vox_core::diagnostics::TextSpan>,
     ) {
         let Some(previous) = self.resolve_binding(name) else {
-            self.emit_op_with_result(
-                None,
-                MirOpKind::Unknown(format!("assign_missing {name}")),
-                vec![value],
-                None,
-            );
+            self.terminate_with_panic(format!(
+                "assignment requires a previously declared `var`, but `{name}` was not found"
+            ));
             return;
         };
         if !previous.mutable {
-            self.emit_op_with_result(
-                None,
-                MirOpKind::Unknown(format!("assign_immutable {name}")),
-                vec![value],
-                None,
-            );
+            self.terminate_with_panic(format!("cannot assign to immutable binding `{name}`"));
             return;
         }
         let version_id = self.new_version(previous.binding, value, source);
@@ -1108,6 +1114,11 @@ impl BodyBuilder {
             MirTerminator::Panic(_) | MirTerminator::Unreachable => {}
         }
         self.current_block().terminator = terminator;
+    }
+
+    fn terminate_with_panic(&mut self, message: String) {
+        self.terminate(MirTerminator::Panic(message));
+        self.current = self.new_block("after_panic");
     }
 
     fn new_block(&mut self, name: &str) -> MirBlockId {
