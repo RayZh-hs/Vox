@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use vox_core::{
-    host::Purity,
+    host::ParameterSpec,
     ids::ArtifactId,
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOp, MirOpKind, MirPathSegment,
@@ -16,17 +16,15 @@ use crate::{HostCallArgument, Runtime};
 
 pub struct MirExecutor<'a> {
     runtime: &'a mut Runtime,
-    artifact_id: ArtifactId,
     module: &'a MirModule,
     values: BTreeMap<MirValueId, InlineValue>,
     versions: BTreeMap<MirVersionId, InlineValue>,
 }
 
 impl<'a> MirExecutor<'a> {
-    pub fn new(runtime: &'a mut Runtime, artifact_id: ArtifactId, module: &'a MirModule) -> Self {
+    pub fn new(runtime: &'a mut Runtime, _artifact_id: ArtifactId, module: &'a MirModule) -> Self {
         Self {
             runtime,
-            artifact_id,
             module,
             values: BTreeMap::new(),
             versions: BTreeMap::new(),
@@ -44,15 +42,15 @@ impl<'a> MirExecutor<'a> {
             .iter()
             .find(|body| matches!(body.kind, MirBodyKind::ScriptEntry))
             .ok_or_else(|| "MIR module does not contain a script entry body".to_owned())?;
-        self.run_body(body, artifact, arguments)
+        self.run_body(body, arguments, Some(&artifact.parameters))
             .map(runtime_value_from_inline)
     }
 
     fn run_body(
         &mut self,
         body: &MirBody,
-        artifact: &CompiledArtifact,
         arguments: &[RuntimeValue],
+        parameter_specs: Option<&[ParameterSpec]>,
     ) -> Result<InlineValue, String> {
         self.values.clear();
         self.versions.clear();
@@ -64,21 +62,16 @@ impl<'a> MirExecutor<'a> {
                 arguments.len()
             ));
         }
-        if arguments.len() < body.parameters.len()
-            && artifact
-                .parameters
-                .iter()
-                .skip(arguments.len())
-                .any(|parameter| parameter.has_default)
-        {
-            return Err("MIR execution does not evaluate script parameter defaults yet".to_owned());
-        }
         if arguments.len() < body.parameters.len() {
-            let missing = artifact
-                .parameters
-                .get(arguments.len())
-                .map(|parameter| parameter.name.as_str())
-                .unwrap_or("<unknown>");
+            let missing = parameter_specs
+                .and_then(|parameters| parameters.get(arguments.len()))
+                .map(|parameter| (parameter.name.as_str(), parameter.has_default));
+            if missing.is_some_and(|(_, has_default)| has_default) {
+                return Err(
+                    "MIR execution does not evaluate script parameter defaults yet".to_owned(),
+                );
+            }
+            let missing = missing.map(|(name, _)| name).unwrap_or("<unknown>");
             return Err(format!("missing required script parameter `{missing}`"));
         }
 
@@ -101,7 +94,7 @@ impl<'a> MirExecutor<'a> {
 
             let block = block_by_id(body, current)?;
             for op in &block.ops {
-                self.eval_op(body, op)?;
+                self.eval_op(op)?;
             }
 
             match &block.terminator {
@@ -163,7 +156,7 @@ impl<'a> MirExecutor<'a> {
         Ok(())
     }
 
-    fn eval_op(&mut self, body: &MirBody, op: &MirOp) -> Result<(), String> {
+    fn eval_op(&mut self, op: &MirOp) -> Result<(), String> {
         let result = match &op.kind {
             MirOpKind::Literal(value) => Some(value.clone()),
             MirOpKind::Unit => Some(InlineValue::Tuple(Vec::new())),
@@ -217,7 +210,8 @@ impl<'a> MirExecutor<'a> {
                 Some(apply_updated_path(target, path, replacement)?)
             }
             MirOpKind::Call { callee, purity } => {
-                Some(self.eval_call(body, callee, *purity, &op.args)?)
+                let _ = purity;
+                Some(self.eval_call(callee, &op.args)?)
             }
             MirOpKind::Econ { .. } => Some(self.materialize_econ(self.single_arg(op)?)),
             MirOpKind::NonNull => {
@@ -263,9 +257,7 @@ impl<'a> MirExecutor<'a> {
 
     fn eval_call(
         &mut self,
-        body: &MirBody,
         callee: &str,
-        purity: Purity,
         args: &[MirValueId],
     ) -> Result<InlineValue, String> {
         let runtime_args = args
@@ -287,25 +279,7 @@ impl<'a> MirExecutor<'a> {
                 .collect::<Vec<_>>();
             let saved_values = self.values.clone();
             let saved_versions = self.versions.clone();
-            let result = self.run_body(
-                &function,
-                &CompiledArtifact {
-                    id: self.artifact_id,
-                    module: self.module.module.clone(),
-                    kind: self.module.kind,
-                    optimization: self.module.optimization,
-                    optimization_rankings: Vec::new(),
-                    parameters: Vec::new(),
-                    result_type: None,
-                    purity,
-                    plan: vox_core::plan::ExecutablePlan::deferred(body.optimization_rank),
-                    mir: None,
-                    diagnostics: vox_core::diagnostics::DiagnosticBag::default(),
-                    dependencies: Vec::new(),
-                    source_revision: 0,
-                },
-                &arguments,
-            );
+            let result = self.run_body(&function, &arguments, None);
             self.values = saved_values;
             self.versions = saved_versions;
             return result;
