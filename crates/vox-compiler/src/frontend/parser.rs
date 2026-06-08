@@ -180,6 +180,10 @@ impl Parser {
             return self.error_here("`return` may only be used inside a function body");
         }
 
+        if self.consume(TokenKind::Semicolon) {
+            return Ok(None);
+        }
+
         let checkpoint = self.index;
         let expr = self.parse_expr()?;
         if self.consume(TokenKind::Semicolon) {
@@ -1263,6 +1267,10 @@ impl Parser {
             if self.at(TokenKind::For) || self.at(TokenKind::If) || self.at(TokenKind::When) {
                 let expr = self.parse_expr()?;
                 items.push(BlockItem::BlockStatement(expr));
+                continue;
+            }
+
+            if self.consume(TokenKind::Semicolon) {
                 continue;
             }
 

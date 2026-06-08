@@ -1658,47 +1658,6 @@ impl CaptureNameCollector {
         }
         self.pop_scope();
     }
-
-    fn visit_block_contents(&mut self, block: &BlockExpr) {
-        for item in &block.items {
-            match item {
-                BlockItem::LocalValue(value) => {
-                    self.visit_expr(&value.initializer);
-                    self.bind_name(&value.name);
-                }
-                BlockItem::Assignment(assignment) => {
-                    self.capture_name(&QualifiedName {
-                        segments: vec![assignment.name.clone()],
-                        span: assignment.span.clone(),
-                    });
-                    self.visit_expr(&assignment.value);
-                }
-                BlockItem::CompoundAssignment(assignment) => {
-                    self.capture_name(&QualifiedName {
-                        segments: vec![assignment.name.clone()],
-                        span: assignment.span.clone(),
-                    });
-                    self.visit_expr(&assignment.value);
-                }
-                BlockItem::Return(statement) => {
-                    if let Some(value) = &statement.value {
-                        self.visit_expr(value);
-                    }
-                }
-                BlockItem::Panic(statement) => {
-                    for part in &statement.message.parts {
-                        if let StringPart::Interpolation(expr) = part {
-                            self.visit_expr(expr);
-                        }
-                    }
-                }
-                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
-            }
-        }
-        if let Some(trailing) = &block.trailing {
-            self.visit_expr(trailing);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2265,16 +2224,23 @@ impl Value {
                 format!("{{{}}}", entries.join(", "))
             }
             Self::Range(range) => range.render(),
-            Self::Function(function) => match &**function {
-                FunctionValue::User(function) => format!(
-                    "<function {}>",
-                    function.name.as_deref().unwrap_or("<lambda>")
-                ),
-                FunctionValue::Generic(function) => {
-                    format!("<generic function {}>", function.name)
-                }
-                FunctionValue::Host(function) => {
-                    format!("<host function {}>", function.qualified_name())
+            Self::Function(function) => {
+                let sig = render_function_sig(&function.runtime_type());
+                match &**function {
+                    FunctionValue::User(function) => {
+                        let name = function.name.as_deref().unwrap_or("<lambda>");
+                        format!("<function {} {}>", name, sig)
+                    }
+                    FunctionValue::Generic(function) => {
+                        format!("<generic function {} {}>", function.name, sig)
+                    }
+                    FunctionValue::Host(function) => {
+                        format!(
+                            "<host function {} {}>",
+                            function.qualified_name(),
+                            sig
+                        )
+                    }
                 }
             },
             Self::Econ(value) => format!("econ({})", value.render()),
@@ -2964,6 +2930,47 @@ fn compare_ord(left: &str, right: &str, operator: &str) -> bool {
         ">" => left > right,
         ">=" => left >= right,
         _ => unreachable!(),
+    }
+}
+
+fn render_function_sig(ty: &ReplType) -> String {
+    match ty {
+        ReplType::Function { parameters, result } => {
+            let params = parameters
+                .iter()
+                .map(|t| t.render())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ret = if matches!(result.as_ref(), ReplType::Unknown(_)) {
+                "?".to_owned()
+            } else {
+                result.render()
+            };
+            format!("({}) -> {}", params, ret)
+        }
+        ReplType::GenericFunction {
+            generic_parameters,
+            parameters,
+            result,
+        } => {
+            let generics = generic_parameters
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.bound))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let params = parameters
+                .iter()
+                .map(|t| t.render())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ret = if matches!(result.as_ref(), ReplType::Unknown(_)) {
+                "?".to_owned()
+            } else {
+                result.render()
+            };
+            format!("[{}] ({}) -> {}", generics, params, ret)
+        }
+        other => other.render(),
     }
 }
 
