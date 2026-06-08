@@ -79,11 +79,9 @@ fn lower_script_entry(body: &MirBody) -> Result<Vec<u8>, String> {
             if body.parameters.contains(&result) {
                 continue;
             }
-            let ty = value_types
-                .get(&result)
-                .copied()
-                .ok_or_else(|| format!("value %{} has no wasm type", result.0))?;
-            locals.add(result, ty);
+            if let Some(ty) = value_types.get(&result).copied() {
+                locals.add(result, ty);
+            }
         }
     }
 
@@ -211,7 +209,7 @@ fn emit_op(
             emit_local_get(source, local_indices, code)?;
             emit_result_set(op, local_indices, code)?;
         }
-        MirOpKind::Bind(_) | MirOpKind::CachePut(_) | MirOpKind::Drop => {}
+        MirOpKind::Unit | MirOpKind::Bind(_) | MirOpKind::CachePut(_) | MirOpKind::Drop => {}
         MirOpKind::Unary(name) => {
             let source = one_arg(op)?;
             let source_ty = value_types
@@ -232,8 +230,7 @@ fn emit_op(
             emit_binary(name, ty, code)?;
             emit_result_set(op, local_indices, code)?;
         }
-        MirOpKind::Unit
-        | MirOpKind::Tuple { .. }
+        MirOpKind::Tuple { .. }
         | MirOpKind::Record { .. }
         | MirOpKind::List
         | MirOpKind::StringInterpolate { .. }
