@@ -467,17 +467,17 @@ impl BodyBuilder {
             }
             ExprKind::Intrinsic(intrinsic) => match intrinsic {
                 IntrinsicExpr::Updated(updated) => {
-                    let mut args = vec![self.lower_expr(&updated.target)];
+                    let mut current = self.lower_expr(&updated.target);
                     for update in &updated.updates {
                         let value = self.lower_expr(&update.value);
-                        args.push(value);
+                        let path = update.path.iter().map(mir_path_segment).collect();
+                        current = self.emit_op(
+                            MirOpKind::Updated { path },
+                            vec![current, value],
+                            Some(expr.span.clone()),
+                        );
                     }
-                    let path = updated
-                        .updates
-                        .first()
-                        .map(|update| update.path.iter().map(mir_path_segment).collect())
-                        .unwrap_or_default();
-                    self.emit_op(MirOpKind::Updated { path }, args, Some(expr.span.clone()))
+                    current
                 }
                 IntrinsicExpr::Econ(econ) => {
                     self.push_scope();

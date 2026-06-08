@@ -209,16 +209,11 @@ impl<'a> MirExecutor<'a> {
                 Some(index_value(target, index)?)
             }
             MirOpKind::Updated { path } => {
-                let Some((target, updates)) = op.args.split_first() else {
-                    return Err("updated op missing target value".to_owned());
+                let [target, replacement] = op.args.as_slice() else {
+                    return Err("updated op expects target and replacement values".to_owned());
                 };
-                if updates.len() != 1 {
-                    return Err(
-                        "MIR execution only supports one updated path per op today".to_owned()
-                    );
-                }
                 let target = self.value(*target)?;
-                let replacement = self.value(updates[0])?;
+                let replacement = self.value(*replacement)?;
                 Some(apply_updated_path(target, path, replacement)?)
             }
             MirOpKind::Call { callee, purity } => {
