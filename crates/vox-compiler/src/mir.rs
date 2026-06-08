@@ -453,9 +453,7 @@ impl BodyBuilder {
             }
             ExprKind::Name(name) => self.lower_name(name, Some(expr.span.clone())),
             ExprKind::Call { callee, arguments } => {
-                let mut args = Vec::new();
-                args.push(self.lower_expr(callee));
-                args.extend(self.lower_arguments(arguments));
+                let args = self.lower_arguments(arguments);
                 self.emit_op(
                     MirOpKind::Call {
                         callee: callee_label(callee),

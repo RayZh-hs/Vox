@@ -270,7 +270,6 @@ impl<'a> MirExecutor<'a> {
     ) -> Result<InlineValue, String> {
         let runtime_args = args
             .iter()
-            .skip(1)
             .map(|arg| self.value(*arg))
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(function) = self
