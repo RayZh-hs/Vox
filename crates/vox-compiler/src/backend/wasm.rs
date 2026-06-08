@@ -339,6 +339,7 @@ fn emit_literal(value: &InlineValue, code: &mut Vec<u8>) -> Result<(), String> {
         InlineValue::String(_)
         | InlineValue::Tuple(_)
         | InlineValue::Record(_)
+        | InlineValue::Handle(_)
         | InlineValue::Null => {
             return Err("only Int, Float, and Bool literals lower to scalar wasm".to_owned());
         }
@@ -522,6 +523,7 @@ fn wasm_type_from_literal(value: &InlineValue) -> Option<WasmType> {
         InlineValue::String(_)
         | InlineValue::Tuple(_)
         | InlineValue::Record(_)
+        | InlineValue::Handle(_)
         | InlineValue::Null => None,
     }
 }

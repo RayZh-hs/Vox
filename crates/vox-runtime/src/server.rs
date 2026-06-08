@@ -1396,13 +1396,7 @@ impl RuntimeConnection {
                 let count = payload.read_u32().map_err(WireFailure::bad_argument)? as usize;
                 let mut values = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let RuntimeValue::Inline(value) = self.decode_runtime_value(payload)? else {
-                        return Err(WireFailure::recoverable(
-                            ErrorCode::BadArgument,
-                            "handle values are not supported inside tuples",
-                        ));
-                    };
-                    values.push(value);
+                    values.push(self.decode_inline_or_handle_value(payload)?);
                 }
                 Ok(RuntimeValue::Inline(InlineValue::Tuple(values)))
             }
@@ -1417,13 +1411,7 @@ impl RuntimeConnection {
                             "duplicate record field",
                         ));
                     }
-                    let RuntimeValue::Inline(value) = self.decode_runtime_value(payload)? else {
-                        return Err(WireFailure::recoverable(
-                            ErrorCode::BadArgument,
-                            "handle values are not supported inside records",
-                        ));
-                    };
-                    fields.insert(name, value);
+                    fields.insert(name, self.decode_inline_or_handle_value(payload)?);
                 }
                 Ok(RuntimeValue::Inline(InlineValue::Record(fields)))
             }
@@ -1438,6 +1426,16 @@ impl RuntimeConnection {
         }
     }
 
+    fn decode_inline_or_handle_value(
+        &self,
+        payload: &mut PayloadReader<'_>,
+    ) -> Result<InlineValue, WireFailure> {
+        match self.decode_runtime_value(payload)? {
+            RuntimeValue::Inline(value) => Ok(value),
+            RuntimeValue::Handle(handle) => Ok(InlineValue::Handle(handle)),
+        }
+    }
+
     fn encode_value_result(
         &mut self,
         opcode: Opcode,
@@ -1448,8 +1446,7 @@ impl RuntimeConnection {
         match value {
             RuntimeValue::Inline(value) => {
                 let mut payload = PayloadWriter::new();
-                crate::protocol::encode_inline_value(&mut payload, &value)
-                    .map_err(WireFailure::bad_argument)?;
+                self.encode_inline_value(&mut payload, &value)?;
                 success_frame(
                     self.protocol_version(),
                     opcode,
@@ -1473,6 +1470,58 @@ impl RuntimeConnection {
                     payload.into_inner(),
                 )
                 .map_err(WireFailure::bad_argument)
+            }
+        }
+    }
+
+    fn encode_inline_value(
+        &mut self,
+        payload: &mut PayloadWriter,
+        value: &InlineValue,
+    ) -> Result<(), WireFailure> {
+        match value {
+            InlineValue::Null
+            | InlineValue::Bool(_)
+            | InlineValue::Int(_)
+            | InlineValue::Float(_)
+            | InlineValue::String(_) => crate::protocol::encode_inline_value(payload, value)
+                .map_err(WireFailure::bad_argument),
+            InlineValue::Tuple(values) => {
+                payload.write_u8(0x05);
+                let len = u32::try_from(values.len()).map_err(|_| {
+                    WireFailure::recoverable(
+                        ErrorCode::BadArgument,
+                        "tuple exceeds protocol size limit",
+                    )
+                })?;
+                payload.write_u32(len);
+                for value in values {
+                    self.encode_inline_value(payload, value)?;
+                }
+                Ok(())
+            }
+            InlineValue::Record(fields) => {
+                payload.write_u8(0x06);
+                let len = u32::try_from(fields.len()).map_err(|_| {
+                    WireFailure::recoverable(
+                        ErrorCode::BadArgument,
+                        "record exceeds protocol size limit",
+                    )
+                })?;
+                payload.write_u32(len);
+                for (name, value) in fields {
+                    payload
+                        .write_string(name)
+                        .map_err(WireFailure::bad_argument)?;
+                    self.encode_inline_value(payload, value)?;
+                }
+                Ok(())
+            }
+            InlineValue::Handle(actual) => {
+                payload.write_u8(0x07);
+                let local_handle = self.allocate_handle(*actual);
+                payload.write_u32(local_handle);
+                Ok(())
             }
         }
     }

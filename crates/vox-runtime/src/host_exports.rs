@@ -457,6 +457,7 @@ fn runtime_value_kind(value: &RuntimeValue) -> &'static str {
         RuntimeValue::Inline(InlineValue::String(_)) => "String",
         RuntimeValue::Inline(InlineValue::Tuple(_)) => "Tuple",
         RuntimeValue::Inline(InlineValue::Record(_)) => "Record",
+        RuntimeValue::Inline(InlineValue::Handle(_)) => "Handle",
         RuntimeValue::Inline(InlineValue::Null) => "Null",
         RuntimeValue::Handle(_) => "Handle",
     }

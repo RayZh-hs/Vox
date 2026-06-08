@@ -652,6 +652,7 @@ fn render_inline_value(value: &InlineValue) -> String {
         InlineValue::Float(value) => value.to_string(),
         InlineValue::Bool(value) => value.to_string(),
         InlineValue::String(value) => value.clone(),
+        InlineValue::Handle(handle) => format!("<handle {}>", handle.0),
         InlineValue::Tuple(values) => match values.as_slice() {
             [] => "()".to_owned(),
             [single] => format!("({},)", render_inline_value(single)),

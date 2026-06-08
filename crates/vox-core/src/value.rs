@@ -10,6 +10,7 @@ pub enum InlineValue {
     String(String),
     Tuple(Vec<InlineValue>),
     Record(BTreeMap<String, InlineValue>),
+    Handle(HandleId),
     Null,
 }
 

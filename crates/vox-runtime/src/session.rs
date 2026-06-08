@@ -1560,6 +1560,7 @@ fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
         vox_core::value::InlineValue::String(value) => {
             format!("\"{}\"", escape_string_literal(value))
         }
+        vox_core::value::InlineValue::Handle(handle) => format!("<handle {}>", handle.0),
         vox_core::value::InlineValue::Tuple(values) => match values.as_slice() {
             [] => "()".to_owned(),
             [single] => format!("({},)", render_inline_value_source(single)),

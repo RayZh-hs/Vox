@@ -554,6 +554,7 @@ fn render_inline_value(value: &InlineValue) -> String {
         InlineValue::Int(value) => value.to_string(),
         InlineValue::Float(value) => value.to_string(),
         InlineValue::String(value) => value.clone(),
+        InlineValue::Handle(handle) => format!("<handle {}>", handle.0),
         InlineValue::Tuple(values) => match values.as_slice() {
             [] => "()".to_owned(),
             [single] => format!("({},)", render_inline_value(single)),
@@ -690,6 +691,7 @@ fn type_name(value: &InlineValue) -> &'static str {
         InlineValue::Float(_) => "Float",
         InlineValue::Bool(_) => "Bool",
         InlineValue::String(_) => "String",
+        InlineValue::Handle(_) => "Handle",
         InlineValue::Tuple(_) => "Tuple",
         InlineValue::Record(_) => "Record",
         InlineValue::Null => "Null",

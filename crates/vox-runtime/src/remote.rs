@@ -255,6 +255,12 @@ impl RemoteRunner {
         } else if frame.header.flags & FLAG_INLINE_VALUE != 0 {
             let value = decode_inline_value(&mut response).map_err(protocol_to_runner)?;
             response.finish().map_err(protocol_to_runner)?;
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+            collect_inline_handles(&value, &mut state.known_handles);
             Ok(RuntimeValue::Inline(value))
         } else if frame.payload.is_empty() {
             Err(RunnerError::Protocol(
@@ -905,6 +911,29 @@ fn decode_handle_data_bytes(bytes: &[u8]) -> Result<HandleData, RunnerError> {
     let value = decode_handle_data(&mut reader).map_err(protocol_to_runner)?;
     reader.finish().map_err(protocol_to_runner)?;
     Ok(value)
+}
+
+fn collect_inline_handles(value: &vox_core::value::InlineValue, handles: &mut BTreeSet<HandleId>) {
+    match value {
+        vox_core::value::InlineValue::Handle(handle) => {
+            handles.insert(*handle);
+        }
+        vox_core::value::InlineValue::Tuple(values) => {
+            for value in values {
+                collect_inline_handles(value, handles);
+            }
+        }
+        vox_core::value::InlineValue::Record(fields) => {
+            for value in fields.values() {
+                collect_inline_handles(value, handles);
+            }
+        }
+        vox_core::value::InlineValue::Null
+        | vox_core::value::InlineValue::Bool(_)
+        | vox_core::value::InlineValue::Int(_)
+        | vox_core::value::InlineValue::Float(_)
+        | vox_core::value::InlineValue::String(_) => {}
+    }
 }
 
 fn write_string_list(writer: &mut PayloadWriter, values: &[String]) -> Result<(), ProtocolError> {

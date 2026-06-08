@@ -675,6 +675,7 @@ fn render_inline_value(value: &InlineValue) -> String {
                 .join(", ");
             format!("{{{fields}}}")
         }
+        InlineValue::Handle(handle) => format!("<handle {}>", handle.0),
         InlineValue::Null => "null".to_owned(),
     }
 }

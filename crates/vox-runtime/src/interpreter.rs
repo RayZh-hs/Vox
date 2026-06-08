@@ -2075,6 +2075,14 @@ impl Value {
                     .map(|(name, value)| (name, Self::from_inline(value)))
                     .collect(),
             ),
+            InlineValue::Handle(handle) => Self::Handle(
+                handle,
+                HandleSummary {
+                    type_name: "Handle".to_owned(),
+                    summary: format!("<handle {}>", handle.0),
+                    bytes: None,
+                },
+            ),
             InlineValue::Null => Self::Null,
         }
     }
@@ -2108,7 +2116,7 @@ impl Value {
             Self::Int(value) => Some(InlineValue::Int(*value)),
             Self::Float(value) => Some(InlineValue::Float(*value)),
             Self::String(value) => Some(InlineValue::String(value.clone())),
-            Self::Handle(_, _) => None,
+            Self::Handle(handle, _) => Some(InlineValue::Handle(*handle)),
             Self::Tuple(values) => values
                 .iter()
                 .map(Value::to_inline)
@@ -2597,7 +2605,7 @@ fn runtime_type_from_host_type(ty: &VoxType) -> ReplType {
 
 fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<Value, String> {
     match value {
-        RuntimeValue::Inline(value) => Ok(Value::from_inline(value.clone())),
+        RuntimeValue::Inline(value) => value_from_inline_value(runtime, value),
         RuntimeValue::Handle(handle) => {
             if let Some(bytes) = runtime.handle_data(*handle) {
                 let mut reader = crate::protocol::PayloadReader::new(bytes);
@@ -2615,6 +2623,29 @@ fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<V
                 .ok_or_else(|| format!("unknown handle {}", handle.0))?;
             Ok(Value::Handle(*handle, summary))
         }
+    }
+}
+
+fn value_from_inline_value(runtime: &Runtime, value: &InlineValue) -> Result<Value, String> {
+    match value {
+        InlineValue::Handle(handle) => {
+            value_from_runtime_value(runtime, &RuntimeValue::Handle(*handle))
+        }
+        InlineValue::Tuple(values) => values
+            .iter()
+            .map(|value| value_from_inline_value(runtime, value))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Tuple),
+        InlineValue::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), value_from_inline_value(runtime, value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(Value::Record),
+        InlineValue::Null
+        | InlineValue::Bool(_)
+        | InlineValue::Int(_)
+        | InlineValue::Float(_)
+        | InlineValue::String(_) => Ok(Value::from_inline(value.clone())),
     }
 }
 
@@ -2642,12 +2673,12 @@ fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
 }
 
 fn runtime_value_from_value(runtime: &mut Runtime, value: Value) -> Result<RuntimeValue, String> {
-    if let Some(inline) = value.to_inline() {
-        return Ok(RuntimeValue::Inline(inline));
-    }
-
     if let Value::Handle(handle, _) = &value {
         return Ok(RuntimeValue::Handle(*handle));
+    }
+
+    if let Some(inline) = value.to_inline() {
+        return Ok(RuntimeValue::Inline(inline));
     }
 
     if let Value::Function(function) = &value {

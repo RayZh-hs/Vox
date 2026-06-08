@@ -10,6 +10,7 @@ use vox_core::{
         ExternalLibraryFormatError, decode_package_manifest, encode_package_manifest,
     },
     host::PackageManifest,
+    ids::HandleId,
     opt::OptimizationLevel,
     value::{HandleData, InlineValue},
 };
@@ -525,6 +526,12 @@ pub fn encode_inline_value(
                 encode_inline_value(writer, value)?;
             }
         }
+        InlineValue::Handle(handle) => {
+            writer.write_u8(0x07);
+            let handle_id = u32::try_from(handle.0)
+                .map_err(|_| ProtocolError::message("handle id exceeds protocol size limit"))?;
+            writer.write_u32(handle_id);
+        }
     }
     Ok(())
 }
@@ -560,9 +567,7 @@ pub fn decode_inline_value(reader: &mut PayloadReader<'_>) -> Result<InlineValue
             }
             Ok(InlineValue::Record(fields))
         }
-        0x07 => Err(ProtocolError::message(
-            "handle values must be decoded by the connection layer",
-        )),
+        0x07 => Ok(InlineValue::Handle(HandleId(reader.read_u32()? as u64))),
         _ => Err(ProtocolError::message("unknown value tag")),
     }
 }
