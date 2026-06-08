@@ -1999,7 +1999,21 @@ fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
             name: name.clone(),
             bound: None,
         },
-        vox_core::types::VoxType::OpaqueSurface(raw) => ReplType::Unknown(raw.clone()),
+        vox_core::types::VoxType::OpaqueSurface(raw) => repl_type_from_opaque_surface(raw),
+    }
+}
+
+fn repl_type_from_opaque_surface(raw: &str) -> ReplType {
+    match raw {
+        "Int" => ReplType::Int,
+        "Float" => ReplType::Float,
+        "Bool" => ReplType::Bool,
+        "String" => ReplType::String,
+        "Unit" | "()" => ReplType::Unit,
+        _ => ReplType::Named {
+            name: raw.to_owned(),
+            arguments: Vec::new(),
+        },
     }
 }
 

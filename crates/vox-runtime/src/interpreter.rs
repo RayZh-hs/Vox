@@ -2599,7 +2599,21 @@ fn runtime_type_from_host_type(ty: &VoxType) -> ReplType {
             name: name.clone(),
             bound: None,
         },
-        VoxType::OpaqueSurface(name) => ReplType::Unknown(name.clone()),
+        VoxType::OpaqueSurface(name) => runtime_type_from_opaque_surface(name),
+    }
+}
+
+fn runtime_type_from_opaque_surface(raw: &str) -> ReplType {
+    match raw {
+        "Int" => ReplType::Int,
+        "Float" => ReplType::Float,
+        "Bool" => ReplType::Bool,
+        "String" => ReplType::String,
+        "Unit" | "()" => ReplType::Unit,
+        _ => ReplType::Named {
+            name: raw.to_owned(),
+            arguments: Vec::new(),
+        },
     }
 }
 
