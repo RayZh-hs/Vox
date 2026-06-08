@@ -768,18 +768,14 @@ impl BodyBuilder {
     ) {
         let Some(arm) = when_expr.arms.get(index) else {
             self.scopes = base_scopes.clone();
-            let value = when_expr
-                .else_arm
-                .as_ref()
-                .map(|else_arm| self.lower_expr(else_arm))
-                .unwrap_or_else(|| {
-                    self.emit_op(
-                        MirOpKind::Unknown("when_no_match".to_owned()),
-                        vec![subject],
-                        None,
-                    )
-                });
-            self.jump_to_join_if_open(join, vec![value]);
+            if let Some(else_arm) = &when_expr.else_arm {
+                let value = self.lower_expr(else_arm);
+                self.jump_to_join_if_open(join, vec![value]);
+            } else {
+                self.terminate(MirTerminator::Panic(
+                    "when expression did not match any arm".to_owned(),
+                ));
+            }
             self.scopes = base_scopes;
             return;
         };
