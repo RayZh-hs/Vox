@@ -45,7 +45,7 @@ impl<'a> MirExecutor<'a> {
             .find(|body| matches!(body.kind, MirBodyKind::ScriptEntry))
             .ok_or_else(|| "MIR module does not contain a script entry body".to_owned())?;
         self.run_body(body, artifact, arguments)
-            .map(RuntimeValue::Inline)
+            .map(runtime_value_from_inline)
     }
 
     fn run_body(
@@ -83,10 +83,8 @@ impl<'a> MirExecutor<'a> {
         }
 
         for (value, argument) in body.parameters.iter().zip(arguments) {
-            let RuntimeValue::Inline(argument) = argument else {
-                return Err("MIR execution does not accept handle arguments yet".to_owned());
-            };
-            self.values.insert(*value, argument.clone());
+            self.values
+                .insert(*value, inline_value_from_runtime(argument));
         }
 
         let mut current = body
@@ -295,7 +293,7 @@ impl<'a> MirExecutor<'a> {
         {
             let arguments = runtime_args
                 .into_iter()
-                .map(RuntimeValue::Inline)
+                .map(runtime_value_from_inline)
                 .collect::<Vec<_>>();
             let saved_values = self.values.clone();
             let saved_versions = self.versions.clone();
@@ -329,16 +327,13 @@ impl<'a> MirExecutor<'a> {
                 .enumerate()
                 .map(|(index, value)| HostCallArgument {
                     name: format!("arg{index}"),
-                    value: Some(RuntimeValue::Inline(value)),
+                    value: Some(runtime_value_from_inline(value)),
                 })
                 .collect::<Vec<_>>();
             let result = self
                 .runtime
                 .invoke_host_function(&package, &function, &arguments)?;
-            let RuntimeValue::Inline(value) = result else {
-                return Err("MIR execution does not consume handle results yet".to_owned());
-            };
-            return Ok(value);
+            return Ok(inline_value_from_runtime(&result));
         }
 
         Err(format!("MIR call target `{callee}` is not executable yet"))
@@ -394,6 +389,20 @@ impl<'a> MirExecutor<'a> {
             .get(&id)
             .cloned()
             .ok_or_else(|| format!("MIR binding version %v{} is not defined", id.0))
+    }
+}
+
+fn inline_value_from_runtime(value: &RuntimeValue) -> InlineValue {
+    match value {
+        RuntimeValue::Inline(value) => value.clone(),
+        RuntimeValue::Handle(handle) => InlineValue::Handle(*handle),
+    }
+}
+
+fn runtime_value_from_inline(value: InlineValue) -> RuntimeValue {
+    match value {
+        InlineValue::Handle(handle) => RuntimeValue::Handle(handle),
+        value => RuntimeValue::Inline(value),
     }
 }
 
