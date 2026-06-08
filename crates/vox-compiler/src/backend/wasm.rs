@@ -108,10 +108,7 @@ fn lower_script_entry(body: &MirBody) -> Result<Vec<u8>, String> {
                 emit_local_get(*value, &local_indices, &mut code)?;
             }
         }
-        MirTerminator::Panic(_) => {
-            return Err("panic terminators are not wasm-lowered yet".to_owned());
-        }
-        MirTerminator::Unreachable => code.push(0x00),
+        MirTerminator::Panic(_) | MirTerminator::Unreachable => code.push(0x00),
         MirTerminator::Jump { .. } | MirTerminator::Branch { .. } => {
             return Err("control-flow terminators are not wasm-lowered yet".to_owned());
         }
