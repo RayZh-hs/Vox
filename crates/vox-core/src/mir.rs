@@ -406,6 +406,7 @@ pub enum MirOpKind {
     Tuple { shape: usize },
     Record { fields: Vec<String> },
     List,
+    StringInterpolate { text: Vec<String> },
     Project(MirProjection),
     Index,
     Updated { path: Vec<MirPathSegment> },
@@ -440,6 +441,9 @@ impl MirOpKind {
             Self::List => {
                 out.push_str("list");
                 Ok(())
+            }
+            Self::StringInterpolate { text } => {
+                write!(out, "string_interpolate text={:?}", text)
             }
             Self::Project(projection) => match projection {
                 MirProjection::Field(field) => write!(out, "project .{field}"),

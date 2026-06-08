@@ -174,6 +174,7 @@ fn infer_value_types(body: &MirBody) -> Result<BTreeMap<MirValueId, WasmType>, S
             | MirOpKind::Tuple { .. }
             | MirOpKind::Record { .. }
             | MirOpKind::List
+            | MirOpKind::StringInterpolate { .. }
             | MirOpKind::Project(_)
             | MirOpKind::Index
             | MirOpKind::Updated { .. }
@@ -238,6 +239,7 @@ fn emit_op(
         | MirOpKind::Tuple { .. }
         | MirOpKind::Record { .. }
         | MirOpKind::List
+        | MirOpKind::StringInterpolate { .. }
         | MirOpKind::Project(_)
         | MirOpKind::Index
         | MirOpKind::Updated { .. }
@@ -529,6 +531,7 @@ fn op_kind_name(kind: &MirOpKind) -> &'static str {
         MirOpKind::Tuple { .. } => "tuple",
         MirOpKind::Record { .. } => "record",
         MirOpKind::List => "list",
+        MirOpKind::StringInterpolate { .. } => "string_interpolate",
         MirOpKind::Project(_) => "project",
         MirOpKind::Index => "index",
         MirOpKind::Updated { .. } => "updated",

@@ -390,16 +390,23 @@ impl BodyBuilder {
                         Some(expr.span.clone()),
                     )
                 } else {
-                    let args = literal
-                        .parts
-                        .iter()
-                        .filter_map(|part| match part {
-                            StringPart::Text(_) => None,
-                            StringPart::Interpolation(expr) => Some(self.lower_expr(expr)),
-                        })
-                        .collect();
+                    let mut args = Vec::new();
+                    let mut text = vec![String::new()];
+                    for part in &literal.parts {
+                        match part {
+                            StringPart::Text(value) => {
+                                text.last_mut()
+                                    .expect("interpolation text should have a current segment")
+                                    .push_str(value);
+                            }
+                            StringPart::Interpolation(value) => {
+                                args.push(self.lower_expr(value));
+                                text.push(String::new());
+                            }
+                        }
+                    }
                     self.emit_op(
-                        MirOpKind::Unknown("string_interpolation".to_owned()),
+                        MirOpKind::StringInterpolate { text },
                         args,
                         Some(expr.span.clone()),
                     )
@@ -528,13 +535,7 @@ impl BodyBuilder {
                 self.lower_short_circuit_bool(left, *op, right, Some(expr.span.clone()))
             }
             ExprKind::Binary { left, op, right } if matches!(op, BinaryOp::Coalesce) => {
-                let left = self.lower_expr(left);
-                let right = self.lower_expr(right);
-                self.emit_op(
-                    MirOpKind::Unknown(binary_op_name(*op).to_owned()),
-                    vec![left, right],
-                    Some(expr.span.clone()),
-                )
+                self.lower_coalesce(left, right, Some(expr.span.clone()))
             }
             ExprKind::Binary { left, op, right } => {
                 let left = self.lower_expr(left);
@@ -700,6 +701,43 @@ impl BodyBuilder {
         self.current = constant;
         let value = self.emit_literal(InlineValue::Bool(matches!(op, BinaryOp::Or)), span.clone());
         self.jump_to_join_if_open(join, vec![value]);
+
+        self.current = join;
+        result
+    }
+
+    fn lower_coalesce(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let left = self.lower_expr(left);
+        let is_null = self.emit_op(
+            MirOpKind::TypeTest("Null".to_owned()),
+            vec![left],
+            span.clone(),
+        );
+        let join = self.new_block("coalesce_join");
+        let result = self.new_value(None, MirValueDefinition::BlockParameter(join), span.clone());
+        self.block_mut(join).parameters.push(result);
+
+        let eval_right = self.new_block("coalesce_rhs");
+        let keep_left = self.new_block("coalesce_left");
+        self.terminate(MirTerminator::Branch {
+            condition: is_null,
+            then_target: eval_right,
+            then_args: Vec::new(),
+            else_target: keep_left,
+            else_args: Vec::new(),
+        });
+
+        self.current = eval_right;
+        let right = self.lower_expr(right);
+        self.jump_to_join_if_open(join, vec![right]);
+
+        self.current = keep_left;
+        self.jump_to_join_if_open(join, vec![left]);
 
         self.current = join;
         result
@@ -1663,6 +1701,9 @@ fn pure_op_name(kind: &MirOpKind) -> Option<String> {
         MirOpKind::Tuple { shape } => Some(format!("tuple:{shape}")),
         MirOpKind::Record { fields } => Some(format!("record:{}", fields.join(","))),
         MirOpKind::List => Some("list".to_owned()),
+        MirOpKind::StringInterpolate { text } => {
+            Some(format!("string_interpolate:{text:?}"))
+        }
         MirOpKind::Project(projection) => Some(format!("project:{projection:?}")),
         MirOpKind::Index => Some("index".to_owned()),
         MirOpKind::Updated { path } => Some(format!("updated:{path:?}")),

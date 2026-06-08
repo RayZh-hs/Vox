@@ -201,6 +201,9 @@ impl<'a> MirExecutor<'a> {
             MirOpKind::List => {
                 return Err("MIR execution does not materialize list handles yet".to_owned());
             }
+            MirOpKind::StringInterpolate { text } => {
+                Some(eval_string_interpolation(text, self.arg_values(op)?)?)
+            }
             MirOpKind::Project(projection) => {
                 let value = self.single_arg(op)?;
                 Some(project_value(value, projection)?)
@@ -522,6 +525,61 @@ fn compare_values(
     Ok(InlineValue::Bool(predicate(ordering)))
 }
 
+fn eval_string_interpolation(
+    text: &[String],
+    values: Vec<InlineValue>,
+) -> Result<InlineValue, String> {
+    if text.len() != values.len() + 1 {
+        return Err(
+            "string interpolation text segment count does not match argument count".to_owned(),
+        );
+    }
+
+    let mut rendered = String::new();
+    for (index, value) in values.into_iter().enumerate() {
+        rendered.push_str(&text[index]);
+        rendered.push_str(&render_inline_value(&value));
+    }
+    rendered.push_str(
+        text.last()
+            .expect("string interpolation should have trailing text segment"),
+    );
+    Ok(InlineValue::String(rendered))
+}
+
+fn render_inline_value(value: &InlineValue) -> String {
+    match value {
+        InlineValue::Null => "null".to_owned(),
+        InlineValue::Bool(value) => value.to_string(),
+        InlineValue::Int(value) => value.to_string(),
+        InlineValue::Float(value) => value.to_string(),
+        InlineValue::String(value) => value.clone(),
+        InlineValue::Tuple(values) => match values.as_slice() {
+            [] => "()".to_owned(),
+            [single] => format!("({},)", render_inline_value(single)),
+            _ => render_delimited_inline("(", ")", values),
+        },
+        InlineValue::Record(fields) => {
+            let entries = fields
+                .iter()
+                .map(|(name, value)| format!("{name} = {}", render_inline_value(value)))
+                .collect::<Vec<_>>();
+            format!("{{{}}}", entries.join(", "))
+        }
+    }
+}
+
+fn render_delimited_inline(prefix: &str, suffix: &str, values: &[InlineValue]) -> String {
+    format!(
+        "{prefix}{}{suffix}",
+        values
+            .iter()
+            .map(render_inline_value)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn project_value(value: InlineValue, projection: &MirProjection) -> Result<InlineValue, String> {
     match (value, projection) {
         (InlineValue::Record(fields), MirProjection::Field(field)) => fields
@@ -649,6 +707,7 @@ fn op_kind_label(kind: &MirOpKind) -> &'static str {
         MirOpKind::Tuple { .. } => "tuple",
         MirOpKind::Record { .. } => "record",
         MirOpKind::List => "list",
+        MirOpKind::StringInterpolate { .. } => "string_interpolate",
         MirOpKind::Project(_) => "project",
         MirOpKind::Index => "index",
         MirOpKind::Updated { .. } => "updated",
