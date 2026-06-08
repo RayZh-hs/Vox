@@ -230,6 +230,20 @@ fn emit_op(
             emit_binary(name, ty, code)?;
             emit_result_set(op, local_indices, code)?;
         }
+        MirOpKind::TypeTest(ty) => {
+            let source = one_arg(op)?;
+            let source_ty = value_types
+                .get(&source)
+                .copied()
+                .ok_or_else(|| format!("value %{} has no wasm type", source.0))?;
+            let matched = matches!(
+                (ty.as_str(), source_ty),
+                ("Int", WasmType::I64) | ("Float", WasmType::F64) | ("Bool", WasmType::I32)
+            );
+            code.push(0x41);
+            write_sleb_i32(code, i32::from(matched));
+            emit_result_set(op, local_indices, code)?;
+        }
         MirOpKind::Tuple { .. }
         | MirOpKind::Record { .. }
         | MirOpKind::List
@@ -241,7 +255,6 @@ fn emit_op(
         | MirOpKind::Econ { .. }
         | MirOpKind::NonNull
         | MirOpKind::SafeProject(_)
-        | MirOpKind::TypeTest(_)
         | MirOpKind::Iterator
         | MirOpKind::IteratorNext
         | MirOpKind::CacheGet(_)
