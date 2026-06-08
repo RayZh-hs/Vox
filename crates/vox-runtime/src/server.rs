@@ -309,10 +309,7 @@ impl RuntimeConnection {
             Opcode::ListSessions => self.handle_list_sessions(frame),
             Opcode::SetSessionReserved => self.handle_set_session_reserved(frame),
             Opcode::MountLibrary => self.handle_mount_library(frame),
-            Opcode::UnmountLibrary => Err(WireFailure::recoverable(
-                ErrorCode::UnsupportedOpcode,
-                "UNMOUNT_LIBRARY is not implemented yet",
-            )),
+            Opcode::UnmountLibrary => self.handle_unmount_library(frame),
             Opcode::LoadScript => self.handle_load_script(frame),
             Opcode::ReloadScript => self.handle_reload_script(frame),
             Opcode::UnloadScript => self.handle_unload_script(frame),
@@ -840,6 +837,36 @@ impl RuntimeConnection {
             local_id,
             0,
             response.into_inner(),
+        )
+        .map_err(WireFailure::bad_argument)
+    }
+
+    fn handle_unmount_library(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        if !frame.payload.is_empty() {
+            return Err(WireFailure::recoverable(
+                ErrorCode::BadArgument,
+                "UNMOUNT_LIBRARY request payload must be empty",
+            ));
+        }
+        let library_id = self.resolve_library(frame.header.target_id)?;
+        let removed = self
+            .runner
+            .unmount_library(library_id)
+            .map_err(WireFailure::from_runner)?;
+        if !removed {
+            return Err(WireFailure::recoverable(
+                ErrorCode::UnknownLibrary,
+                "unknown library",
+            ));
+        }
+        self.libraries.remove(&frame.header.target_id);
+        success_frame(
+            self.protocol_version(),
+            Opcode::UnmountLibrary,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
         )
         .map_err(WireFailure::bad_argument)
     }
@@ -1490,6 +1517,13 @@ impl RuntimeConnection {
             .get(&local_id)
             .copied()
             .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownScript, "unknown script"))
+    }
+
+    fn resolve_library(&self, local_id: u32) -> Result<LibraryId, WireFailure> {
+        self.libraries
+            .get(&local_id)
+            .copied()
+            .ok_or_else(|| WireFailure::recoverable(ErrorCode::UnknownLibrary, "unknown library"))
     }
 
     fn resolve_session(&self, session_id: u32) -> Result<SessionId, WireFailure> {

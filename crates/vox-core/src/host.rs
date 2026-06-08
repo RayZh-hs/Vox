@@ -87,6 +87,10 @@ impl HostRegistry {
         self.packages.insert(manifest.package.clone(), manifest)
     }
 
+    pub fn unregister_package(&mut self, module: &ModulePath) -> Option<PackageManifest> {
+        self.packages.remove(module)
+    }
+
     pub fn package(&self, module: &ModulePath) -> Option<&PackageManifest> {
         self.packages.get(module)
     }

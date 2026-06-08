@@ -453,6 +453,37 @@ impl Runtime {
             .find(|library| library.id == library_id)
     }
 
+    pub fn unmount_library(&mut self, library_id: LibraryId) -> bool {
+        let Some(index) = self
+            .libraries
+            .iter()
+            .position(|library| library.id == library_id)
+        else {
+            return false;
+        };
+        let package = self.libraries[index].manifest.package.clone();
+        let was_active = !self.libraries[index + 1..]
+            .iter()
+            .any(|library| library.manifest.package == package);
+        self.libraries.remove(index);
+        if was_active {
+            self.host_functions
+                .retain(|(function_package, _), _| function_package != &package);
+            if let Some(replacement) = self
+                .libraries
+                .iter()
+                .rev()
+                .find(|library| library.manifest.package == package)
+            {
+                self.host.register_package(replacement.manifest.clone());
+            } else {
+                self.host.unregister_package(&package);
+            }
+        }
+        self.next_library_revision += 1;
+        true
+    }
+
     pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
         self.clear_generic_handles(Some(artifact_id));
         self.artifacts.remove(artifact_id).is_some()

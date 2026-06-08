@@ -45,7 +45,7 @@ struct RemoteRunnerInner {
 #[derive(Debug, Clone)]
 struct RemoteState {
     default_xopt: OptimizationLevel,
-    mounted_manifests: Vec<PackageManifest>,
+    mounted_manifests: Vec<(LibraryId, PackageManifest)>,
     known_handles: BTreeSet<HandleId>,
 }
 
@@ -512,8 +512,28 @@ impl RuntimeRunner for RemoteRunner {
             .state
             .lock()
             .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
-        state.mounted_manifests.push(manifest);
-        Ok(LibraryId(library_id as u64))
+        let library = LibraryId(library_id as u64);
+        state.mounted_manifests.push((library, manifest));
+        Ok(library)
+    }
+
+    fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError> {
+        let target_id = self.to_wire_id(library.0, "library")?;
+        let _frame = self.invoke(Opcode::UnmountLibrary, target_id, 0, Vec::new())?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        let removed = state
+            .mounted_manifests
+            .iter()
+            .position(|(candidate, _)| *candidate == library)
+            .is_some_and(|index| {
+                state.mounted_manifests.remove(index);
+                true
+            });
+        Ok(removed)
     }
 
     fn load_script(
@@ -758,7 +778,11 @@ impl RuntimeRunner for RemoteRunner {
             .state
             .lock()
             .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
-        Ok(state.mounted_manifests.clone())
+        Ok(state
+            .mounted_manifests
+            .iter()
+            .map(|(_, manifest)| manifest.clone())
+            .collect())
     }
 
     fn set_default_xopt(&self, xopt: OptimizationLevel) -> Result<(), RunnerError> {

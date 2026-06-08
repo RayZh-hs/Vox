@@ -123,6 +123,8 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         self.mount_library(manifest)
     }
 
+    fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError>;
+
     fn load_script(
         &self,
         source: SourceText,
@@ -539,6 +541,10 @@ impl RuntimeRunner for EmbeddedRunner {
 
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError> {
         self.with_runtime(|runtime| Ok(runtime.mount_library(manifest)))
+    }
+
+    fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError> {
+        self.with_runtime(|runtime| Ok(runtime.unmount_library(library)))
     }
 
     fn load_script(
