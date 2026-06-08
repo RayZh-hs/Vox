@@ -308,8 +308,17 @@ fn emit_binary(name: &str, ty: WasmType, code: &mut Vec<u8>) -> Result<(), Strin
         ("greater", WasmType::F64) => 0x64,
         ("less_equal", WasmType::F64) => 0x65,
         ("greater_equal", WasmType::F64) => 0x66,
+        ("add", WasmType::I32) => 0x6a,
+        ("subtract", WasmType::I32) => 0x6b,
+        ("multiply", WasmType::I32) => 0x6c,
+        ("divide", WasmType::I32) => 0x6d,
+        ("remainder", WasmType::I32) => 0x6f,
         ("equal", WasmType::I32) => 0x46,
         ("not_equal", WasmType::I32) => 0x47,
+        ("less", WasmType::I32) => 0x48,
+        ("greater", WasmType::I32) => 0x4a,
+        ("less_equal", WasmType::I32) => 0x4c,
+        ("greater_equal", WasmType::I32) => 0x4e,
         _ => return Err(format!("unsupported binary wasm op `{name}` for {ty:?}")),
     };
     code.push(opcode);
