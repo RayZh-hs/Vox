@@ -1268,6 +1268,12 @@ impl Parser {
                 continue;
             }
 
+            if self.at(TokenKind::If) || self.at(TokenKind::When) {
+                let expr = self.parse_expr()?;
+                items.push(BlockItem::Expr(expr));
+                continue;
+            }
+
             let expr = self.parse_expr()?;
             if self.consume(TokenKind::Semicolon) {
                 items.push(BlockItem::Expr(expr));

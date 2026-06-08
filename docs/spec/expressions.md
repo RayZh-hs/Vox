@@ -197,7 +197,11 @@ Rules:
 
 - `if` is an expression, not a statement;
 - each branch produces a value;
-- the overall type is the common type of the branch results.
+- the overall type is the common type of the branch results;
+- when `if` appears at the head of a statement position inside a block, it
+  acts as an expression-statement without a trailing `;`. To use `if` as a
+  trailing expression in that position, wrap it in parentheses:
+  `(if (cond) { a } else { b })`.
 
 ## 6. `when` Expressions
 
@@ -227,7 +231,10 @@ Rules:
 - `when` does not support range matching or general pattern matching;
 - an inline arm ends with `;`;
 - a block arm does not use `;` after its closing `}`;
-- `else` is optional.
+- `else` is optional;
+- when `when` appears at the head of a statement position inside a block, it
+  acts as an expression-statement without a trailing `;`. To use `when` as a
+  trailing expression, wrap it in parentheses.
 
 ## 7. Block Expressions
 

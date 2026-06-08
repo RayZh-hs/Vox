@@ -15,14 +15,32 @@ BlockItem
    |  ForStatement
    |  ReturnStatement
    |  PanicStatement
+   |  IfExpr
+   |  WhenExpr
    |  ExprStatement
 
 ExprStatement
   ::= Expr ";"
 ```
 
-The final expression in a block is a trailing expression, not an
-`ExprStatement`, and it has no semicolon.
+`if` and `when` are expressions, but when they appear at the head of a
+statement position inside a block, they act as expression-statements without a
+trailing `;`. The parser consumes them as if they were statements, and the
+block loop continues to the next item.
+
+All other expressions at statement position require a `;`. The final
+expression in a block is a trailing expression with no semicolon.
+
+To use an `if` or `when` expression as a trailing expression when it would
+otherwise appear at the head of a statement position, wrap it in parentheses:
+
+```vox
+fun describe(x: Int?): String {
+    if (x == null) { return "none"; }
+
+    (if (x > 0) { "positive" } else { "non-positive" })
+}
+```
 
 ## 2. Local Value Declarations
 
