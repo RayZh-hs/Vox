@@ -851,6 +851,29 @@ impl<'a> TypeEngine<'a> {
                 }
                 Ok(ty)
             }
+            ExprKind::For(expr) => {
+                let iterable = self.infer_expr(&expr.iterable, scope)?;
+                match iterable {
+                    ReplType::List(item) | ReplType::Range(item) => {
+                        let mut loop_scope = scope.clone();
+                        loop_scope.values.insert(
+                            expr.pattern.clone(),
+                            LocalBinding {
+                                ty: *item,
+                                mutable: false,
+                            },
+                        );
+                        self.infer_block(&expr.body, &mut loop_scope)?;
+                    }
+                    other => {
+                        return Err(format!(
+                            "for-loop requires an iterable list or range, found `{}`",
+                            other.render()
+                        ));
+                    }
+                }
+                Ok(ReplType::Unit)
+            }
             ExprKind::Lambda(lambda) => {
                 let mut nested = scope.clone();
                 let mut parameters = Vec::new();
@@ -949,27 +972,6 @@ impl<'a> TypeEngine<'a> {
                     let rhs = self.infer_expr(&assignment.value, &mut nested)?;
                     self.infer_compound_assignment(&current.ty, &rhs, assignment.op)?;
                 }
-                BlockItem::For(statement) => {
-                    let iterable = self.infer_expr(&statement.iterable, &mut nested)?;
-                    let element = match iterable {
-                        ReplType::List(item) | ReplType::Range(item) => *item,
-                        other => {
-                            return Err(format!(
-                                "for-loop requires an iterable list or range, found `{}`",
-                                other.render()
-                            ));
-                        }
-                    };
-                    let mut loop_scope = nested.clone();
-                    loop_scope.values.insert(
-                        statement.pattern.clone(),
-                        LocalBinding {
-                            ty: element,
-                            mutable: false,
-                        },
-                    );
-                    self.infer_block(&statement.body, &mut loop_scope)?;
-                }
                 BlockItem::Return(statement) => {
                     return Ok(statement
                         .value
@@ -979,7 +981,7 @@ impl<'a> TypeEngine<'a> {
                         .unwrap_or(ReplType::Unit));
                 }
                 BlockItem::Panic(_) => return Ok(ReplType::Unknown("Never".to_owned())),
-                BlockItem::Expr(expr) => {
+                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                     self.infer_expr(expr, &mut nested)?;
                 }
             }
@@ -1037,33 +1039,11 @@ impl<'a> TypeEngine<'a> {
                 let rhs = self.infer_expr(&assignment.value, scope)?;
                 self.infer_compound_assignment(&current.ty, &rhs, assignment.op)
             }
-            BlockItem::For(statement) => {
-                let iterable = self.infer_expr(&statement.iterable, scope)?;
-                let element = match iterable {
-                    ReplType::List(item) | ReplType::Range(item) => *item,
-                    other => {
-                        return Err(format!(
-                            "for-loop requires an iterable list or range, found `{}`",
-                            other.render()
-                        ));
-                    }
-                };
-                let mut loop_scope = scope.clone();
-                loop_scope.values.insert(
-                    statement.pattern.clone(),
-                    LocalBinding {
-                        ty: element,
-                        mutable: false,
-                    },
-                );
-                self.infer_block(&statement.body, &mut loop_scope)?;
-                Ok(())
-            }
             BlockItem::Return(_) => {
                 Err("`return` may only be used inside a function body".to_owned())
             }
             BlockItem::Panic(_) => Ok(()),
-            BlockItem::Expr(expr) => {
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.infer_expr(expr, scope)?;
                 Ok(())
             }
@@ -1673,6 +1653,13 @@ impl<'a> CaptureNameCollector<'a> {
                     self.visit_expr(else_arm);
                 }
             }
+            ExprKind::For(expr) => {
+                self.visit_expr(&expr.iterable);
+                self.push_scope();
+                self.bind_name(&expr.pattern);
+                self.visit_block_contents(&expr.body);
+                self.pop_scope();
+            }
             ExprKind::Lambda(lambda) => {
                 self.push_scope();
                 for parameter in &lambda.parameters {
@@ -1731,13 +1718,6 @@ impl<'a> CaptureNameCollector<'a> {
                     });
                     self.visit_expr(&assignment.value);
                 }
-                BlockItem::For(statement) => {
-                    self.visit_expr(&statement.iterable);
-                    self.push_scope();
-                    self.bind_name(&statement.pattern);
-                    self.visit_block_contents(&statement.body);
-                    self.pop_scope();
-                }
                 BlockItem::Return(statement) => {
                     if let Some(value) = &statement.value {
                         self.visit_expr(value);
@@ -1750,7 +1730,7 @@ impl<'a> CaptureNameCollector<'a> {
                         }
                     }
                 }
-                BlockItem::Expr(expr) => self.visit_expr(expr),
+                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
         if let Some(trailing) = &block.trailing {

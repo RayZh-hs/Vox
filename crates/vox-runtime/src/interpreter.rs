@@ -480,7 +480,6 @@ impl<'a> EvalContext<'a> {
                 let next = self.eval_compound_assignment(current.value, rhs, assignment.op)?;
                 self.module.assign_script_binding(&assignment.name, next)
             }
-            BlockItem::For(statement) => self.eval_for(statement),
             BlockItem::Return(statement) => Err(EvalError::Return(
                 statement
                     .value
@@ -493,7 +492,7 @@ impl<'a> EvalContext<'a> {
                 "panic: {}",
                 self.eval_string_literal(&statement.message)?
             ))),
-            BlockItem::Expr(expr) => {
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(())
             }
@@ -581,6 +580,10 @@ impl<'a> EvalContext<'a> {
             ExprKind::Range(range) => self.eval_range(range),
             ExprKind::If(expr) => self.eval_if(expr),
             ExprKind::When(expr) => self.eval_when(expr),
+            ExprKind::For(expr) => {
+                self.eval_for(expr)?;
+                Ok(Value::unit())
+            }
             ExprKind::Lambda(lambda) => {
                 let captured = self.capture_lambda_bindings(lambda)?;
                 Ok(Value::Function(Rc::new(FunctionValue::User(
@@ -1110,7 +1113,6 @@ impl<'a> EvalContext<'a> {
                     self.eval_compound_assignment(current.value.clone(), rhs, assignment.op)?;
                 self.assign_local(&assignment.name, next)
             }
-            BlockItem::For(statement) => self.eval_for(statement),
             BlockItem::Return(statement) => Err(EvalError::Return(
                 statement
                     .value
@@ -1123,7 +1125,7 @@ impl<'a> EvalContext<'a> {
                 "panic: {}",
                 self.eval_string_literal(&statement.message)?
             ))),
-            BlockItem::Expr(expr) => {
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(())
             }
@@ -1147,7 +1149,7 @@ impl<'a> EvalContext<'a> {
 
     fn eval_for(
         &mut self,
-        statement: &vox_compiler::frontend::ast::ForStatement,
+        statement: &vox_compiler::frontend::ast::ForExpr,
     ) -> Result<(), EvalError> {
         let iterable = self.eval_expr(&statement.iterable)?;
         let items = self.expand_iterable(iterable)?;
@@ -1576,6 +1578,13 @@ impl CaptureNameCollector {
                     self.visit_expr(else_arm);
                 }
             }
+            ExprKind::For(expr) => {
+                self.visit_expr(&expr.iterable);
+                self.push_scope();
+                self.bind_name(&expr.pattern);
+                self.visit_block(&expr.body);
+                self.pop_scope();
+            }
             ExprKind::Lambda(lambda) => {
                 self.push_scope();
                 for parameter in &lambda.parameters {
@@ -1629,13 +1638,6 @@ impl CaptureNameCollector {
                     });
                     self.visit_expr(&assignment.value);
                 }
-                BlockItem::For(statement) => {
-                    self.visit_expr(&statement.iterable);
-                    self.push_scope();
-                    self.bind_name(&statement.pattern);
-                    self.visit_block_contents(&statement.body);
-                    self.pop_scope();
-                }
                 BlockItem::Return(statement) => {
                     if let Some(value) = &statement.value {
                         self.visit_expr(value);
@@ -1648,7 +1650,7 @@ impl CaptureNameCollector {
                         }
                     }
                 }
-                BlockItem::Expr(expr) => self.visit_expr(expr),
+                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
         if let Some(trailing) = &block.trailing {
@@ -1678,13 +1680,6 @@ impl CaptureNameCollector {
                     });
                     self.visit_expr(&assignment.value);
                 }
-                BlockItem::For(statement) => {
-                    self.visit_expr(&statement.iterable);
-                    self.push_scope();
-                    self.bind_name(&statement.pattern);
-                    self.visit_block_contents(&statement.body);
-                    self.pop_scope();
-                }
                 BlockItem::Return(statement) => {
                     if let Some(value) = &statement.value {
                         self.visit_expr(value);
@@ -1697,7 +1692,7 @@ impl CaptureNameCollector {
                         }
                     }
                 }
-                BlockItem::Expr(expr) => self.visit_expr(expr),
+                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
         if let Some(trailing) = &block.trailing {

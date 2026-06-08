@@ -18,6 +18,7 @@ The following constructs are expressions:
 - unary and binary operator expressions;
 - `if` expressions;
 - `when` expressions;
+- `for` expressions;
 - lambda expressions;
 - block expressions.
 
@@ -117,6 +118,7 @@ PrimaryExpr
   ::= Literal
    |  QualifiedIdentifier
    |  ParenExpr
+   |  ForExpr
    |  IfExpr
    |  WhenExpr
    |  BlockExpr
@@ -195,13 +197,9 @@ IfExpr
 
 Rules:
 
-- `if` is an expression, not a statement;
+- `if` is an expression as well as a statement: if it appears at the head of a statement it is parsed as a statement. To use `if` as an expression in that position, wrap it in parentheses: `(if (cond) { a } else { b })`.
 - each branch produces a value;
-- the overall type is the common type of the branch results;
-- when `if` appears at the head of a statement position inside a block, it
-  acts as an expression-statement without a trailing `;`. To use `if` as a
-  trailing expression in that position, wrap it in parentheses:
-  `(if (cond) { a } else { b })`.
+- the overall type is the common type of the branch results.
 
 ## 6. `when` Expressions
 
@@ -232,9 +230,9 @@ Rules:
 - an inline arm ends with `;`;
 - a block arm does not use `;` after its closing `}`;
 - `else` is optional;
-- when `when` appears at the head of a statement position inside a block, it
-  acts as an expression-statement without a trailing `;`. To use `when` as a
-  trailing expression, wrap it in parentheses.
+- at the head of a statement position, `when` is parsed as a `BlockStatement`
+  and does not require a trailing `;`. To use `when` as a trailing expression,
+  wrap it in parentheses.
 
 ## 7. Block Expressions
 

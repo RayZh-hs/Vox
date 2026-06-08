@@ -16,7 +16,7 @@ use crate::frontend::{
     FrontendUnit,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, Expr, ExprKind, ForStatement, FunctionDecl, IfExpr,
+        CompoundAssignmentStatement, Expr, ExprKind, ForExpr, FunctionDecl, IfExpr,
         IntrinsicExpr, RangeExpr, RecordFieldInit, ReturnStatement, StringLiteral, StringPart,
         TopLevelItem, ValueDecl, WhenExpr,
     },
@@ -250,6 +250,7 @@ fn visit_expr(expr: &Expr, features: &mut RankFeatures) {
         ExprKind::Range(range) => visit_range(range, features),
         ExprKind::If(if_expr) => visit_if(if_expr, features),
         ExprKind::When(when_expr) => visit_when(when_expr, features),
+        ExprKind::For(for_expr) => visit_for(for_expr, features),
         ExprKind::Lambda(lambda) => visit_expr(&lambda.body, features),
         ExprKind::Block(block) => visit_block(block, features),
     }
@@ -333,10 +334,9 @@ fn visit_block_item(item: &BlockItem, features: &mut RankFeatures) {
         BlockItem::CompoundAssignment(assignment) => {
             visit_compound_assignment(assignment, features)
         }
-        BlockItem::For(statement) => visit_for(statement, features),
         BlockItem::Return(statement) => visit_return(statement, features),
         BlockItem::Panic(statement) => visit_string_literal(&statement.message, features),
-        BlockItem::Expr(expr) => visit_expr(expr, features),
+        BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => visit_expr(expr, features),
     }
 }
 
@@ -351,7 +351,7 @@ fn visit_compound_assignment(
     visit_expr(&assignment.value, features);
 }
 
-fn visit_for(statement: &ForStatement, features: &mut RankFeatures) {
+fn visit_for(statement: &ForExpr, features: &mut RankFeatures) {
     visit_expr(&statement.iterable, features);
     visit_block(&statement.body, features);
 }

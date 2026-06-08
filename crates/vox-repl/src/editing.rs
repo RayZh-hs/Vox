@@ -152,10 +152,9 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
             BlockItem::LocalValue(value) => &value.span,
             BlockItem::Assignment(assignment) => &assignment.span,
             BlockItem::CompoundAssignment(assignment) => &assignment.span,
-            BlockItem::For(statement) => &statement.span,
             BlockItem::Return(statement) => &statement.span,
             BlockItem::Panic(statement) => &statement.span,
-            BlockItem::Expr(expr) => &expr.span,
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => &expr.span,
         },
     };
     source[span.start..span.end].to_owned()

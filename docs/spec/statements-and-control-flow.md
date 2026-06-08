@@ -1,7 +1,7 @@
 # Statements and Control Flow
 
 This chapter defines statement forms that may appear inside block expressions.
-Script files may also use assignment, compound assignment, `for`, `panic`, and
+Script files may also use assignment, compound assignment, `panic`, and
 expression statements at top level. Package files may not use statements at top
 level.
 
@@ -12,26 +12,29 @@ BlockItem
   ::= LocalValueDecl
    |  AssignmentStatement
    |  CompoundAssignmentStatement
-   |  ForStatement
    |  ReturnStatement
    |  PanicStatement
-   |  IfExpr
-   |  WhenExpr
+   |  BlockStatement
    |  ExprStatement
+
+BlockStatement
+  ::= IfExpr
+   |  WhenExpr
+   |  ForExpr
 
 ExprStatement
   ::= Expr ";"
 ```
 
-`if` and `when` are expressions, but when they appear at the head of a
-statement position inside a block, they act as expression-statements without a
-trailing `;`. The parser consumes them as if they were statements, and the
-block loop continues to the next item.
+A `BlockStatement` is a block-like expression (`if`, `when`, or `for`) that
+appears at the head of a statement position inside a block. It is consumed as a
+statement without a trailing `;`. The parser consumes it and the block loop
+continues to the next item.
 
 All other expressions at statement position require a `;`. The final
 expression in a block is a trailing expression with no semicolon.
 
-To use an `if` or `when` expression as a trailing expression when it would
+To use a block-like expression as a trailing expression when it would
 otherwise appear at the head of a statement position, wrap it in parentheses:
 
 ```vox
@@ -88,10 +91,10 @@ Rules:
 - compound assignment is valid only for a previously declared `var`;
 - compound assignment is not valid for `val`.
 
-## 5. `for` Statements
+## 5. `for` Expressions
 
 ```ebnf
-ForStatement
+ForExpr
   ::= "for" "(" Pattern "in" Expr ")" BlockExpr
 
 Pattern
@@ -104,7 +107,7 @@ Rules:
 - the current language defines only identifier loop patterns;
 - the loop body is always a block expression.
 
-`for` is a statement form, not an expression.
+`for` is an expression that evaluates to the unit value `()`.
 
 ## 6. `return` Statements
 

@@ -9,7 +9,7 @@ use crate::frontend::{
     ast::{
         Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, CompilationUnit,
         CompoundAssignmentOp, CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind,
-        ForStatement, FrontendUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
+        ForExpr, FrontendUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
         IntrinsicExpr, LambdaExpr, LambdaParameter, LocalValueDecl, Mutability, PanicStatement,
         ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField,
         ReturnStatement, StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
@@ -170,10 +170,6 @@ impl Parser {
     fn parse_script_statement(&mut self) -> Result<Option<BlockItem>, DiagnosticBag> {
         if let Some(statement) = self.try_parse_assignment_statement()? {
             return Ok(Some(statement));
-        }
-
-        if self.at(TokenKind::For) {
-            return Ok(Some(BlockItem::For(self.parse_for_statement()?)));
         }
 
         if self.at(TokenKind::Panic) {
@@ -1045,6 +1041,7 @@ impl Parser {
             TokenKind::LBracket => self.parse_list_literal(),
             TokenKind::LParen => self.parse_paren_or_tuple_expr(),
             TokenKind::LBrace => self.parse_braced_expr(),
+            TokenKind::For => self.parse_for_expr(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::When => self.parse_when_expr(),
             TokenKind::Econ => self.parse_intrinsic_primary_expr(IntrinsicName::Econ),
@@ -1253,11 +1250,6 @@ impl Parser {
                 continue;
             }
 
-            if self.at(TokenKind::For) {
-                items.push(BlockItem::For(self.parse_for_statement()?));
-                continue;
-            }
-
             if self.at(TokenKind::Return) {
                 items.push(BlockItem::Return(self.parse_return_statement()?));
                 continue;
@@ -1268,9 +1260,9 @@ impl Parser {
                 continue;
             }
 
-            if self.at(TokenKind::If) || self.at(TokenKind::When) {
+            if self.at(TokenKind::For) || self.at(TokenKind::If) || self.at(TokenKind::When) {
                 let expr = self.parse_expr()?;
-                items.push(BlockItem::Expr(expr));
+                items.push(BlockItem::BlockStatement(expr));
                 continue;
             }
 
@@ -1348,7 +1340,7 @@ impl Parser {
         }
     }
 
-    fn parse_for_statement(&mut self) -> Result<ForStatement, DiagnosticBag> {
+    fn parse_for_expr(&mut self) -> Result<Expr, DiagnosticBag> {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::For, "expected `for`")?;
         self.expect_simple(TokenKind::LParen, "expected `(` after `for`")?;
@@ -1357,14 +1349,18 @@ impl Parser {
         let iterable = self.parse_expr()?;
         self.expect_simple(TokenKind::RParen, "expected `)` after `for` header")?;
         let body = self.parse_block_expr_required()?;
+        let end = body.span.end;
         let ExprKind::Block(block) = body.kind else {
             unreachable!();
         };
-        Ok(ForStatement {
-            pattern,
-            iterable,
-            span: TextSpan::new(start, body.span.end),
-            body: block,
+        Ok(Expr {
+            kind: ExprKind::For(ForExpr {
+                pattern,
+                iterable: Box::new(iterable),
+                body: block,
+                span: TextSpan::new(start, end),
+            }),
+            span: TextSpan::new(start, end),
         })
     }
 

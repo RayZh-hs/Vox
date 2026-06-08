@@ -332,6 +332,7 @@ pub enum ExprKind {
     Range(RangeExpr),
     If(IfExpr),
     When(WhenExpr),
+    For(ForExpr),
     Lambda(LambdaExpr),
     Block(BlockExpr),
 }
@@ -485,9 +486,9 @@ pub enum BlockItem {
     LocalValue(LocalValueDecl),
     Assignment(AssignmentStatement),
     CompoundAssignment(CompoundAssignmentStatement),
-    For(ForStatement),
     Return(ReturnStatement),
     Panic(PanicStatement),
+    BlockStatement(Expr),
     Expr(Expr),
 }
 
@@ -516,9 +517,9 @@ pub struct CompoundAssignmentStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForStatement {
+pub struct ForExpr {
     pub pattern: String,
-    pub iterable: Expr,
+    pub iterable: Box<Expr>,
     pub body: BlockExpr,
     pub span: TextSpan,
 }

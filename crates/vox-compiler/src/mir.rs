@@ -338,50 +338,6 @@ impl BodyBuilder {
                     Some(assignment.span.clone()),
                 );
             }
-            BlockItem::For(statement) => {
-                let iterable = self.lower_expr(&statement.iterable);
-                let iterator = self.emit_op(
-                    MirOpKind::Iterator,
-                    vec![iterable],
-                    Some(statement.span.clone()),
-                );
-                let header = self.new_block("for_header");
-                let body_block = self.new_block("for_body");
-                let exit = self.new_block("for_exit");
-                self.terminate(MirTerminator::Jump {
-                    target: header,
-                    args: Vec::new(),
-                });
-
-                self.current = header;
-                let item = self.emit_op(
-                    MirOpKind::IteratorNext,
-                    vec![iterator],
-                    Some(statement.span.clone()),
-                );
-                self.terminate(MirTerminator::Branch {
-                    condition: item,
-                    then_target: body_block,
-                    then_args: Vec::new(),
-                    else_target: exit,
-                    else_args: Vec::new(),
-                });
-
-                self.current = body_block;
-                self.push_scope();
-                self.declare_binding(
-                    statement.pattern.clone(),
-                    MirMutability::Val,
-                    None,
-                    Some(statement.span.clone()),
-                    item,
-                    MirVersionSource::Loop,
-                );
-                self.lower_block_expr(&statement.body);
-                self.pop_scope();
-                self.jump_to_join_if_open(header, Vec::new());
-                self.current = exit;
-            }
             BlockItem::Return(statement) => {
                 let value = statement
                     .value
@@ -397,7 +353,7 @@ impl BodyBuilder {
                 )));
                 self.current = self.new_block("after_panic");
             }
-            BlockItem::Expr(expr) => {
+            BlockItem::Expr(expr) | BlockItem::BlockStatement(expr) => {
                 let value = self.lower_expr(expr);
                 self.emit_op_with_result(
                     None,
@@ -612,6 +568,7 @@ impl BodyBuilder {
             }
             ExprKind::If(if_expr) => self.lower_if_expr(if_expr, Some(expr.span.clone())),
             ExprKind::When(when_expr) => self.lower_when_expr(when_expr, Some(expr.span.clone())),
+            ExprKind::For(for_expr) => self.lower_for_expr(for_expr, Some(expr.span.clone())),
             ExprKind::Lambda(lambda) => {
                 let args = lambda
                     .parameters
@@ -829,6 +786,56 @@ impl BodyBuilder {
 
         self.current = next_block;
         self.lower_when_arm(index + 1, subject, when_expr, join, base_scopes);
+    }
+
+    fn lower_for_expr(
+        &mut self,
+        for_expr: &crate::frontend::ast::ForExpr,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let iterable = self.lower_expr(&for_expr.iterable);
+        let iterator = self.emit_op(
+            MirOpKind::Iterator,
+            vec![iterable],
+            span.clone(),
+        );
+        let header = self.new_block("for_header");
+        let body_block = self.new_block("for_body");
+        let exit = self.new_block("for_exit");
+        self.terminate(MirTerminator::Jump {
+            target: header,
+            args: Vec::new(),
+        });
+
+        self.current = header;
+        let item = self.emit_op(
+            MirOpKind::IteratorNext,
+            vec![iterator],
+            span.clone(),
+        );
+        self.terminate(MirTerminator::Branch {
+            condition: item,
+            then_target: body_block,
+            then_args: Vec::new(),
+            else_target: exit,
+            else_args: Vec::new(),
+        });
+
+        self.current = body_block;
+        self.push_scope();
+        self.declare_binding(
+            for_expr.pattern.clone(),
+            MirMutability::Val,
+            None,
+            span.clone(),
+            item,
+            MirVersionSource::Loop,
+        );
+        self.lower_block_expr(&for_expr.body);
+        self.pop_scope();
+        self.jump_to_join_if_open(header, Vec::new());
+        self.current = exit;
+        self.emit_unit()
     }
 
     fn lower_arguments(&mut self, arguments: &[Argument]) -> Vec<MirValueId> {

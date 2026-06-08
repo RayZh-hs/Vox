@@ -5,7 +5,7 @@ use vox_compiler::frontend::{
     analyze_source,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForStatement, FunctionDecl,
+        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, FunctionDecl,
         IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr,
         ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic,
         WhenArm, WhenExpr,
@@ -1306,6 +1306,7 @@ impl<'a> FunctionCallCollector<'a> {
             ExprKind::Range(range) => self.visit_range(range),
             ExprKind::If(expr) => self.visit_if(expr),
             ExprKind::When(expr) => self.visit_when(expr),
+            ExprKind::For(expr) => self.visit_for(expr),
             ExprKind::Lambda(expr) => self.visit_lambda(expr),
             ExprKind::Block(block) => self.visit_block(block),
         }
@@ -1397,10 +1398,9 @@ impl<'a> FunctionCallCollector<'a> {
                 BlockItem::CompoundAssignment(assignment) => {
                     self.visit_compound_assignment(assignment)
                 }
-                BlockItem::For(statement) => self.visit_for(statement),
                 BlockItem::Return(statement) => self.visit_return(statement),
                 BlockItem::Panic(statement) => self.visit_string_literal(&statement.message),
-                BlockItem::Expr(expr) => self.visit_expr(expr),
+                BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
         if let Some(trailing) = &block.trailing {
@@ -1421,7 +1421,7 @@ impl<'a> FunctionCallCollector<'a> {
         self.visit_expr(&assignment.value);
     }
 
-    fn visit_for(&mut self, statement: &ForStatement) {
+    fn visit_for(&mut self, statement: &ForExpr) {
         self.visit_expr(&statement.iterable);
         self.push_scope();
         self.bind_name(&statement.pattern);
@@ -1472,10 +1472,9 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
             BlockItem::LocalValue(value) => &value.span,
             BlockItem::Assignment(assignment) => &assignment.span,
             BlockItem::CompoundAssignment(assignment) => &assignment.span,
-            BlockItem::For(statement) => &statement.span,
             BlockItem::Return(statement) => &statement.span,
             BlockItem::Panic(statement) => &statement.span,
-            BlockItem::Expr(expr) => &expr.span,
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => &expr.span,
         },
     };
     source[span.start..span.end].to_owned()
