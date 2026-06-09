@@ -5,7 +5,8 @@ use std::{
 
 use vox_core::{
     diagnostics::DiagnosticBag,
-    host::{HostRegistry, Purity},
+    external_library::{ExternalLibraryHeader, MINIMAL_WASM_MODULE, encode_external_library_file},
+    host::{HostRegistry, PackageManifest, Purity},
     ids::ArtifactId,
     opt::{OptimizationLevel, OptimizationSubject},
     plan::{CompiledArtifact, DependencyFingerprint, ExecutablePlan},
@@ -131,4 +132,29 @@ fn collect_dependencies(request: &CompileRequest) -> Vec<DependencyFingerprint> 
             revision: request.source.origin.revision,
         })
         .collect()
+}
+
+pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
+    let result = Compiler::default().compile(request);
+    let artifact = result
+        .artifact
+        .ok_or_else(|| result.diagnostics.to_string())?;
+    let wasm_bytes = artifact
+        .plan
+        .wasm
+        .as_ref()
+        .map(|wasm| wasm.bytes.clone())
+        .unwrap_or_else(|| MINIMAL_WASM_MODULE.to_vec());
+
+    let manifest = PackageManifest {
+        package: artifact.module.clone(),
+        types: Vec::new(),
+        traits: Vec::new(),
+        functions: Vec::new(),
+    };
+    let header = ExternalLibraryHeader {
+        manifest,
+        wasm_bytes,
+    };
+    encode_external_library_file(&header).map_err(|error| error.to_string())
 }

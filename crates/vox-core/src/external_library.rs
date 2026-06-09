@@ -14,8 +14,8 @@ use crate::{
     types::{QualifiedTypeName, RecordField, VoxType},
 };
 
-pub const EXTERNAL_LIBRARY_HEADER_MAGIC: [u8; 4] = *b"VXLH";
-pub const EXTERNAL_LIBRARY_HEADER_VERSION: u16 = 2;
+pub const EXTERNAL_LIBRARY_MAGIC: [u8; 4] = *b"VXLH";
+pub const EXTERNAL_LIBRARY_VERSION: u16 = 3;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,21 +26,19 @@ pub struct ExternalLibrary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLibraryHeader {
     pub manifest: PackageManifest,
-    pub wasm_file_name: String,
+    pub wasm_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedExternalLibrary {
     header: ExternalLibraryHeader,
-    header_bytes: Vec<u8>,
-    wasm_bytes: Vec<u8>,
-    header_file_name: String,
+    library_bytes: Vec<u8>,
+    library_file_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedExternalLibraryFiles {
-    pub header_path: PathBuf,
-    pub wasm_path: PathBuf,
+    pub library_path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -83,17 +81,17 @@ impl ExternalLibrary {
     ) -> Result<GeneratedExternalLibrary, ExternalLibraryFormatError> {
         let manifest = extend_manifest_with_registered_exports(self.manifest)
             .map_err(ExternalLibraryFormatError::Message)?;
-        let file_stem = package_file_stem(&manifest.package).to_owned();
+        let wasm_bytes = wasm_bytes.into();
         let header = ExternalLibraryHeader {
             manifest,
-            wasm_file_name: format!("{file_stem}.wasm"),
+            wasm_bytes,
         };
-        let header_bytes = encode_external_library_header(&header)?;
+        let library_bytes = encode_external_library_file(&header)?;
+        let library_file_name = format!("{}.voxlib", header.manifest.package.as_str());
         Ok(GeneratedExternalLibrary {
             header,
-            header_bytes,
-            wasm_bytes: wasm_bytes.into(),
-            header_file_name: format!("{file_stem}.voxh"),
+            library_bytes,
+            library_file_name,
         })
     }
 }
@@ -103,20 +101,16 @@ impl GeneratedExternalLibrary {
         &self.header
     }
 
-    pub fn header_bytes(&self) -> &[u8] {
-        &self.header_bytes
+    pub fn library_bytes(&self) -> &[u8] {
+        &self.library_bytes
+    }
+
+    pub fn library_file_name(&self) -> &str {
+        &self.library_file_name
     }
 
     pub fn wasm_bytes(&self) -> &[u8] {
-        &self.wasm_bytes
-    }
-
-    pub fn header_file_name(&self) -> &str {
-        &self.header_file_name
-    }
-
-    pub fn wasm_file_name(&self) -> &str {
-        &self.header.wasm_file_name
+        &self.header.wasm_bytes
     }
 
     pub fn write_to_dir(
@@ -126,15 +120,10 @@ impl GeneratedExternalLibrary {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
 
-        let header_path = dir.join(self.header_file_name());
-        let wasm_path = dir.join(self.wasm_file_name());
-        fs::write(&header_path, &self.header_bytes)?;
-        fs::write(&wasm_path, &self.wasm_bytes)?;
+        let library_path = dir.join(self.library_file_name());
+        fs::write(&library_path, &self.library_bytes)?;
 
-        Ok(GeneratedExternalLibraryFiles {
-            header_path,
-            wasm_path,
-        })
+        Ok(GeneratedExternalLibraryFiles { library_path })
     }
 }
 
@@ -155,43 +144,52 @@ impl From<io::Error> for ExternalLibraryFormatError {
     }
 }
 
-pub fn encode_external_library_header(
+// =============================================================================
+// .voxlib binary format (version 3)
+//
+// Layout:  magic(4B) | version(u16) | reserved(u16)
+//        | manifest(len+bytes) | wasm(len+bytes)
+//
+// Single self-contained file; wasm is embedded inline.
+// =============================================================================
+
+pub fn encode_external_library_file(
     header: &ExternalLibraryHeader,
 ) -> Result<Vec<u8>, ExternalLibraryFormatError> {
     let mut writer = BinaryWriter::new();
-    writer.write_fixed(&EXTERNAL_LIBRARY_HEADER_MAGIC);
-    writer.write_u16(EXTERNAL_LIBRARY_HEADER_VERSION);
+    writer.write_fixed(&EXTERNAL_LIBRARY_MAGIC);
+    writer.write_u16(EXTERNAL_LIBRARY_VERSION);
     writer.write_u16(0);
-    writer.write_string(&header.wasm_file_name)?;
     writer.write_bytes(&encode_package_manifest(&header.manifest)?)?;
+    writer.write_bytes(&header.wasm_bytes)?;
     Ok(writer.into_inner())
 }
 
-pub fn decode_external_library_header(
+pub fn decode_external_library_file(
     bytes: &[u8],
 ) -> Result<ExternalLibraryHeader, ExternalLibraryFormatError> {
     let mut reader = BinaryReader::new(bytes);
     let magic = reader.read_fixed::<4>()?;
-    if magic != EXTERNAL_LIBRARY_HEADER_MAGIC {
+    if magic != EXTERNAL_LIBRARY_MAGIC {
         return Err(ExternalLibraryFormatError::Message(
-            "invalid external library header magic".to_owned(),
+            "invalid external library magic".to_owned(),
         ));
     }
 
     let version = reader.read_u16()?;
-    if version != EXTERNAL_LIBRARY_HEADER_VERSION {
+    if version != EXTERNAL_LIBRARY_VERSION {
         return Err(ExternalLibraryFormatError::Message(format!(
-            "unsupported external library header version {version}"
+            "unsupported external library version {version}"
         )));
     }
 
     let _reserved = reader.read_u16()?;
-    let wasm_file_name = reader.read_string()?;
     let manifest = decode_package_manifest(&reader.read_bytes()?)?;
+    let wasm_bytes = reader.read_bytes()?;
     reader.finish()?;
     Ok(ExternalLibraryHeader {
         manifest,
-        wasm_file_name,
+        wasm_bytes,
     })
 }
 
@@ -504,14 +502,6 @@ fn decode_qualified_type_name(
         .map_err(|diagnostic| ExternalLibraryFormatError::Message(diagnostic.message))?;
     let name = reader.read_string()?;
     Ok(QualifiedTypeName { module, name })
-}
-
-fn package_file_stem(package: &ModulePath) -> &str {
-    package
-        .segments()
-        .last()
-        .map(String::as_str)
-        .unwrap_or("library")
 }
 
 struct BinaryWriter {

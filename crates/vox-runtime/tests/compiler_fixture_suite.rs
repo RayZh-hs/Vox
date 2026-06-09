@@ -18,6 +18,8 @@ use vox_core::{
 };
 use vox_runtime::infer_environment;
 
+use std::env;
+
 // =============================================================================
 // Test external library items (used by both manifest-generation and combined tests).
 // =============================================================================
@@ -389,6 +391,47 @@ fn extern_fixtures_pass_semantic_inference() {
             )
         });
     }
+}
+
+// =========================================================================
+// Voxlib compile → write → load round-trip test
+// =========================================================================
+
+#[test]
+fn voxlib_file_compile_write_and_mount_round_trip() {
+    let source = "package fixtures.roundtrip; public fun add(a: Int, b: Int): Int = a + b;"
+        .to_owned();
+    let module = ModulePath::parse("fixtures.roundtrip").expect("valid package path");
+
+    let request = CompileRequest {
+        source: SourceText::new("roundtrip.vox", 1, source),
+        optimization: OptimizationLevel::SOpt,
+        optimization_overrides: Default::default(),
+        host: HostRegistry::default(),
+    };
+    let voxlib_bytes =
+        vox_compiler::compile_to_voxlib(request).expect("voxlib compilation should succeed");
+
+    let tmp = env::temp_dir().join("vox-test-roundtrip");
+    let _ = fs::create_dir_all(&tmp);
+    let lib_path = tmp.join("fixtures.roundtrip.voxlib");
+    fs::write(&lib_path, &voxlib_bytes).expect("voxlib write should succeed");
+
+    let mut runtime = vox_runtime::Runtime::default();
+    let id = runtime
+        .mount_voxlib_file(&lib_path)
+        .expect("voxlib mount should succeed");
+
+    let mounted = runtime
+        .library(id)
+        .expect("library should be accessible by id");
+    assert_eq!(
+        mounted.manifest.package, module,
+        "mounted package name should match"
+    );
+
+    let _ = fs::remove_file(&lib_path);
+    let _ = id;
 }
 
 fn extern_manifest() -> PackageManifest {

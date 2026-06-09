@@ -16,3 +16,5 @@ NEVER implement a feature without full understanding of the requirements. If you
 When implementing the codebase, you may use any external library you wish.
 
 When writing documents, keep your writing clear, concise, to-the-point and human-readable. Avoid technical jargon, non-standard terminology like "facade", and unnecessary details. Never repeat yourself.
+
+Do not overwrite or delete existing, unrelated content in any documentation, tracked by git or not. If you need to update something, prepend or append to the existing content, or create a new section if necessary. Only delete content if it has been resolved, is already false, or has met criteria for removal as specified above. In any of these cases, you should report this removal when you finish working.

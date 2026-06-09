@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, fs,
+    path::Path,
     sync::Arc,
 };
 
@@ -19,7 +20,7 @@ mod session;
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler};
 use vox_core::{
-    external_library::ExternalLibrary,
+    external_library::{ExternalLibrary, decode_external_library_file},
     host::{HostRegistry, PackageManifest},
     ids::{ArtifactId, HandleId, LibraryId},
     opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
@@ -196,6 +197,29 @@ impl Runtime {
         library: ExternalLibrary,
     ) -> Result<LibraryId, String> {
         library.build().map(|manifest| self.mount_library(manifest))
+    }
+
+    pub fn mount_voxlib_file(&mut self, path: &Path) -> Result<LibraryId, String> {
+        let bytes = fs::read(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let header = decode_external_library_file(&bytes)
+            .map_err(|error| format!("invalid .voxlib file {}: {error}", path.display()))?;
+        Ok(self.mount_library(header.manifest))
+    }
+
+    pub fn mount_voxlib_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
+        let entries = fs::read_dir(dir)
+            .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("directory read error: {error}"))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("voxlib") {
+                ids.push(self.mount_voxlib_file(&path)?);
+            }
+        }
+        Ok(ids)
     }
 
     pub fn mount_host_library<I>(
