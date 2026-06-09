@@ -95,6 +95,7 @@ pub struct OptimizationStatus {
     pub artifact: Option<ArtifactId>,
     pub mir_available: bool,
     pub wasm_available: bool,
+    pub runtime_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +148,7 @@ pub struct Runtime {
     host_functions: BTreeMap<(ModulePath, String), RegisteredHostFunction>,
     artifacts: ArtifactStore,
     handles: HandleStore,
+    mir_execution_failures: BTreeMap<ArtifactId, String>,
     generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
     libraries: Vec<MountedLibrary>,
     next_library_id: u64,
@@ -290,6 +292,7 @@ impl Runtime {
             .expect("successful compilation should produce an artifact");
         let treewalk = result.treewalk;
         let id = artifact.id;
+        self.mir_execution_failures.remove(&id);
         self.artifacts.insert(artifact, treewalk);
         Ok(id)
     }
@@ -337,6 +340,7 @@ impl Runtime {
                 .as_ref()
                 .map(|treewalk| &treewalk.functions)
                 != result.treewalk.as_ref().map(|treewalk| &treewalk.functions);
+        self.mir_execution_failures.remove(&artifact_id);
         self.artifacts.insert(artifact, result.treewalk);
         if generic_signatures_changed {
             self.clear_generic_handles(Some(artifact_id));
@@ -372,6 +376,7 @@ impl Runtime {
             .expect("successful compilation should produce an artifact");
         let treewalk = result.treewalk;
         let id = artifact.id;
+        self.mir_execution_failures.remove(&id);
         self.artifacts.insert(artifact, treewalk);
         Ok(id)
     }
@@ -411,6 +416,7 @@ impl Runtime {
                 .as_ref()
                 .map(|treewalk| &treewalk.functions)
                 != result.treewalk.as_ref().map(|treewalk| &treewalk.functions);
+        self.mir_execution_failures.remove(&artifact_id);
         self.artifacts.insert(artifact, result.treewalk);
         if generic_signatures_changed {
             self.clear_generic_handles(Some(artifact_id));
@@ -428,6 +434,7 @@ impl Runtime {
             .get(artifact_id)
             .ok_or(RuntimeError::MissingArtifact(artifact_id))?;
         Ok(artifact_optimization_statuses(
+            self,
             artifact,
             artifact_id,
             settings,
@@ -486,6 +493,7 @@ impl Runtime {
 
     pub fn unload_script(&mut self, artifact_id: ArtifactId) -> bool {
         self.clear_generic_handles(Some(artifact_id));
+        self.mir_execution_failures.remove(&artifact_id);
         self.artifacts.remove(artifact_id).is_some()
     }
 
@@ -518,10 +526,14 @@ impl Runtime {
         }
 
         if let Some(mir) = artifact.mir.clone() {
-            if let Ok(value) =
-                MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, arguments)
-            {
-                return Ok(value);
+            match MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, arguments) {
+                Ok(value) => {
+                    self.mir_execution_failures.remove(&artifact_id);
+                    return Ok(value);
+                }
+                Err(message) => {
+                    self.mir_execution_failures.insert(artifact_id, message);
+                }
             }
         }
 
@@ -648,6 +660,7 @@ impl Runtime {
 
     pub fn clear_artifacts(&mut self) {
         self.artifacts = ArtifactStore::default();
+        self.mir_execution_failures.clear();
         self.clear_generic_handles(None);
     }
 
@@ -737,6 +750,7 @@ fn qualified_host_name(package: &ModulePath, function: &str) -> String {
 }
 
 fn artifact_optimization_statuses(
+    runtime: &Runtime,
     artifact: &CompiledArtifact,
     artifact_id: ArtifactId,
     settings: &OptimizationSettings,
@@ -755,6 +769,10 @@ fn artifact_optimization_statuses(
         artifact: Some(artifact_id),
         mir_available: artifact.mir.is_some() || artifact.plan.mir_text.is_some(),
         wasm_available: artifact.plan.wasm.is_some(),
+        runtime_note: runtime
+            .mir_execution_failures
+            .get(&artifact_id)
+            .map(|message| format!("MIR execution fell back to interpreter: {message}")),
     });
 
     for ranking in &artifact.optimization_rankings {
@@ -775,6 +793,7 @@ fn artifact_optimization_statuses(
                 .as_ref()
                 .is_some_and(|mir| mir.bodies.iter().any(|body| body.name == *name)),
             wasm_available: false,
+            runtime_note: None,
         });
     }
 

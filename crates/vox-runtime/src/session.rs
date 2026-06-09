@@ -5,10 +5,9 @@ use vox_compiler::frontend::{
     analyze_source,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, FunctionDecl,
-        IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr,
-        ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic,
-        WhenArm, WhenExpr,
+        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, FunctionDecl, IfExpr,
+        IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr, ReturnStatement,
+        StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic, WhenArm, WhenExpr,
     },
 };
 use vox_core::{
@@ -579,6 +578,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             artifact: None,
             mir_available: false,
             wasm_available: false,
+            runtime_note: None,
         }];
         statuses.extend(functions.into_iter().map(|function| {
             OptimizationStatus {
@@ -592,6 +592,7 @@ impl<R: RuntimeRunner> SessionState<R> {
                 artifact: None,
                 mir_available: false,
                 wasm_available: false,
+                runtime_note: None,
             }
         }));
         Ok(statuses)

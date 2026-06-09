@@ -136,6 +136,7 @@ fn encode_optimization_statuses(
                 ProtocolError::message("artifact id exceeds the 32-bit protocol range")
             })?);
         }
+        writer.write_string(status.runtime_note.as_deref().unwrap_or_default())?;
     }
     Ok(())
 }

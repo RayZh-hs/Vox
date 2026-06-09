@@ -1004,6 +1004,10 @@ fn decode_optimization_statuses(bytes: &[u8]) -> Result<Vec<OptimizationStatus>,
         } else {
             None
         };
+        let runtime_note = match reader.read_string().map_err(protocol_to_runner)? {
+            note if note.is_empty() => None,
+            note => Some(note),
+        };
         statuses.push(OptimizationStatus {
             object,
             requested,
@@ -1011,6 +1015,7 @@ fn decode_optimization_statuses(bytes: &[u8]) -> Result<Vec<OptimizationStatus>,
             artifact,
             mir_available,
             wasm_available,
+            runtime_note,
         });
     }
     reader.finish().map_err(protocol_to_runner)?;

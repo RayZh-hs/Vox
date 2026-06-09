@@ -575,14 +575,19 @@ fn render_optimization_statuses(statuses: &[OptimizationStatus]) -> String {
             } else {
                 dumps.join(",")
             };
-            format!(
+            let mut rendered = format!(
                 "{} mode={} rank={} artifact={} dumps={}",
                 status.object,
                 status.requested.as_str(),
                 rank,
                 artifact,
                 dumps
-            )
+            );
+            if let Some(note) = &status.runtime_note {
+                rendered.push_str(" note=");
+                rendered.push_str(note);
+            }
+            rendered
         })
         .collect::<Vec<_>>()
         .join("\n")
