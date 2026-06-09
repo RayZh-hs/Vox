@@ -1341,6 +1341,109 @@ pub(crate) fn fold_constants(module: &mut MirModule) -> MirPassReport {
     }
 }
 
+pub(crate) fn propagate_copies(module: &mut MirModule) -> MirPassReport {
+    let mut rewrites = 0;
+    let mut removed = 0;
+    for body in &mut module.bodies {
+        let mut aliases = BTreeMap::<MirValueId, MirValueId>::new();
+        for block in &body.blocks {
+            for op in &block.ops {
+                if matches!(op.kind, MirOpKind::Use(_)) {
+                    if let (Some(result), [source]) = (op.result, op.args.as_slice()) {
+                        if result != *source {
+                            aliases.insert(result, *source);
+                        }
+                    }
+                }
+            }
+        }
+
+        if aliases.is_empty() {
+            continue;
+        }
+
+        for block in &mut body.blocks {
+            for op in &mut block.ops {
+                for arg in &mut op.args {
+                    if rewrite_copy_alias(arg, &aliases) {
+                        rewrites += 1;
+                    }
+                }
+            }
+
+            match &mut block.terminator {
+                MirTerminator::Return(value) => {
+                    if rewrite_copy_alias(value, &aliases) {
+                        rewrites += 1;
+                    }
+                }
+                MirTerminator::Branch {
+                    condition,
+                    then_args,
+                    else_args,
+                    ..
+                } => {
+                    if rewrite_copy_alias(condition, &aliases) {
+                        rewrites += 1;
+                    }
+                    for arg in then_args.iter_mut().chain(else_args.iter_mut()) {
+                        if rewrite_copy_alias(arg, &aliases) {
+                            rewrites += 1;
+                        }
+                    }
+                }
+                MirTerminator::Jump { args, .. } => {
+                    for arg in args {
+                        if rewrite_copy_alias(arg, &aliases) {
+                            rewrites += 1;
+                        }
+                    }
+                }
+                MirTerminator::Panic(_) | MirTerminator::Unreachable => {}
+            }
+        }
+
+        for version in &mut body.versions {
+            if rewrite_copy_alias(&mut version.value, &aliases) {
+                rewrites += 1;
+            }
+        }
+
+        for block in &mut body.blocks {
+            let before = block.ops.len();
+            block.ops.retain(|op| {
+                !(matches!(op.kind, MirOpKind::Use(_))
+                    && op.result.is_some_and(|result| aliases.contains_key(&result)))
+            });
+            removed += before - block.ops.len();
+        }
+
+        body.values.retain(|value| !aliases.contains_key(&value.id));
+    }
+
+    MirPassReport {
+        name: "copy-propagation",
+        changed: rewrites > 0 || removed > 0,
+        summary: format!(
+            "copy propagation rewrote {rewrites} reference(s) and removed {removed} copy op(s)"
+        ),
+    }
+}
+
+fn rewrite_copy_alias(value: &mut MirValueId, aliases: &BTreeMap<MirValueId, MirValueId>) -> bool {
+    let original = *value;
+    let mut resolved = original;
+    let mut seen = BTreeSet::new();
+    while let Some(next) = aliases.get(&resolved).copied() {
+        if !seen.insert(resolved) {
+            break;
+        }
+        resolved = next;
+    }
+    *value = resolved;
+    resolved != original
+}
+
 pub(crate) fn analyze_lifetimes(module: &mut MirModule) -> MirPassReport {
     for body in &mut module.bodies {
         let mut def_points = BTreeMap::new();

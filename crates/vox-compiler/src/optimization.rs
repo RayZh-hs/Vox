@@ -9,7 +9,7 @@ use vox_core::{
 use crate::mir::{
     MirPassFn, analyze_lifetimes, analyze_projection_demand, build_def_use,
     cull_unused_composite_outputs, enable_active_value_cache, fold_constants, mark_copy_on_write,
-    remove_dead_pure_ops, reuse_value_slots, seal_module,
+    propagate_copies, remove_dead_pure_ops, reuse_value_slots, seal_module,
 };
 
 use crate::frontend::{
@@ -42,7 +42,7 @@ impl OptimizationPipeline {
             },
             OptimizationStage {
                 name: "cheap-canonicalization",
-                passes: vec![fold_constants, build_def_use],
+                passes: vec![fold_constants, propagate_copies, build_def_use],
             },
             OptimizationStage {
                 name: "baseline-analysis",
