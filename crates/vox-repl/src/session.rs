@@ -129,6 +129,7 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 "new".to_owned(),
                 "reserve".to_owned(),
                 "list".to_owned(),
+                "transfer".to_owned(),
             ],
             symbols,
         };
@@ -264,7 +265,41 @@ impl<R: RuntimeRunner> ReplSession<R> {
             }
             SessionCommand::Reserve => self.toggle_session_reserve(),
             SessionCommand::List => self.list_sessions(),
+            SessionCommand::Transfer {
+                binding,
+                source,
+                alias,
+            } => self.transfer_session_binding(&binding, &source, alias.as_deref()),
         }
+    }
+
+    fn transfer_session_binding(
+        &mut self,
+        binding: &str,
+        source: &str,
+        alias: Option<&str>,
+    ) -> ReplOutput {
+        let selector = match parse_session_selector(source) {
+            Ok(selector) => selector,
+            Err(error) => return ReplOutput::error(error),
+        };
+        let target_name = match transfer_target_name(binding, alias) {
+            Ok(name) => name,
+            Err(error) => return ReplOutput::error(error),
+        };
+        let source_id = match self
+            .runtime
+            .transfer_binding_from(selector, binding, &target_name)
+        {
+            Ok(source_id) => source_id,
+            Err(error) => return ReplOutput::error(error.to_string()),
+        };
+        ReplOutput::message(format!(
+            "transferred `{}` from session {} as `{}`",
+            binding.trim(),
+            source_id.0,
+            target_name
+        ))
     }
 
     fn run_file(&mut self, path: &str) -> ReplOutput {
@@ -515,9 +550,37 @@ fn render_help() -> String {
         ":session connect (target)  - attach to an existing session by id or name",
         ":session new [name]        - create a fresh anonymous or named session",
         ":session reserve           - toggle whether the current session is retained at 0 users",
+        ":session transfer [binding] from [session] [as name] - copy a live binding into this session",
         ":session list              - list available sessions",
     ]
     .join("\n")
+}
+
+fn transfer_target_name(binding: &str, alias: Option<&str>) -> Result<String, String> {
+    if let Some(alias) = alias {
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Err("transfer target name must not be empty".to_owned());
+        }
+        return Ok(alias.to_owned());
+    }
+
+    let binding = binding.trim();
+    if binding == "$" {
+        return Err("transferring `$` requires `as <name>`".to_owned());
+    }
+    if !binding
+        .chars()
+        .all(|ch| ch == '_' || ch == '.' || ch.is_ascii_alphanumeric())
+    {
+        return Err("transfer target must be named with `as <name>`".to_owned());
+    }
+    Ok(binding
+        .rsplit('.')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(binding)
+        .to_owned())
 }
 
 fn parse_optimization_level(raw: &str) -> Option<OptimizationLevel> {

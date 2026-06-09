@@ -387,6 +387,31 @@ impl RuntimeRunner for RemoteRunner {
         self.decode_runtime_result(frame)
     }
 
+    fn transfer_session_binding(
+        &self,
+        source: SessionId,
+        target: SessionId,
+        source_name: &str,
+        target_name: &str,
+    ) -> Result<(), RunnerError> {
+        let target_id = self.to_wire_id(target.0, "session")?;
+        let mut payload = PayloadWriter::new();
+        payload.write_u32(self.to_wire_id(source.0, "session")?);
+        payload
+            .write_string(source_name)
+            .map_err(protocol_to_runner)?;
+        payload
+            .write_string(target_name)
+            .map_err(protocol_to_runner)?;
+        let _ = self.invoke(
+            Opcode::TransferSessionBinding,
+            target_id,
+            0,
+            payload.into_inner(),
+        )?;
+        Ok(())
+    }
+
     fn drop_session_item(&self, session: SessionId, raw: &str) -> Result<bool, RunnerError> {
         let target_id = self.to_wire_id(session.0, "session")?;
         let mut payload = PayloadWriter::new();
@@ -879,6 +904,7 @@ fn protocol_error_to_runner(frame: &Frame) -> Result<RunnerError, RunnerError> {
                 | Opcode::SetSessionOpt
                 | Opcode::GetSessionOpt
                 | Opcode::DumpSessionOpt
+                | Opcode::TransferSessionBinding
                 | Opcode::CloseSession
                 | Opcode::ListSessions
                 | Opcode::SetSessionReserved

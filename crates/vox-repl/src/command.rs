@@ -33,6 +33,11 @@ pub enum SessionCommand {
     New(Option<String>),
     Reserve,
     List,
+    Transfer {
+        binding: String,
+        source: String,
+        alias: Option<String>,
+    },
 }
 
 impl FromStr for ReplCommand {
@@ -122,8 +127,44 @@ fn parse_session_command(parts: Vec<&str>) -> Result<ReplCommand, String> {
         }
         "reserve" => Ok(ReplCommand::Session(SessionCommand::Reserve)),
         "list" => Ok(ReplCommand::Session(SessionCommand::List)),
+        "transfer" => parse_session_transfer_command(&parts),
         other => Err(format!("unknown `:session` subcommand `{other}`")),
     }
+}
+
+fn parse_session_transfer_command(parts: &[&str]) -> Result<ReplCommand, String> {
+    let Some(from_index) = parts.iter().position(|part| *part == "from") else {
+        return Err("`:session transfer` expects `<binding> from <session>`".to_owned());
+    };
+    if from_index == 1 {
+        return Err("`:session transfer` requires a binding before `from`".to_owned());
+    }
+    let binding = parts[1..from_index].join(" ");
+    let rest = &parts[from_index + 1..];
+    if rest.is_empty() {
+        return Err("`:session transfer` requires a source session after `from`".to_owned());
+    }
+
+    let (source, alias) = if let Some(as_index) = rest.iter().position(|part| *part == "as") {
+        if as_index == 0 {
+            return Err("`:session transfer` requires a source session before `as`".to_owned());
+        }
+        if as_index + 1 >= rest.len() {
+            return Err("`:session transfer` requires a target name after `as`".to_owned());
+        }
+        (
+            rest[..as_index].join(" "),
+            Some(rest[as_index + 1..].join(" ")),
+        )
+    } else {
+        (rest.join(" "), None)
+    };
+
+    Ok(ReplCommand::Session(SessionCommand::Transfer {
+        binding,
+        source,
+        alias,
+    }))
 }
 
 #[cfg(test)]

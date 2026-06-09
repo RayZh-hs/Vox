@@ -142,6 +142,12 @@ struct RetainedLastValue {
     value: Option<RuntimeValue>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct LiveBinding {
+    ty_source: String,
+    value: RuntimeValue,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SessionModel {
     unit: CompilationUnit,
@@ -152,6 +158,7 @@ struct SessionModel {
 pub(crate) struct SessionState<R: RuntimeRunner> {
     runner: R,
     items: Vec<StoredItem>,
+    live_bindings: BTreeMap<String, LiveBinding>,
     binding_handles: BTreeMap<String, HandleId>,
     hidden_last: Option<RetainedLastValue>,
     next_source_revision: u64,
@@ -165,6 +172,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         Self {
             runner,
             items: Vec::new(),
+            live_bindings: BTreeMap::new(),
             binding_handles: BTreeMap::new(),
             hidden_last: None,
             next_source_revision: 0,
@@ -181,6 +189,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         }
 
         self.enforce_incremental_redefinition_policy(&parsed.items)?;
+        self.remove_live_bindings_for_items(&parsed.items)?;
 
         let candidate_items = merge_items(&self.items, parsed.items.clone());
         let items_changed = candidate_items != self.items;
@@ -248,6 +257,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         } else {
             trimmed
         };
+        let removed_live = self.remove_live_binding(target)?;
         let before = self.items.len();
         self.items.retain(|item| !item.matches_drop(target));
         let removed_hidden = if target == LAST_VALUE_NAME {
@@ -261,10 +271,11 @@ impl<R: RuntimeRunner> SessionState<R> {
             self.clear_binding_handles()?;
             self.retain_known_optimization_overrides();
         }
-        Ok(before != self.items.len() || removed_hidden)
+        Ok(before != self.items.len() || removed_hidden || removed_live)
     }
 
     pub fn reset(&mut self) -> Result<(), SessionError> {
+        self.clear_live_bindings()?;
         self.clear_binding_handles()?;
         self.clear_hidden_last()?;
         self.items.clear();
@@ -288,6 +299,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         }
 
         self.validate_environment(&frontend.syntax)?;
+        self.clear_live_bindings()?;
         self.clear_binding_handles()?;
         self.clear_hidden_last()?;
 
@@ -360,6 +372,86 @@ impl<R: RuntimeRunner> SessionState<R> {
         Ok(statuses)
     }
 
+    pub fn transfer_binding_from(
+        &mut self,
+        source_name: &str,
+        target_name: &str,
+        value: RuntimeValue,
+    ) -> Result<(), SessionError> {
+        let target_name = validate_live_binding_name(target_name)?;
+        if self
+            .items
+            .iter()
+            .any(|item| item.matches_drop(target_name.as_str()))
+        {
+            return Err(SessionError::Message(format!(
+                "target session already has a stored item named `{target_name}`"
+            )));
+        }
+
+        let ty_source = self.runtime_value_type_source(&value)?;
+        self.validate_live_binding_source(&target_name, &ty_source)?;
+
+        self.retain_runtime_value(&value)?;
+        if let Some(previous) = self.live_bindings.remove(&target_name) {
+            self.release_runtime_value(&previous.value)?;
+        }
+        self.live_bindings
+            .insert(target_name, LiveBinding { ty_source, value });
+        let _ = source_name;
+        Ok(())
+    }
+
+    pub fn evaluate_transfer_source(
+        &mut self,
+        raw: &str,
+    ) -> Result<(RuntimeValue, bool), SessionError> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(SessionError::Message(
+                "transfer requires a source binding".to_owned(),
+            ));
+        }
+        if trimmed == "$" {
+            return self
+                .hidden_last
+                .as_ref()
+                .and_then(|hidden_last| hidden_last.value.clone())
+                .map(|value| (value, false))
+                .ok_or_else(|| SessionError::Message("`$` is not set".to_owned()));
+        }
+        if let Some(binding) = self.live_bindings.get(trimmed) {
+            return Ok((binding.value.clone(), false));
+        }
+        if let Some(handle) = self.binding_handles.get(trimmed) {
+            return Ok((RuntimeValue::Handle(*handle), false));
+        }
+
+        let parsed = parse_submission(trimmed)?;
+        if !parsed.items.is_empty() {
+            return Err(SessionError::Message(
+                "transfer source must be an expression, not a definition".to_owned(),
+            ));
+        }
+        let Some(result_source) = parsed.result_source else {
+            return Err(SessionError::Message(
+                "transfer source must produce a value".to_owned(),
+            ));
+        };
+        let source = self.synthetic_source(
+            &self.items,
+            if parsed.uses_last_value {
+                self.hidden_last_item()
+            } else {
+                None
+            },
+            Some(&result_source),
+        );
+        let value = self.evaluate_script_source(&source)?;
+        let owns_handle = matches!(value, RuntimeValue::Handle(_));
+        Ok((value, owns_handle))
+    }
+
     pub fn optimization_dump(
         &mut self,
         object: &str,
@@ -386,7 +478,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         label: &str,
         items: &[StoredItem],
     ) -> Result<SessionModel, SessionError> {
-        let source = render_session_source(items, None, None);
+        let source = render_session_source(&self.live_bindings, items, None, None);
         let frontend = analyze_source(&SourceText::new(label, 1, &source))
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
         let environment = self.validate_environment(&frontend.syntax)?;
@@ -512,7 +604,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         hidden_last: Option<&StoredItem>,
         result: Option<&str>,
     ) -> String {
-        render_session_source(items, hidden_last, result)
+        render_session_source(&self.live_bindings, items, hidden_last, result)
     }
 
     fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, SessionError> {
@@ -530,8 +622,13 @@ impl<R: RuntimeRunner> SessionState<R> {
             artifact_id
         };
 
+        let arguments = self
+            .live_bindings
+            .values()
+            .map(|binding| binding.value.clone())
+            .collect::<Vec<_>>();
         self.runner
-            .run_script(artifact_id, &[])
+            .run_script(artifact_id, &arguments)
             .map_err(SessionError::from)
     }
 
@@ -625,6 +722,39 @@ impl<R: RuntimeRunner> SessionState<R> {
         self.hidden_last.as_ref().map(|value| &value.item)
     }
 
+    fn remove_live_bindings_for_items(&mut self, items: &[StoredItem]) -> Result<(), SessionError> {
+        for item in items {
+            match &item.key {
+                StoredItemKey::Value { name } | StoredItemKey::Function { name } => {
+                    self.remove_live_binding(name)?;
+                }
+                StoredItemKey::Import { .. } | StoredItemKey::Statement => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_live_binding(&mut self, name: &str) -> Result<bool, SessionError> {
+        let Some(binding) = self.live_bindings.remove(name) else {
+            return Ok(false);
+        };
+        self.release_runtime_value(&binding.value)?;
+        Ok(true)
+    }
+
+    fn clear_live_bindings(&mut self) -> Result<(), SessionError> {
+        let values = self
+            .live_bindings
+            .values()
+            .map(|binding| binding.value.clone())
+            .collect::<Vec<_>>();
+        self.live_bindings.clear();
+        for value in values {
+            self.release_runtime_value(&value)?;
+        }
+        Ok(())
+    }
+
     fn clear_binding_handles(&mut self) -> Result<(), SessionError> {
         let handles = self.binding_handles.values().copied().collect::<Vec<_>>();
         self.binding_handles.clear();
@@ -714,10 +844,37 @@ impl<R: RuntimeRunner> SessionState<R> {
         }
         Ok(())
     }
+
+    fn runtime_value_type_source(&self, value: &RuntimeValue) -> Result<String, SessionError> {
+        match value {
+            RuntimeValue::Inline(value) => Ok(inline_value_type_source(value)),
+            RuntimeValue::Handle(handle) => {
+                let Some(summary) = self.runner.describe_handle(*handle)? else {
+                    return Err(SessionError::Message(format!(
+                        "handle {} was not found",
+                        handle.0
+                    )));
+                };
+                Ok(summary.type_name)
+            }
+        }
+    }
+
+    fn validate_live_binding_source(
+        &self,
+        name: &str,
+        ty_source: &str,
+    ) -> Result<(), SessionError> {
+        let source = format!("script {REPL_MODULE};\nparam {name}: {ty_source};\n{name}\n");
+        analyze_source(&SourceText::new("<repl-transfer>", 1, &source))
+            .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
+        Ok(())
+    }
 }
 
 impl<R: RuntimeRunner> Drop for SessionState<R> {
     fn drop(&mut self) {
+        let _ = self.clear_live_bindings();
         let _ = self.clear_binding_handles();
         let _ = self.clear_hidden_last();
         let _ = self.unload_active_artifact();
@@ -810,6 +967,21 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
             .map_err(SessionError::from)
     }
 
+    pub fn transfer_binding_from(
+        &mut self,
+        source: SessionSelector,
+        source_name: &str,
+        target_name: &str,
+    ) -> Result<SessionId, SessionError> {
+        let source_session = Self::attach(self.runner.clone(), source)?;
+        let source_id = source_session.id();
+        self.runner
+            .transfer_session_binding(source_id, self.session_id, source_name, target_name)
+            .map_err(SessionError::from)?;
+        drop(source_session);
+        Ok(source_id)
+    }
+
     pub fn type_of(&self, raw_expr: &str) -> Result<ReplType, SessionError> {
         if raw_expr.trim().is_empty() {
             return Err(SessionError::Message(
@@ -821,6 +993,7 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         let snapshot = self.snapshot_source()?;
         let items = snapshot_items(&snapshot, true)?;
         let source = render_session_source(
+            &BTreeMap::new(),
             &items,
             rewritten
                 .uses_last_value
@@ -998,6 +1171,7 @@ fn environment_from_snapshot<R: RuntimeRunner>(
 ) -> Result<TypeEnvironment, SessionError> {
     let items = snapshot_items(snapshot, include_hidden_last)?;
     let source = render_session_source(
+        &BTreeMap::new(),
         &items,
         if include_hidden_last {
             find_hidden_last(&items)
@@ -1029,11 +1203,19 @@ fn find_hidden_last(items: &[StoredItem]) -> Option<&StoredItem> {
 }
 
 fn render_session_source(
+    live_bindings: &BTreeMap<String, LiveBinding>,
     items: &[StoredItem],
     hidden_last: Option<&StoredItem>,
     result: Option<&str>,
 ) -> String {
     let mut source = format!("script {REPL_MODULE};\n");
+    for (name, binding) in live_bindings {
+        source.push_str("param ");
+        source.push_str(name);
+        source.push_str(": ");
+        source.push_str(&binding.ty_source);
+        source.push_str(";\n");
+    }
     for item in items {
         if item.is_hidden_last() {
             continue;
@@ -1584,6 +1766,60 @@ fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
         ),
         vox_core::value::InlineValue::Null => "null".to_owned(),
     }
+}
+
+fn inline_value_type_source(value: &vox_core::value::InlineValue) -> String {
+    match value {
+        vox_core::value::InlineValue::Int(_) => "Int".to_owned(),
+        vox_core::value::InlineValue::Float(_) => "Float".to_owned(),
+        vox_core::value::InlineValue::Bool(_) => "Bool".to_owned(),
+        vox_core::value::InlineValue::String(_) => "String".to_owned(),
+        vox_core::value::InlineValue::Handle(_) => "Handle".to_owned(),
+        vox_core::value::InlineValue::Tuple(values) => match values.as_slice() {
+            [] => "()".to_owned(),
+            _ => format!(
+                "({})",
+                values
+                    .iter()
+                    .map(inline_value_type_source)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        vox_core::value::InlineValue::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", inline_value_type_source(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        vox_core::value::InlineValue::Null => "Null".to_owned(),
+    }
+}
+
+fn validate_live_binding_name(raw: &str) -> Result<String, SessionError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(SessionError::Message(
+            "transfer target name must not be empty".to_owned(),
+        ));
+    }
+    if !is_identifier(trimmed) {
+        return Err(SessionError::Message(format!(
+            "transfer target `{trimmed}` must be a single identifier"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn is_identifier(raw: &str) -> bool {
+    let mut chars = raw.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn render_float_literal(value: f64) -> String {

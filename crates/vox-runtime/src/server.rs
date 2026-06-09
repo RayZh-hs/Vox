@@ -306,6 +306,7 @@ impl RuntimeConnection {
             Opcode::SetSessionOpt => self.handle_set_session_opt(frame),
             Opcode::GetSessionOpt => self.handle_get_session_opt(frame),
             Opcode::DumpSessionOpt => self.handle_dump_session_opt(frame),
+            Opcode::TransferSessionBinding => self.handle_transfer_session_binding(frame),
             Opcode::CloseSession => self.handle_close_session(frame),
             Opcode::ListSessions => self.handle_list_sessions(frame),
             Opcode::SetSessionReserved => self.handle_set_session_reserved(frame),
@@ -700,6 +701,29 @@ impl RuntimeConnection {
             frame.header.target_id,
             value,
         )
+    }
+
+    fn handle_transfer_session_binding(&mut self, frame: Frame) -> Result<Frame, WireFailure> {
+        let target_session = self.resolve_session(frame.header.target_id)?;
+        let mut payload = PayloadReader::new(&frame.payload);
+        let source_session =
+            SessionId(payload.read_u32().map_err(WireFailure::bad_argument)? as u64);
+        let source_name = payload.read_string().map_err(WireFailure::bad_argument)?;
+        let target_name = payload.read_string().map_err(WireFailure::bad_argument)?;
+        payload.finish().map_err(WireFailure::bad_argument)?;
+
+        self.runner
+            .transfer_session_binding(source_session, target_session, &source_name, &target_name)
+            .map_err(WireFailure::from_runner)?;
+        success_frame(
+            self.protocol_version(),
+            Opcode::TransferSessionBinding,
+            frame.header.request_id,
+            frame.header.target_id,
+            0,
+            Vec::new(),
+        )
+        .map_err(WireFailure::bad_argument)
     }
 
     fn handle_set_session_xopt(&mut self, frame: Frame) -> Result<Frame, WireFailure> {

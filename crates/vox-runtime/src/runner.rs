@@ -77,6 +77,14 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         raw: &str,
     ) -> Result<RuntimeValue, RunnerError>;
 
+    fn transfer_session_binding(
+        &self,
+        source: SessionId,
+        target: SessionId,
+        source_name: &str,
+        target_name: &str,
+    ) -> Result<(), RunnerError>;
+
     fn drop_session_item(&self, session: SessionId, raw: &str) -> Result<bool, RunnerError>;
 
     fn reset_session(&self, session: SessionId) -> Result<(), RunnerError>;
@@ -453,6 +461,33 @@ impl RuntimeRunner for EmbeddedRunner {
                 .run_script_text(path, raw)
                 .map_err(map_session_error)
         })
+    }
+
+    fn transfer_session_binding(
+        &self,
+        source: SessionId,
+        target: SessionId,
+        source_name: &str,
+        target_name: &str,
+    ) -> Result<(), RunnerError> {
+        let (value, owns_handle) = self.with_session(source, |state| {
+            state
+                .state
+                .evaluate_transfer_source(source_name)
+                .map_err(map_session_error)
+        })?;
+        let result = self.with_session(target, |state| {
+            state
+                .state
+                .transfer_binding_from(source_name, target_name, value.clone())
+                .map_err(map_session_error)
+        });
+        if owns_handle {
+            if let RuntimeValue::Handle(handle) = value {
+                self.release_handle(handle)?;
+            }
+        }
+        result
     }
 
     fn drop_session_item(&self, session: SessionId, raw: &str) -> Result<bool, RunnerError> {
