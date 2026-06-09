@@ -902,11 +902,11 @@ impl BodyBuilder {
         if name.segments.len() == 1 {
             self.use_name(&name.segments[0], span)
         } else {
-            self.emit_op(
-                MirOpKind::Unknown(format!("qualified_name {}", name.to_source_string())),
-                Vec::new(),
-                span,
-            )
+            self.terminate_with_panic(format!(
+                "qualified name `{}` is not available as a MIR value",
+                name.to_source_string()
+            ));
+            self.emit_unit_with_span(span)
         }
     }
 
@@ -918,7 +918,8 @@ impl BodyBuilder {
         if let Some(binding) = self.resolve_binding(name) {
             return self.emit_op(MirOpKind::Use(binding.version), vec![binding.value], span);
         }
-        self.emit_op(MirOpKind::Unknown(format!("name {name}")), Vec::new(), span)
+        self.terminate_with_panic(format!("unknown name `{name}`"));
+        self.emit_unit_with_span(span)
     }
 
     fn declare_binding(
@@ -1031,8 +1032,15 @@ impl BodyBuilder {
     }
 
     fn emit_unit(&mut self) -> MirValueId {
-        let value = self.new_value(None, MirValueDefinition::Unit, None);
-        self.emit_op_with_result(Some(value), MirOpKind::Unit, Vec::new(), None);
+        self.emit_unit_with_span(None)
+    }
+
+    fn emit_unit_with_span(
+        &mut self,
+        span: Option<vox_core::diagnostics::TextSpan>,
+    ) -> MirValueId {
+        let value = self.new_value(None, MirValueDefinition::Unit, span.clone());
+        self.emit_op_with_result(Some(value), MirOpKind::Unit, Vec::new(), span);
         value
     }
 
