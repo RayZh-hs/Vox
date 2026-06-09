@@ -994,6 +994,313 @@ fn collect_references(
     spans
 }
 
+struct CallInfo {
+    callee_name: String,
+    active_parameter: usize,
+}
+
+fn find_call_at_offset(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    offset: usize,
+) -> Option<CallInfo> {
+    use vox_compiler::frontend::ast::*;
+    let mut best: Option<(String, usize)> = None;
+
+    fn walk_expr(expr: &Expr, offset: usize, best: &mut Option<(String, usize)>) {
+        if offset < expr.span.start || offset >= expr.span.end {
+            return;
+        }
+
+        fn walk_children(expr: &Expr, offset: usize, best: &mut Option<(String, usize)>) {
+            match &expr.kind {
+                ExprKind::Block(block) => {
+                    for item in &block.items {
+                        match item {
+                            BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                            BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                            BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                            BlockItem::Return(r) => {
+                                if let Some(ref val) = r.value {
+                                    walk_expr(val, offset, best);
+                                }
+                            }
+                            BlockItem::Panic(_) => {}
+                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                        }
+                    }
+                    if let Some(ref trailing) = block.trailing {
+                        walk_expr(trailing, offset, best);
+                    }
+                }
+                ExprKind::If(if_expr) => {
+                    for branch in &if_expr.branches {
+                        walk_expr(&branch.condition, offset, best);
+                        for item in &branch.body.items {
+                            match item {
+                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::Return(r) => {
+                                    if let Some(ref val) = r.value {
+                                        walk_expr(val, offset, best);
+                                    }
+                                }
+                                BlockItem::Panic(_) => {}
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            }
+                        }
+                        if let Some(ref trailing) = branch.body.trailing {
+                            walk_expr(trailing, offset, best);
+                        }
+                    }
+                    if let Some(ref else_branch) = if_expr.else_branch {
+                        for item in &else_branch.items {
+                            match item {
+                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::Return(r) => {
+                                    if let Some(ref val) = r.value {
+                                        walk_expr(val, offset, best);
+                                    }
+                                }
+                                BlockItem::Panic(_) => {}
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            }
+                        }
+                        if let Some(ref trailing) = else_branch.trailing {
+                            walk_expr(trailing, offset, best);
+                        }
+                    }
+                }
+                ExprKind::When(when_expr) => {
+                    walk_expr(&when_expr.subject, offset, best);
+                    for arm in &when_expr.arms {
+                        walk_expr(&arm.body, offset, best);
+                    }
+                    if let Some(ref else_arm) = when_expr.else_arm {
+                        walk_expr(else_arm, offset, best);
+                    }
+                }
+                ExprKind::For(for_expr) => {
+                    walk_expr(&for_expr.iterable, offset, best);
+                    for item in &for_expr.body.items {
+                        match item {
+                            BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                            BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                            BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                            BlockItem::Return(r) => {
+                                if let Some(ref val) = r.value {
+                                    walk_expr(val, offset, best);
+                                }
+                            }
+                            BlockItem::Panic(_) => {}
+                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                        }
+                    }
+                    if let Some(ref trailing) = for_expr.body.trailing {
+                        walk_expr(trailing, offset, best);
+                    }
+                }
+                ExprKind::Lambda(lambda) => walk_expr(&lambda.body, offset, best),
+                ExprKind::Call { callee, arguments } => {
+                    walk_expr(callee, offset, best);
+                    for arg in arguments {
+                        match arg {
+                            Argument::Positional(e) => walk_expr(e, offset, best),
+                            Argument::Named { value, .. } => walk_expr(value, offset, best),
+                        }
+                    }
+                }
+                ExprKind::ReceiverCall { receiver, callee: _, arguments } => {
+                    walk_expr(receiver, offset, best);
+                    for arg in arguments {
+                        match arg {
+                            Argument::Positional(e) => walk_expr(e, offset, best),
+                            Argument::Named { value, .. } => walk_expr(value, offset, best),
+                        }
+                    }
+                }
+                ExprKind::List(items) | ExprKind::Tuple(items) => {
+                    for item in items {
+                        walk_expr(item, offset, best);
+                    }
+                }
+                ExprKind::Record(fields) => {
+                    for field in fields {
+                        walk_expr(&field.value, offset, best);
+                    }
+                }
+                ExprKind::Index { target, index } => {
+                    walk_expr(target, offset, best);
+                    walk_expr(index, offset, best);
+                }
+                ExprKind::Field { target, .. }
+                | ExprKind::SafeField { target, .. }
+                | ExprKind::NonNull { target } => walk_expr(target, offset, best),
+                ExprKind::Unary { expr: inner, .. } => walk_expr(inner, offset, best),
+                ExprKind::Binary { left, right, .. } => {
+                    walk_expr(left, offset, best);
+                    walk_expr(right, offset, best);
+                }
+                ExprKind::Range(range) => {
+                    if let Some(ref start) = range.start {
+                        walk_expr(start, offset, best);
+                    }
+                    if let Some(ref end) = range.end {
+                        walk_expr(end, offset, best);
+                    }
+                }
+                ExprKind::Intrinsic(intr) => match intr {
+                    IntrinsicExpr::Updated(u) => {
+                        walk_expr(&u.target, offset, best);
+                        for upd in &u.updates {
+                            walk_expr(&upd.value, offset, best);
+                        }
+                    }
+                    IntrinsicExpr::Econ(e) => {
+                        for item in &e.body.items {
+                            match item {
+                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::Return(r) => {
+                                    if let Some(ref val) = r.value {
+                                        walk_expr(val, offset, best);
+                                    }
+                                }
+                                BlockItem::Panic(_) => {}
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            }
+                        }
+                        if let Some(ref trailing) = e.body.trailing {
+                            walk_expr(trailing, offset, best);
+                        }
+                    }
+                },
+                ExprKind::Name(_)
+                | ExprKind::Integer(_)
+                | ExprKind::Float(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Null
+                | ExprKind::String(_) => {}
+            }
+        }
+
+        match &expr.kind {
+            ExprKind::Call { callee, arguments } => {
+                for (i, arg) in arguments.iter().enumerate() {
+                    let arg_span = match arg {
+                        Argument::Positional(e) => e.span.clone(),
+                        Argument::Named { value: e, .. } => e.span.clone(),
+                    };
+                    if offset >= arg_span.start && offset <= arg_span.end {
+                        if let ExprKind::Name(ref qname) = callee.kind {
+                            if !qname.segments.is_empty() {
+                                *best = Some((qname.to_source_string(), i));
+                            }
+                        }
+                    }
+                }
+                walk_children(expr, offset, best);
+            }
+            ExprKind::ReceiverCall { callee, arguments, .. } => {
+                for (i, arg) in arguments.iter().enumerate() {
+                    let arg_span = match arg {
+                        Argument::Positional(e) => e.span.clone(),
+                        Argument::Named { value: e, .. } => e.span.clone(),
+                    };
+                    if offset >= arg_span.start && offset <= arg_span.end {
+                        *best = Some((callee.to_source_string(), i));
+                    }
+                }
+                walk_children(expr, offset, best);
+            }
+            _ => walk_children(expr, offset, best),
+        }
+    }
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => walk_expr(&f.body, offset, &mut best),
+            TopLevelItem::Value(v) => walk_expr(&v.initializer, offset, &mut best),
+            TopLevelItem::Param(p) => {
+                if let Some(ref default) = p.default {
+                    walk_expr(default, offset, &mut best);
+                }
+            }
+            TopLevelItem::Statement(s) => match s {
+                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, &mut best),
+                _ => {}
+            },
+            TopLevelItem::Import(_) => {}
+        }
+    }
+
+    if let Some(ref result) = unit.syntax.result {
+        walk_expr(result, offset, &mut best);
+    }
+
+    best.map(|(name, idx)| CallInfo {
+        callee_name: name,
+        active_parameter: idx,
+    })
+}
+
+fn compute_signature_help(source: &str, position: Position) -> Option<SignatureHelp> {
+    use vox_compiler::frontend::ast::*;
+    let source_text = SourceText::new("", 0, source);
+    let unit = frontend::analyze_source(&source_text).ok()?;
+    let offset = position_to_byte_offset(source, position);
+    let call_info = find_call_at_offset(&unit, offset)?;
+
+    for item in &unit.syntax.items {
+        if let TopLevelItem::Function(f) = item {
+            if f.name == call_info.callee_name {
+                let params: Vec<ParameterInformation> = f
+                    .parameters
+                    .iter()
+                    .map(|p| {
+                        let label = format!("{}: {}", p.name, p.ty.to_source_string());
+                        ParameterInformation {
+                            label: ParameterLabel::Simple(label),
+                            documentation: None,
+                        }
+                    })
+                    .collect();
+
+                let param_count = f.parameters.len().max(1);
+                let sig = SignatureInformation {
+                    label: format!(
+                        "{}({}){}",
+                        f.name,
+                        f.parameters
+                            .iter()
+                            .map(|p| format!("{}: {}", p.name, p.ty.to_source_string()))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        f.return_type
+                            .as_ref()
+                            .map(|t| format!(" -> {}", t.to_source_string()))
+                            .unwrap_or_default()
+                    ),
+                    documentation: None,
+                    parameters: Some(params),
+                    active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+                };
+
+                return Some(SignatureHelp {
+                    signatures: vec![sig],
+                    active_signature: Some(0),
+                    active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+                });
+            }
+        }
+    }
+
+    None
+}
+
 fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option<GotoDefinitionResponse> {
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
@@ -1083,6 +1390,11 @@ impl LanguageServer for VoxLanguageServer {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: Default::default(),
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -1256,6 +1568,26 @@ impl LanguageServer for VoxLanguageServer {
 
         match source {
             Some(text) => Ok(compute_hover(
+                &text,
+                params.text_document_position_params.position,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let source = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&params.text_document_position_params.text_document.uri)
+            .cloned();
+
+        match source {
+            Some(text) => Ok(compute_signature_help(
                 &text,
                 params.text_document_position_params.position,
             )),
