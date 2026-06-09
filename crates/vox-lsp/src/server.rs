@@ -1301,6 +1301,82 @@ fn compute_signature_help(source: &str, position: Position) -> Option<SignatureH
     None
 }
 
+fn compute_completion(source: &str, _position: Position) -> Option<Vec<CompletionItem>> {
+    use std::collections::BTreeSet;
+    use vox_compiler::frontend::ast::*;
+
+    let source_text = SourceText::new("", 0, source);
+    let unit = frontend::analyze_source(&source_text).ok()?;
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+
+    for kw in vox_runtime::language_keywords() {
+        names.insert(kw);
+    }
+
+    fn collect_block(
+        items: &[BlockItem],
+        names: &mut BTreeSet<String>,
+    ) {
+        for item in items {
+            match item {
+                BlockItem::LocalValue(lv) => {
+                    names.insert(lv.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                names.insert(f.name.clone());
+                for p in &f.parameters {
+                    names.insert(p.name.clone());
+                }
+                if let ExprKind::Block(ref block) = f.body.kind {
+                    collect_block(&block.items, &mut names);
+                }
+            }
+            TopLevelItem::Value(v) => {
+                names.insert(v.name.clone());
+            }
+            TopLevelItem::Param(p) => {
+                names.insert(p.name.clone());
+            }
+            TopLevelItem::Statement(s) => {
+                if let BlockItem::LocalValue(lv) = s {
+                    names.insert(lv.name.clone());
+                }
+            }
+            TopLevelItem::Import(i) => {
+                if let Some(last) = i.module.segments.last() {
+                    names.insert(last.clone());
+                }
+                names.insert(i.module.to_source_string());
+            }
+        }
+    }
+
+    if let Some(ref result) = unit.syntax.result {
+        if let ExprKind::Block(ref block) = result.kind {
+            collect_block(&block.items, &mut names);
+        }
+    }
+
+    let completions: Vec<CompletionItem> = names
+        .into_iter()
+        .map(|name| CompletionItem {
+            label: name.clone(),
+            kind: None,
+            ..Default::default()
+        })
+        .collect();
+
+    Some(completions)
+}
+
 fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option<GotoDefinitionResponse> {
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
@@ -1395,6 +1471,7 @@ impl LanguageServer for VoxLanguageServer {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
+                completion_provider: Some(CompletionOptions::default()),
                 ..Default::default()
             },
             ..Default::default()
@@ -1591,6 +1668,29 @@ impl LanguageServer for VoxLanguageServer {
                 &text,
                 params.text_document_position_params.position,
             )),
+            None => Ok(None),
+        }
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> Result<Option<CompletionResponse>> {
+        let source = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&params.text_document_position.text_document.uri)
+            .cloned();
+
+        match source {
+            Some(text) => {
+                let items = compute_completion(
+                    &text,
+                    params.text_document_position.position,
+                );
+                Ok(items.map(CompletionResponse::Array))
+            }
             None => Ok(None),
         }
     }
