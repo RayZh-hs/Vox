@@ -1005,6 +1005,51 @@ fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option
     Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
 }
 
+fn compute_hover(source: &str, position: Position) -> Option<Hover> {
+    let source_text = SourceText::new("", 0, source);
+    let unit = frontend::analyze_source(&source_text).ok()?;
+    let offset = position_to_byte_offset(source, position);
+    let name = find_name_at_offset(&unit, source, offset)?;
+
+    let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
+
+    for binding in &env.bindings {
+        if binding.name == name {
+            let contents = HoverContents::Scalar(MarkedString::String(format!(
+                "{}: {}",
+                binding.name,
+                binding.ty.render()
+            )));
+            return Some(Hover {
+                contents,
+                range: None,
+            });
+        }
+    }
+
+    for func in &env.functions {
+        if func.name == name {
+            let sig = format!(
+                "fun {}({}) -> {}",
+                func.name,
+                func.parameters
+                    .iter()
+                    .map(|p| format!("{}: {}", p.name, p.ty.render()))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                func.return_type.render()
+            );
+            let contents = HoverContents::Scalar(MarkedString::String(sig));
+            return Some(Hover {
+                contents,
+                range: None,
+            });
+        }
+    }
+
+    None
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for VoxLanguageServer {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
@@ -1037,6 +1082,7 @@ impl LanguageServer for VoxLanguageServer {
                 })),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -1198,5 +1244,22 @@ impl LanguageServer for VoxLanguageServer {
             .collect();
 
         Ok(Some(locations))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let source = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&params.text_document_position_params.text_document.uri)
+            .cloned();
+
+        match source {
+            Some(text) => Ok(compute_hover(
+                &text,
+                params.text_document_position_params.position,
+            )),
+            None => Ok(None),
+        }
     }
 }
