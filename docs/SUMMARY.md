@@ -17,6 +17,7 @@
   - [Runtime](system/runtime/README.md)
     - [Protocol](system/runtime/protocol.md)
   - [REPL](system/repl.md)
+  - [LSP](system/lsp/README.md)
 
 - [Language Integration](integration/README.md)
   - [Rust](integration/rust/README.md)
