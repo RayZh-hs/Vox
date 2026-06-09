@@ -1,10 +1,12 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 use vox_compiler::{CompileRequest, Compiler, FrontendUnit};
 use vox_core::{
+    external_library::ExternalLibrary,
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, HostRegistry, PackageManifest, ParameterSpec,
         Purity, TraitMethodSpec, TraitSpec, TypeSpec,
@@ -12,8 +14,53 @@ use vox_core::{
     opt::OptimizationLevel,
     source::{ModulePath, SourceText},
     types::{QualifiedTypeName, VoxType},
+    VoxExport, vox_fn,
 };
 use vox_runtime::infer_environment;
+
+// =============================================================================
+// Test external library items (used by both manifest-generation and combined tests).
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq, VoxExport)]
+struct TestPoint {
+    x: i64,
+    y: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, VoxExport)]
+#[allow(dead_code)]
+struct TestEmpty {}
+
+#[vox_fn(purity = "pure")]
+fn make_empty() -> TestEmpty {
+    TestEmpty {}
+}
+
+#[vox_fn(purity = "pure")]
+fn make_point(x: i64, y: i64) -> TestPoint {
+    TestPoint { x, y }
+}
+
+#[vox_fn(purity = "pure")]
+fn point_distance(a: TestPoint, b: TestPoint) -> f64 {
+    (((b.x - a.x).pow(2) + (b.y - a.y).pow(2)) as f64).sqrt()
+}
+
+#[vox_fn(purity = "pure")]
+fn maybe_point(has: bool, x: i64, y: i64) -> Option<TestPoint> {
+    if has { Some(TestPoint { x, y }) } else { None }
+}
+
+#[vox_fn(purity = "pure")]
+fn points(count: i64) -> Vec<TestPoint> {
+    (0..count).map(|i| TestPoint { x: i, y: i * 2 }).collect()
+}
+
+#[vox_fn(purity = "pure")]
+fn tags() -> Vec<String> {
+    vec!["fast".into(), "gpu".into()]
+}
 
 #[test]
 fn compile_ok_fixtures_compile_at_all_optimization_levels() {
@@ -113,13 +160,21 @@ fn expect_compile_success(path: &Path) -> FrontendUnit {
 }
 
 fn compile_fixture(path: &Path, optimization: OptimizationLevel) -> vox_compiler::CompileResult {
+    compile_with_registry(path, optimization, host_registry())
+}
+
+fn compile_with_registry(
+    path: &Path,
+    optimization: OptimizationLevel,
+    registry: HostRegistry,
+) -> vox_compiler::CompileResult {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));
     Compiler::default().compile(CompileRequest {
         source: SourceText::new(path.display().to_string(), 1, source),
         optimization,
         optimization_overrides: Default::default(),
-        host: host_registry(),
+        host: registry,
     })
 }
 
@@ -129,7 +184,11 @@ fn fixture_paths(group: &str) -> Vec<PathBuf> {
         .join("fixtures")
         .join("compiler")
         .join(group);
-    let mut paths = fs::read_dir(&dir)
+    collect_vox_paths(&dir)
+}
+
+fn collect_vox_paths(dir: &Path) -> Vec<PathBuf> {
+    let mut paths = fs::read_dir(dir)
         .unwrap_or_else(|error| {
             panic!(
                 "failed to read fixture directory `{}`: {error}",
@@ -175,6 +234,183 @@ fn host_registry() -> HostRegistry {
 
 fn semantic_manifests() -> Vec<PackageManifest> {
     vec![host_manifest(), image_manifest(), tools_manifest()]
+}
+
+// =========================================================================
+// External-library manifest generation test
+// =========================================================================
+
+#[test]
+fn test_external_library_manifest_generation() {
+    let package_name = "test.fxt";
+    let manifest = ExternalLibrary::new(package_name)
+        .expect("valid package name")
+        .build()
+        .expect("external library build should collect registered exports");
+
+    let package = ModulePath::parse(package_name).expect("valid package path");
+    assert_eq!(manifest.package, package, "package name mismatch");
+
+    let types: BTreeMap<&str, &TypeSpec> = manifest
+        .types
+        .iter()
+        .map(|t| (t.name.name.as_str(), t))
+        .collect();
+
+    let point = types.get("TestPoint").expect("TestPoint should be registered");
+    assert_eq!(point.name.module, package);
+    assert_eq!(
+        point.fields.len(),
+        2,
+        "TestPoint should have 2 fields"
+    );
+    let fields: BTreeMap<&str, &FieldSpec> = point
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    assert_eq!(fields.get("x").map(|f| &f.ty), Some(&VoxType::Int));
+    assert_eq!(fields.get("y").map(|f| &f.ty), Some(&VoxType::Int));
+
+    let empty = types.get("TestEmpty").expect("TestEmpty should be registered");
+    assert!(empty.fields.is_empty(), "TestEmpty should have no fields");
+
+    let functions: BTreeMap<&str, &FunctionSpec> = manifest
+        .functions
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+
+    let mk = functions
+        .get("make_point")
+        .expect("make_point should be registered");
+    assert_eq!(mk.parameters.len(), 2, "make_point expects 2 parameters");
+    assert_eq!(mk.parameters[0].name, "x");
+    assert_eq!(mk.parameters[0].ty, VoxType::Int);
+    assert_eq!(mk.parameters[1].name, "y");
+    assert_eq!(mk.parameters[1].ty, VoxType::Int);
+    assert_eq!(
+        mk.return_type,
+        VoxType::Named(qualified_type(&package, "TestPoint"))
+    );
+    assert_eq!(mk.purity, Purity::Pure);
+    assert_eq!(mk.export, FunctionExportKind::Function);
+
+    let me = functions
+        .get("make_empty")
+        .expect("make_empty should be registered");
+    assert!(me.parameters.is_empty(), "make_empty expects no parameters");
+    assert_eq!(
+        me.return_type,
+        VoxType::Named(qualified_type(&package, "TestEmpty"))
+    );
+    assert_eq!(me.purity, Purity::Pure);
+    assert_eq!(me.export, FunctionExportKind::Function);
+
+    let dist = functions
+        .get("point_distance")
+        .expect("point_distance should be registered");
+    assert_eq!(dist.return_type, VoxType::Float);
+    assert_eq!(dist.export, FunctionExportKind::Function);
+
+    let maybe = functions
+        .get("maybe_point")
+        .expect("maybe_point should be registered");
+    assert_eq!(maybe.parameters.len(), 3);
+    assert_eq!(maybe.parameters[0].name, "has");
+    assert_eq!(maybe.parameters[0].ty, VoxType::Bool);
+    assert_eq!(
+        maybe.return_type,
+        VoxType::Nullable(Box::new(VoxType::Named(qualified_type(
+            &package,
+            "TestPoint"
+        ))))
+    );
+
+    let pts = functions
+        .get("points")
+        .expect("points should be registered");
+    assert_eq!(
+        pts.return_type,
+        VoxType::List(Box::new(VoxType::Named(qualified_type(
+            &package,
+            "TestPoint"
+        ))))
+    );
+
+    let t = functions.get("tags").expect("tags should be registered");
+    assert_eq!(
+        t.return_type,
+        VoxType::List(Box::new(VoxType::String))
+    );
+}
+
+// =========================================================================
+// Combined tests: external-library manifest + .vox fixture scripts
+// =========================================================================
+
+#[test]
+fn extern_fixtures_compile_at_all_optimization_levels() {
+    let registry = extern_registry();
+    for path in extern_fixture_paths() {
+        for level in optimization_levels() {
+            let result = compile_with_registry(&path, level, registry.clone());
+            assert!(
+                !result.diagnostics.has_errors(),
+                "expected `{}` to compile at {:?}, found diagnostics:\n{}",
+                path.display(),
+                level,
+                result.diagnostics
+            );
+            assert!(
+                result.artifact.is_some(),
+                "expected `{}` to produce a compiled artifact at {:?}",
+                path.display(),
+                level
+            );
+        }
+    }
+}
+
+#[test]
+fn extern_fixtures_pass_semantic_inference() {
+    let manifest = extern_manifest();
+    let manifests = vec![manifest];
+    let registry = extern_registry();
+    for path in extern_fixture_paths() {
+        let result = compile_with_registry(&path, OptimizationLevel::SOpt, registry.clone());
+        let frontend = result
+            .frontend
+            .unwrap_or_else(|| panic!("expected `{}` to produce a frontend unit", path.display()));
+        infer_environment(&frontend.syntax, &manifests).unwrap_or_else(|error| {
+            panic!(
+                "expected `{}` to pass semantic inference, found: {error}",
+                path.display()
+            )
+        });
+    }
+}
+
+fn extern_manifest() -> PackageManifest {
+    ExternalLibrary::new("test.fxt")
+        .expect("valid package name")
+        .build()
+        .expect("external library build should succeed")
+}
+
+fn extern_registry() -> HostRegistry {
+    let mut registry = HostRegistry::default();
+    registry.register_package(extern_manifest());
+    registry
+}
+
+fn extern_fixture_paths() -> Vec<PathBuf> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("compiler")
+        .join("extern_ok");
+    collect_vox_paths(&dir)
 }
 
 fn host_manifest() -> PackageManifest {

@@ -1,0 +1,6 @@
+script fixtures.extern.list_string;
+
+import test.fxt;
+
+val tags: List[String] = test.fxt.tags();
+tags

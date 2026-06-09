@@ -1,0 +1,8 @@
+script fixtures.extern.struct_use;
+
+import test.fxt;
+
+val origin: test.fxt.TestPoint = test.fxt.make_point(0, 0);
+val far: test.fxt.TestPoint = test.fxt.make_point(10, 20);
+val distance: Float = test.fxt.point_distance(origin, far);
+distance

@@ -1,0 +1,8 @@
+script fixtures.extern.nullable_list;
+
+import test.fxt;
+
+val maybe: test.fxt.TestPoint? = test.fxt.maybe_point(true, 5, 7);
+val point: test.fxt.TestPoint = maybe!!;
+val list: List[test.fxt.TestPoint] = test.fxt.points(3);
+list
