@@ -583,20 +583,15 @@ impl BodyBuilder {
             ExprKind::When(when_expr) => self.lower_when_expr(when_expr, Some(expr.span.clone())),
             ExprKind::For(for_expr) => self.lower_for_expr(for_expr, Some(expr.span.clone())),
             ExprKind::Lambda(lambda) => {
-                let args = lambda
-                    .parameters
-                    .iter()
-                    .map(|parameter| {
-                        self.emit_op(
-                            MirOpKind::Unknown(format!("lambda_param {}", parameter.name)),
-                            Vec::new(),
-                            Some(parameter.span.clone()),
-                        )
-                    })
-                    .collect();
                 self.emit_op(
-                    MirOpKind::Unknown("lambda".to_owned()),
-                    args,
+                    MirOpKind::Lambda {
+                        parameters: lambda
+                            .parameters
+                            .iter()
+                            .map(|parameter| parameter.name.clone())
+                            .collect(),
+                    },
+                    Vec::new(),
                     Some(expr.span.clone()),
                 )
             }
@@ -1823,6 +1818,7 @@ fn pure_op_name(kind: &MirOpKind) -> Option<String> {
         MirOpKind::Project(projection) => Some(format!("project:{projection:?}")),
         MirOpKind::Index => Some("index".to_owned()),
         MirOpKind::Updated { path } => Some(format!("updated:{path:?}")),
+        MirOpKind::Lambda { parameters } => Some(format!("lambda:{}", parameters.join(","))),
         MirOpKind::NonNull => Some("non_null".to_owned()),
         MirOpKind::SafeProject(field) => Some(format!("safe_project:{field}")),
         MirOpKind::TypeTest(ty) => Some(format!("type_test:{ty}")),

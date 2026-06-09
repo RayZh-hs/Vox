@@ -213,6 +213,7 @@ impl<'a> MirExecutor<'a> {
                 let _ = purity;
                 Some(self.eval_call(callee, &op.args)?)
             }
+            MirOpKind::Lambda { parameters } => Some(self.materialize_lambda(parameters)),
             MirOpKind::Econ { .. } => Some(self.materialize_econ(self.single_arg(op)?)),
             MirOpKind::NonNull => {
                 let value = self.single_arg(op)?;
@@ -321,6 +322,20 @@ impl<'a> MirExecutor<'a> {
         let summary = HandleSummary {
             type_name: "Econ".to_owned(),
             summary: format!("econ({})", render_inline_value(&value)),
+            bytes: None,
+        };
+        InlineValue::Handle(self.runtime.allocate_handle(summary))
+    }
+
+    fn materialize_lambda(&mut self, parameters: &[String]) -> InlineValue {
+        let signature = if parameters.is_empty() {
+            "()".to_owned()
+        } else {
+            parameters.join(", ")
+        };
+        let summary = HandleSummary {
+            type_name: "Function".to_owned(),
+            summary: format!("<function <lambda> ({signature})>"),
             bytes: None,
         };
         InlineValue::Handle(self.runtime.allocate_handle(summary))
@@ -739,6 +754,7 @@ fn op_kind_label(kind: &MirOpKind) -> &'static str {
         MirOpKind::Index => "index",
         MirOpKind::Updated { .. } => "updated",
         MirOpKind::Call { .. } => "call",
+        MirOpKind::Lambda { .. } => "lambda",
         MirOpKind::Econ { .. } => "econ",
         MirOpKind::NonNull => "non_null",
         MirOpKind::SafeProject(_) => "safe_project",

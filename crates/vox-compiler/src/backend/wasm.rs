@@ -174,6 +174,7 @@ fn infer_value_types(body: &MirBody) -> Result<BTreeMap<MirValueId, WasmType>, S
             | MirOpKind::Index
             | MirOpKind::Updated { .. }
             | MirOpKind::Call { .. }
+            | MirOpKind::Lambda { .. }
             | MirOpKind::Econ { .. }
             | MirOpKind::SafeProject(_)
             | MirOpKind::Iterator
@@ -251,6 +252,7 @@ fn emit_op(
         | MirOpKind::Index
         | MirOpKind::Updated { .. }
         | MirOpKind::Call { .. }
+        | MirOpKind::Lambda { .. }
         | MirOpKind::Econ { .. }
         | MirOpKind::SafeProject(_)
         | MirOpKind::Iterator
@@ -552,6 +554,7 @@ fn op_kind_name(kind: &MirOpKind) -> &'static str {
         MirOpKind::Index => "index",
         MirOpKind::Updated { .. } => "updated",
         MirOpKind::Call { .. } => "call",
+        MirOpKind::Lambda { .. } => "lambda",
         MirOpKind::Econ { .. } => "econ",
         MirOpKind::NonNull => "non_null",
         MirOpKind::SafeProject(_) => "safe_project",
