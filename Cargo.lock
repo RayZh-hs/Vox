@@ -853,6 +853,7 @@ dependencies = [
  "tower-lsp",
  "vox-compiler",
  "vox-core",
+ "vox-runtime",
 ]
 
 [[package]]

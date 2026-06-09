@@ -680,12 +680,21 @@ fn find_name_at_offset(
             | ExprKind::String(_) => {}
         }
 
-        None
-    }
+    None
+}
 
     fn find_in_block_item(item: &BlockItem, source: &str, offset: usize) -> Option<String> {
         match item {
-            BlockItem::LocalValue(lv) => find_in_expr(&lv.initializer, source, offset),
+            BlockItem::LocalValue(lv) => {
+                if offset >= lv.span.start && offset < lv.span.end {
+                    if let Some(ident) = identifier_at_offset(source, offset) {
+                        if ident == lv.name {
+                            return Some(lv.name.clone());
+                        }
+                    }
+                }
+                find_in_expr(&lv.initializer, source, offset)
+            }
             BlockItem::Assignment(a) => find_in_expr(&a.value, source, offset),
             BlockItem::CompoundAssignment(ca) => find_in_expr(&ca.value, source, offset),
             BlockItem::Return(r) => match &r.value {
@@ -732,6 +741,25 @@ fn find_name_at_offset(
     }
 
     None
+}
+
+fn identifier_at_offset(source: &str, offset: usize) -> Option<&str> {
+    let bytes = source.as_bytes();
+    if offset >= bytes.len() {
+        return None;
+    }
+    if !is_ident_byte(bytes[offset]) {
+        return None;
+    }
+    let mut start = offset;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = offset;
+    while end < bytes.len() && is_ident_byte(bytes[end]) {
+        end += 1;
+    }
+    Some(&source[start..end])
 }
 
 fn collect_references(
@@ -1546,9 +1574,23 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
     let offset = position_to_byte_offset(source, position);
-    let name = find_name_at_offset(&unit, source, offset)?;
 
     let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
+
+    if let Some(ty) = env.find_type_at_offset(offset) {
+        let name = find_name_at_offset(&unit, source, offset)
+            .or_else(|| identifier_at_offset(source, offset).map(String::from));
+        let label = match name {
+            Some(name) => format!("{}: {}", name, ty.render()),
+            None => ty.render(),
+        };
+        return Some(Hover {
+            contents: HoverContents::Scalar(MarkedString::String(label)),
+            range: None,
+        });
+    }
+
+    let name = find_name_at_offset(&unit, source, offset)?;
 
     for binding in &env.bindings {
         if binding.name == name {
@@ -1557,10 +1599,7 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
                 binding.name,
                 binding.ty.render()
             )));
-            return Some(Hover {
-                contents,
-                range: None,
-            });
+            return Some(Hover { contents, range: None });
         }
     }
 
@@ -1577,10 +1616,7 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
                 func.return_type.render()
             );
             let contents = HoverContents::Scalar(MarkedString::String(sig));
-            return Some(Hover {
-                contents,
-                range: None,
-            });
+            return Some(Hover { contents, range: None });
         }
     }
 

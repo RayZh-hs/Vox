@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use vox_compiler::frontend::ast::{
@@ -86,6 +87,16 @@ pub struct TypeEnvironment {
     pub bindings: Vec<BindingSummary>,
     pub functions: Vec<FunctionSummary>,
     pub result: Option<ReplType>,
+    pub expr_type_map: BTreeMap<usize, (usize, ReplType)>,
+}
+
+impl TypeEnvironment {
+    pub fn find_type_at_offset(&self, offset: usize) -> Option<&ReplType> {
+        self.expr_type_map
+            .range(..=offset)
+            .next_back()
+            .and_then(|(_, (end, ty))| if offset < *end { Some(ty) } else { None })
+    }
 }
 
 pub fn infer_environment(
@@ -320,6 +331,7 @@ struct TypeEngine<'a> {
     imports: BTreeMap<String, ImportedPackage>,
     values: BTreeMap<String, ValueInfo>,
     functions: BTreeMap<String, FunctionInfo>,
+    expr_types: RefCell<BTreeMap<usize, (usize, ReplType)>>,
 }
 
 impl<'a> TypeEngine<'a> {
@@ -335,6 +347,7 @@ impl<'a> TypeEngine<'a> {
             imports: BTreeMap::new(),
             values: BTreeMap::new(),
             functions: BTreeMap::new(),
+            expr_types: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -364,6 +377,7 @@ impl<'a> TypeEngine<'a> {
                 .map(|function| function.summary.clone())
                 .collect(),
             result,
+            expr_type_map: self.expr_types.borrow().clone(),
         })
     }
 
@@ -550,6 +564,9 @@ impl<'a> TypeEngine<'a> {
 
             let mut scope = self.top_level_scope();
             let ty = self.infer_value_initializer(value, &mut scope)?;
+            self.expr_types
+                .borrow_mut()
+                .insert(value.span.start, (value.span.end, ty.clone()));
 
             if let Some(binding) = self.values.get_mut(&value.name) {
                 binding.ty = ty;
@@ -579,6 +596,9 @@ impl<'a> TypeEngine<'a> {
                         return Err(captured_rebind_error(&value.name, functions));
                     }
                     let ty = self.infer_value_initializer(value, &mut scope)?;
+                    self.expr_types
+                        .borrow_mut()
+                        .insert(value.span.start, (value.span.end, ty.clone()));
                     let binding = LocalBinding {
                         ty: ty.clone(),
                         mutable: matches!(value.mutability, Mutability::Var),
@@ -703,6 +723,14 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn infer_expr(&self, expr: &Expr, scope: &mut TypeScope) -> Result<ReplType, String> {
+        let ty = self.infer_expr_inner(expr, scope)?;
+        self.expr_types
+            .borrow_mut()
+            .insert(expr.span.start, (expr.span.end, ty.clone()));
+        Ok(ty)
+    }
+
+    fn infer_expr_inner(&self, expr: &Expr, scope: &mut TypeScope) -> Result<ReplType, String> {
         match &expr.kind {
             ExprKind::Integer(_) => Ok(ReplType::Int),
             ExprKind::Float(_) => Ok(ReplType::Float),
@@ -1070,6 +1098,9 @@ impl<'a> TypeEngine<'a> {
         } else {
             inferred
         };
+        self.expr_types
+            .borrow_mut()
+            .insert(value.span.start, (value.span.end, ty.clone()));
         scope.values.insert(
             value.name.clone(),
             LocalBinding {
