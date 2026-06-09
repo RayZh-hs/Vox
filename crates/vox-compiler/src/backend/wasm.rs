@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use vox_core::{
-    mir::{MirBody, MirBodyKind, MirModule, MirOp, MirOpKind, MirTerminator, MirValueId},
+    mir::{
+        MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOp, MirOpKind, MirTerminator,
+        MirValueId,
+    },
     plan::WasmArtifact,
     types::VoxType,
     value::InlineValue,
@@ -45,14 +48,6 @@ impl WasmBackend {
 }
 
 fn lower_script_entry(body: &MirBody) -> Result<Vec<u8>, String> {
-    if body.blocks.len() != 1 {
-        return Err("wasm backend currently lowers only single-block MIR bodies".to_owned());
-    }
-    let block = body
-        .blocks
-        .first()
-        .ok_or_else(|| "script entry has no MIR block".to_owned())?;
-
     let value_types = infer_value_types(body)?;
     let params = body
         .parameters
@@ -65,23 +60,15 @@ fn lower_script_entry(body: &MirBody) -> Result<Vec<u8>, String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let result_type = match &block.terminator {
-        MirTerminator::Return(value) => value_types.get(value).copied(),
-        MirTerminator::Panic(_)
-        | MirTerminator::Unreachable
-        | MirTerminator::Jump { .. }
-        | MirTerminator::Branch { .. } => None,
-    };
+    let result_type = infer_result_type(body, &value_types)?;
 
     let mut locals = LocalLayout::new();
-    for op in &block.ops {
-        if let Some(result) = op.result {
-            if body.parameters.contains(&result) {
-                continue;
-            }
-            if let Some(ty) = value_types.get(&result).copied() {
-                locals.add(result, ty);
-            }
+    for value in &body.values {
+        if body.parameters.contains(&value.id) {
+            continue;
+        }
+        if let Some(ty) = value_types.get(&value.id).copied() {
+            locals.add(value.id, ty);
         }
     }
 
@@ -96,21 +83,19 @@ fn lower_script_entry(body: &MirBody) -> Result<Vec<u8>, String> {
     }
 
     locals.encode_declarations(&mut code);
-    for op in &block.ops {
-        emit_op(op, &value_types, &local_indices, &mut code)?;
-    }
-
-    match &block.terminator {
-        MirTerminator::Return(value) => {
-            if result_type.is_some() {
-                emit_local_get(*value, &local_indices, &mut code)?;
-            }
-        }
-        MirTerminator::Panic(_) | MirTerminator::Unreachable => code.push(0x00),
-        MirTerminator::Jump { .. } | MirTerminator::Branch { .. } => {
-            return Err("control-flow terminators are not wasm-lowered yet".to_owned());
-        }
-    }
+    let entry = body
+        .blocks
+        .first()
+        .map(|block| block.id)
+        .ok_or_else(|| "script entry has no MIR block".to_owned())?;
+    emit_block(
+        body,
+        entry,
+        &value_types,
+        &local_indices,
+        &mut code,
+        &mut Vec::new(),
+    )?;
     code.push(0x0b);
 
     let mut module = Vec::new();
@@ -131,66 +116,236 @@ fn infer_value_types(body: &MirBody) -> Result<BTreeMap<MirValueId, WasmType>, S
         }
     }
 
-    let block = body
-        .blocks
-        .first()
-        .ok_or_else(|| "script entry has no MIR block".to_owned())?;
-    for op in &block.ops {
-        let Some(result) = op.result else {
-            continue;
-        };
-        let ty = match &op.kind {
-            MirOpKind::Literal(value) => wasm_type_from_literal(value),
-            MirOpKind::Unit => None,
-            MirOpKind::Use(_) | MirOpKind::NonNull | MirOpKind::TypeRefine(_) => {
-                op.args.first().and_then(|arg| types.get(arg)).copied()
-            }
-            MirOpKind::Unary(name) => {
-                let arg = op
-                    .args
-                    .first()
-                    .and_then(|arg| types.get(arg))
-                    .copied()
-                    .ok_or_else(|| format!("unary op result %{} has untyped operand", result.0))?;
-                match name.as_str() {
-                    "not" => Some(WasmType::I32),
-                    "negate" => Some(arg),
-                    _ => return Err(format!("unsupported unary wasm op `{name}`")),
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &body.blocks {
+            for op in &block.ops {
+                let Some(result) = op.result else {
+                    continue;
+                };
+                let ty = infer_op_type(op, result, &types)?;
+                if let Some(ty) = ty {
+                    changed |= insert_value_type(&mut types, result, ty)?;
                 }
             }
-            MirOpKind::Binary(name) => match name.as_str() {
-                "less" | "less_equal" | "greater" | "greater_equal" | "equal" | "not_equal" => {
-                    Some(WasmType::I32)
+            match &block.terminator {
+                MirTerminator::Jump { target, args } => {
+                    changed |= infer_block_argument_types(body, *target, args, &mut types)?;
                 }
-                _ => op.args.first().and_then(|arg| types.get(arg)).copied(),
-            },
-            MirOpKind::TypeTest(_) => Some(WasmType::I32),
-            MirOpKind::Bind(_)
-            | MirOpKind::Tuple { .. }
-            | MirOpKind::Record { .. }
-            | MirOpKind::List
-            | MirOpKind::StringInterpolate { .. }
-            | MirOpKind::Project(_)
-            | MirOpKind::Index
-            | MirOpKind::Updated { .. }
-            | MirOpKind::Call { .. }
-            | MirOpKind::Lambda { .. }
-            | MirOpKind::Econ { .. }
-            | MirOpKind::SafeProject(_)
-            | MirOpKind::Iterator
-            | MirOpKind::IteratorNext
-            | MirOpKind::CacheGet(_)
-            | MirOpKind::CachePut(_)
-            | MirOpKind::Drop
-            | MirOpKind::Unknown(_) => None,
-        };
-
-        if let Some(ty) = ty {
-            types.insert(result, ty);
+                MirTerminator::Branch {
+                    then_target,
+                    then_args,
+                    else_target,
+                    else_args,
+                    ..
+                } => {
+                    changed |=
+                        infer_block_argument_types(body, *then_target, then_args, &mut types)?;
+                    changed |=
+                        infer_block_argument_types(body, *else_target, else_args, &mut types)?;
+                }
+                MirTerminator::Return(_) | MirTerminator::Panic(_) | MirTerminator::Unreachable => {
+                }
+            }
         }
     }
 
     Ok(types)
+}
+
+fn infer_op_type(
+    op: &MirOp,
+    _result: MirValueId,
+    types: &BTreeMap<MirValueId, WasmType>,
+) -> Result<Option<WasmType>, String> {
+    let ty = match &op.kind {
+        MirOpKind::Literal(value) => wasm_type_from_literal(value),
+        MirOpKind::Unit => None,
+        MirOpKind::Use(_) | MirOpKind::NonNull | MirOpKind::TypeRefine(_) => {
+            op.args.first().and_then(|arg| types.get(arg)).copied()
+        }
+        MirOpKind::Unary(name) => {
+            let Some(arg) = op.args.first().and_then(|arg| types.get(arg)).copied() else {
+                return Ok(None);
+            };
+            match name.as_str() {
+                "not" => Some(WasmType::I32),
+                "negate" => Some(arg),
+                _ => return Err(format!("unsupported unary wasm op `{name}`")),
+            }
+        }
+        MirOpKind::Binary(name) => match name.as_str() {
+            "less" | "less_equal" | "greater" | "greater_equal" | "equal" | "not_equal" => {
+                Some(WasmType::I32)
+            }
+            _ => op.args.first().and_then(|arg| types.get(arg)).copied(),
+        },
+        MirOpKind::TypeTest(_) => Some(WasmType::I32),
+        MirOpKind::Bind(_)
+        | MirOpKind::Tuple { .. }
+        | MirOpKind::Record { .. }
+        | MirOpKind::List
+        | MirOpKind::StringInterpolate { .. }
+        | MirOpKind::Project(_)
+        | MirOpKind::Index
+        | MirOpKind::Updated { .. }
+        | MirOpKind::Call { .. }
+        | MirOpKind::Lambda { .. }
+        | MirOpKind::Econ { .. }
+        | MirOpKind::SafeProject(_)
+        | MirOpKind::Iterator
+        | MirOpKind::IteratorNext
+        | MirOpKind::CacheGet(_)
+        | MirOpKind::CachePut(_)
+        | MirOpKind::Drop
+        | MirOpKind::Unknown(_) => None,
+    };
+    Ok(ty)
+}
+
+fn infer_block_argument_types(
+    body: &MirBody,
+    target: MirBlockId,
+    args: &[MirValueId],
+    types: &mut BTreeMap<MirValueId, WasmType>,
+) -> Result<bool, String> {
+    let block = block_by_id(body, target)?;
+    if block.parameters.len() != args.len() {
+        return Err(format!(
+            "block %bb{} expects {} argument(s), received {}",
+            target.0,
+            block.parameters.len(),
+            args.len()
+        ));
+    }
+    let mut changed = false;
+    for (parameter, arg) in block.parameters.iter().zip(args) {
+        if let Some(ty) = types.get(arg).copied() {
+            changed |= insert_value_type(types, *parameter, ty)?;
+        }
+    }
+    Ok(changed)
+}
+
+fn insert_value_type(
+    types: &mut BTreeMap<MirValueId, WasmType>,
+    value: MirValueId,
+    ty: WasmType,
+) -> Result<bool, String> {
+    if let Some(existing) = types.get(&value).copied() {
+        if existing != ty {
+            return Err(format!(
+                "value %{} has conflicting wasm types {existing:?} and {ty:?}",
+                value.0
+            ));
+        }
+        return Ok(false);
+    }
+    types.insert(value, ty);
+    Ok(true)
+}
+
+fn infer_result_type(
+    body: &MirBody,
+    value_types: &BTreeMap<MirValueId, WasmType>,
+) -> Result<Option<WasmType>, String> {
+    let mut result = None;
+    for block in &body.blocks {
+        if let MirTerminator::Return(value) = &block.terminator {
+            let ty = value_types.get(value).copied();
+            match (result, ty) {
+                (None, Some(ty)) => result = Some(ty),
+                (Some(left), Some(right)) if left != right => {
+                    return Err(format!(
+                        "return values have conflicting wasm types {left:?} and {right:?}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn block_by_id(body: &MirBody, id: MirBlockId) -> Result<&MirBlock, String> {
+    body.blocks
+        .iter()
+        .find(|block| block.id == id)
+        .ok_or_else(|| format!("MIR block %bb{} was not found", id.0))
+}
+
+fn emit_block(
+    body: &MirBody,
+    block_id: MirBlockId,
+    value_types: &BTreeMap<MirValueId, WasmType>,
+    local_indices: &BTreeMap<MirValueId, u32>,
+    code: &mut Vec<u8>,
+    stack: &mut Vec<MirBlockId>,
+) -> Result<(), String> {
+    if stack.contains(&block_id) {
+        return Err("cyclic MIR control flow is not wasm-lowered yet".to_owned());
+    }
+    stack.push(block_id);
+    let block = block_by_id(body, block_id)?;
+    for op in &block.ops {
+        emit_op(op, value_types, local_indices, code)?;
+    }
+    match &block.terminator {
+        MirTerminator::Return(value) => {
+            if value_types.get(value).is_some() {
+                emit_local_get(*value, local_indices, code)?;
+            }
+            code.push(0x0f);
+        }
+        MirTerminator::Panic(_) | MirTerminator::Unreachable => code.push(0x00),
+        MirTerminator::Jump { target, args } => {
+            emit_block_arguments(body, *target, args, local_indices, code)?;
+            emit_block(body, *target, value_types, local_indices, code, stack)?;
+        }
+        MirTerminator::Branch {
+            condition,
+            then_target,
+            then_args,
+            else_target,
+            else_args,
+        } => {
+            emit_local_get(*condition, local_indices, code)?;
+            code.push(0x04);
+            code.push(0x40);
+            emit_block_arguments(body, *then_target, then_args, local_indices, code)?;
+            emit_block(body, *then_target, value_types, local_indices, code, stack)?;
+            code.push(0x05);
+            emit_block_arguments(body, *else_target, else_args, local_indices, code)?;
+            emit_block(body, *else_target, value_types, local_indices, code, stack)?;
+            code.push(0x0b);
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn emit_block_arguments(
+    body: &MirBody,
+    target: MirBlockId,
+    args: &[MirValueId],
+    local_indices: &BTreeMap<MirValueId, u32>,
+    code: &mut Vec<u8>,
+) -> Result<(), String> {
+    let block = block_by_id(body, target)?;
+    if block.parameters.len() != args.len() {
+        return Err(format!(
+            "block %bb{} expects {} argument(s), received {}",
+            target.0,
+            block.parameters.len(),
+            args.len()
+        ));
+    }
+    for (parameter, arg) in block.parameters.iter().zip(args) {
+        emit_local_get(*arg, local_indices, code)?;
+        emit_local_set(*parameter, local_indices, code)?;
+    }
+    Ok(())
 }
 
 fn emit_op(
@@ -367,6 +522,20 @@ fn emit_local_get(
         .copied()
         .ok_or_else(|| format!("value %{} has no wasm local", value.0))?;
     code.push(0x20);
+    write_uleb_u32(code, index);
+    Ok(())
+}
+
+fn emit_local_set(
+    value: MirValueId,
+    local_indices: &BTreeMap<MirValueId, u32>,
+    code: &mut Vec<u8>,
+) -> Result<(), String> {
+    let index = local_indices
+        .get(&value)
+        .copied()
+        .ok_or_else(|| format!("value %{} has no wasm local", value.0))?;
+    code.push(0x21);
     write_uleb_u32(code, index);
     Ok(())
 }
