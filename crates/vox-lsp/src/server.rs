@@ -1301,27 +1301,181 @@ fn compute_signature_help(source: &str, position: Position) -> Option<SignatureH
     None
 }
 
-fn compute_completion(source: &str, _position: Position) -> Option<Vec<CompletionItem>> {
-    use std::collections::BTreeSet;
+fn try_dot_completion(source: &str, position: Position) -> Option<Vec<CompletionItem>> {
+    use vox_runtime::ReplType;
+
+    let offset = position_to_byte_offset(source, position);
+    let bytes = source.as_bytes();
+
+    // Detect if cursor is right after `.` or `?.`
+    if offset == 0 || offset > source.len() {
+        return None;
+    }
+
+    let mut dot_end = offset;
+    let is_safe = dot_end >= 2 && bytes[dot_end - 2] == b'.' && bytes[dot_end - 1] == b'?';
+    if !is_safe && (dot_end == 0 || bytes[dot_end - 1] != b'.') {
+        return None;
+    }
+    if is_safe {
+        dot_end -= 2;
+    } else {
+        dot_end -= 1;
+    }
+
+    // Extract receiver chain: scan backwards from dot to find identifier segments separated by dots
+    let prefix_before_dot = &source[..dot_end];
+    let chain = extract_receiver_chain(prefix_before_dot)?;
+
+    // Try to parse the prefix (source up to the dot, excluding the dot and trailing content)
+    // We use the prefix before the dot to avoid the incomplete dot access parsing error
+    let source_text = SourceText::new("", 0, prefix_before_dot);
+    let unit = frontend::analyze_source(&source_text).ok()?;
+    let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
+
+    // Resolve the first segment in bindings
+    let first = &chain[0];
+    let mut current_type: Option<ReplType> = None;
+
+    for binding in &env.bindings {
+        if binding.name == *first {
+            current_type = Some(binding.ty.clone());
+            break;
+        }
+    }
+
+    // Walk remaining segments as field accesses on record types
+    for segment in chain.iter().skip(1) {
+        current_type = match current_type {
+            Some(ReplType::Record(fields)) => {
+                fields
+                    .iter()
+                    .find(|f| f.name == *segment)
+                    .map(|f| f.ty.clone())
+            }
+            Some(ReplType::Nullable(inner)) => match *inner {
+                ReplType::Record(fields) => fields
+                    .iter()
+                    .find(|f| f.name == *segment)
+                    .map(|f| f.ty.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+
+    // Generate completions from the final type's fields
+    match current_type {
+        Some(ReplType::Record(fields)) => Some(
+            fields
+                .iter()
+                .map(|f| CompletionItem {
+                    label: f.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(f.ty.render()),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        Some(ReplType::Nullable(inner)) => {
+            if let ReplType::Record(fields) = *inner {
+                Some(
+                    fields
+                        .iter()
+                        .map(|f| CompletionItem {
+                            label: f.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(f.ty.render()),
+                            ..Default::default()
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_receiver_chain(prefix: &str) -> Option<Vec<String>> {
+    let trimmed = prefix.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let bytes = trimmed.as_bytes();
+    let mut end = trimmed.len();
+    let mut segments: Vec<String> = Vec::new();
+
+    loop {
+        // Skip trailing whitespace
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            break;
+        }
+
+        // Find identifier: scan backwards for identifier characters
+        let mut ident_start = end;
+        while ident_start > 0 && is_ident_byte(bytes[ident_start - 1]) {
+            ident_start -= 1;
+        }
+
+        if ident_start == end {
+            break;
+        }
+
+        segments.push(trimmed[ident_start..end].to_string());
+        end = ident_start;
+
+        // Skip whitespace before separator
+        while end > 0 && bytes[end - 1] == b' ' {
+            end -= 1;
+        }
+
+        // Check for dot separator
+        if end > 0 && bytes[end - 1] == b'.' {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    segments.reverse();
+    if segments.is_empty() { None } else { Some(segments) }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn compute_completion(source: &str, position: Position) -> Option<Vec<CompletionItem>> {
+    if let Some(items) = try_dot_completion(source, position) {
+        return Some(items);
+    }
+
+    use std::collections::BTreeMap;
     use vox_compiler::frontend::ast::*;
 
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
 
-    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut names: BTreeMap<String, CompletionItemKind> = BTreeMap::new();
 
     for kw in vox_runtime::language_keywords() {
-        names.insert(kw);
+        names.entry(kw).or_insert(CompletionItemKind::KEYWORD);
     }
 
     fn collect_block(
         items: &[BlockItem],
-        names: &mut BTreeSet<String>,
+        names: &mut BTreeMap<String, CompletionItemKind>,
     ) {
         for item in items {
             match item {
                 BlockItem::LocalValue(lv) => {
-                    names.insert(lv.name.clone());
+                    names.entry(lv.name.clone()).or_insert(CompletionItemKind::VARIABLE);
                 }
                 _ => {}
             }
@@ -1331,30 +1485,30 @@ fn compute_completion(source: &str, _position: Position) -> Option<Vec<Completio
     for item in &unit.syntax.items {
         match item {
             TopLevelItem::Function(f) => {
-                names.insert(f.name.clone());
+                names.entry(f.name.clone()).or_insert(CompletionItemKind::FUNCTION);
                 for p in &f.parameters {
-                    names.insert(p.name.clone());
+                    names.entry(p.name.clone()).or_insert(CompletionItemKind::VARIABLE);
                 }
                 if let ExprKind::Block(ref block) = f.body.kind {
                     collect_block(&block.items, &mut names);
                 }
             }
             TopLevelItem::Value(v) => {
-                names.insert(v.name.clone());
+                names.entry(v.name.clone()).or_insert(CompletionItemKind::VARIABLE);
             }
             TopLevelItem::Param(p) => {
-                names.insert(p.name.clone());
+                names.entry(p.name.clone()).or_insert(CompletionItemKind::VARIABLE);
             }
             TopLevelItem::Statement(s) => {
                 if let BlockItem::LocalValue(lv) = s {
-                    names.insert(lv.name.clone());
+                    names.entry(lv.name.clone()).or_insert(CompletionItemKind::VARIABLE);
                 }
             }
             TopLevelItem::Import(i) => {
                 if let Some(last) = i.module.segments.last() {
-                    names.insert(last.clone());
+                    names.entry(last.clone()).or_insert(CompletionItemKind::MODULE);
                 }
-                names.insert(i.module.to_source_string());
+                names.entry(i.module.to_source_string()).or_insert(CompletionItemKind::MODULE);
             }
         }
     }
@@ -1367,9 +1521,9 @@ fn compute_completion(source: &str, _position: Position) -> Option<Vec<Completio
 
     let completions: Vec<CompletionItem> = names
         .into_iter()
-        .map(|name| CompletionItem {
-            label: name.clone(),
-            kind: None,
+        .map(|(name, kind)| CompletionItem {
+            label: name,
+            kind: Some(kind),
             ..Default::default()
         })
         .collect();
@@ -1471,7 +1625,10 @@ impl LanguageServer for VoxLanguageServer {
                     retrigger_characters: None,
                     work_done_progress_options: Default::default(),
                 }),
-                completion_provider: Some(CompletionOptions::default()),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".into()]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
