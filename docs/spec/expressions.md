@@ -18,7 +18,7 @@ The following constructs are expressions:
 - unary and binary operator expressions;
 - `if` expressions;
 - `when` expressions;
-- `for` expressions;
+- `for` expressions (iterator, condition, and statement-condition forms);
 - lambda expressions;
 - block expressions.
 

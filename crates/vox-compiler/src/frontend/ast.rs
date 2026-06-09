@@ -488,6 +488,8 @@ pub enum BlockItem {
     CompoundAssignment(CompoundAssignmentStatement),
     Return(ReturnStatement),
     Panic(PanicStatement),
+    Break(BreakStatement),
+    Continue(ContinueStatement),
     BlockStatement(Expr),
     Expr(Expr),
 }
@@ -518,10 +520,29 @@ pub struct CompoundAssignmentStatement {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForExpr {
-    pub pattern: String,
-    pub iterable: Box<Expr>,
+    pub init: Option<Box<BlockItem>>,
+    pub header: ForHeader,
     pub body: BlockExpr,
     pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForHeader {
+    In {
+        pattern: String,
+        iterable: Box<Expr>,
+    },
+    Condition(Box<Expr>),
+}
+
+impl ForExpr {
+    pub fn body(&self) -> &BlockExpr {
+        &self.body
+    }
+
+    pub fn span(&self) -> TextSpan {
+        self.span.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,6 +554,16 @@ pub struct ReturnStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanicStatement {
     pub message: StringLiteral,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakStatement {
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinueStatement {
     pub span: TextSpan,
 }
 

@@ -70,6 +70,8 @@ Examples of invalid identifiers:
 The following words are reserved keywords:
 
 - `as`
+- `break`
+- `continue`
 - `dyn`
 - `econ`
 - `else`

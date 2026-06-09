@@ -25,6 +25,20 @@ fun blockMath(limit: Int): Int {
     for (item in 0..limit) {
         total += item;
     }
+    var k: Int = 0;
+    for (k < limit) {
+        k += 1;
+        if (k > 5) {
+            break;
+        }
+    }
+    for (val m: Int = 0; m < 10) {
+        total += m;
+        continue;
+    }
+    for (val n: Int = 0; n in 0..5) {
+        total += n;
+    }
     return total;
 }
 

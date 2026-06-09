@@ -9,9 +9,10 @@ use vox_compiler::{
     TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
-        ExprKind, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability, ParamDecl, Parameter,
-        QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart, TopLevelItem,
-        TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
+        ExprKind, ForHeader, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability,
+        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral,
+        StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
+        UpdatedPathSegment, ValueDecl,
     },
 };
 use vox_core::{
@@ -60,6 +61,12 @@ impl<'a> Interpreter<'a> {
                 Err(EvalError::Return(_)) => {
                     return Err("`return` may only be used inside a function body".to_owned());
                 }
+                Err(EvalError::Break) => {
+                    return Err("`break` may only be used inside a `for` loop".to_owned());
+                }
+                Err(EvalError::Continue) => {
+                    return Err("`continue` may only be used inside a `for` loop".to_owned());
+                }
                 Err(EvalError::Message(message)) => return Err(message),
             }
         }
@@ -67,6 +74,12 @@ impl<'a> Interpreter<'a> {
             Ok(value) => value,
             Err(EvalError::Return(_)) => {
                 return Err("`return` may only be used inside a function body".to_owned());
+            }
+            Err(EvalError::Break) => {
+                return Err("`break` may only be used inside a `for` loop".to_owned());
+            }
+            Err(EvalError::Continue) => {
+                return Err("`continue` may only be used inside a `for` loop".to_owned());
             }
             Err(EvalError::Message(message)) => return Err(message),
         };
@@ -102,6 +115,18 @@ impl<'a> Interpreter<'a> {
                     Err(EvalError::Return(_)) => {
                         return Err(format!(
                             "default value for parameter `{}` attempted to return from a function",
+                            parameter.name
+                        ));
+                    }
+                    Err(EvalError::Break) => {
+                        return Err(format!(
+                            "default value for parameter `{}` attempted to break out of a loop",
+                            parameter.name
+                        ));
+                    }
+                    Err(EvalError::Continue) => {
+                        return Err(format!(
+                            "default value for parameter `{}` attempted to continue a loop",
                             parameter.name
                         ));
                     }
@@ -492,6 +517,12 @@ impl<'a> EvalContext<'a> {
                 "panic: {}",
                 self.eval_string_literal(&statement.message)?
             ))),
+            BlockItem::Break(_) => Err(EvalError::Message(
+                "break outside loop".to_owned(),
+            )),
+            BlockItem::Continue(_) => Err(EvalError::Message(
+                "continue outside loop".to_owned(),
+            )),
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(())
@@ -1125,6 +1156,8 @@ impl<'a> EvalContext<'a> {
                 "panic: {}",
                 self.eval_string_literal(&statement.message)?
             ))),
+            BlockItem::Break(_) => Err(EvalError::Break),
+            BlockItem::Continue(_) => Err(EvalError::Continue),
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(())
@@ -1151,20 +1184,66 @@ impl<'a> EvalContext<'a> {
         &mut self,
         statement: &vox_compiler::frontend::ast::ForExpr,
     ) -> Result<(), EvalError> {
-        let iterable = self.eval_expr(&statement.iterable)?;
-        let items = self.expand_iterable(iterable)?;
-        for item in items {
+        let scope_pushed = statement.init.is_some();
+        if scope_pushed {
             self.push_scope(Scope::default());
-            self.define_local(statement.pattern.clone(), item, false);
-            let result = self.eval_block(&statement.body);
-            self.pop_scope();
-            match result {
-                Ok(_) => {}
-                Err(EvalError::Return(value)) => return Err(EvalError::Return(value)),
-                Err(EvalError::Message(message)) => return Err(EvalError::Message(message)),
+        }
+        if let Some(init) = &statement.init {
+            match self.eval_block_item(init) {
+                Ok(()) => {}
+                Err(e) => {
+                    if scope_pushed {
+                        self.pop_scope();
+                    }
+                    return Err(e);
+                }
             }
         }
-        Ok(())
+
+        let result = match &statement.header {
+            ForHeader::In {
+                pattern,
+                iterable,
+            } => {
+                let iterable = self.eval_expr(iterable)?;
+                let items = self.expand_iterable(iterable)?;
+                for item in items {
+                    self.push_scope(Scope::default());
+                    self.define_local(pattern.clone(), item, false);
+                    let result = self.eval_block(&statement.body);
+                    self.pop_scope();
+                    match result {
+                        Ok(_) => {}
+                        Err(EvalError::Break) => break,
+                        Err(EvalError::Continue) => continue,
+                        Err(other) => return Err(other),
+                    }
+                }
+                Ok(())
+            }
+            ForHeader::Condition(condition) => {
+                loop {
+                    let cond_value = self.eval_expr(condition)?;
+                    let cond = self.expect_bool(cond_value, "for condition")?;
+                    if !cond {
+                        break;
+                    }
+                    let result = self.eval_block(&statement.body);
+                    match result {
+                        Ok(_) => {}
+                        Err(EvalError::Break) => break,
+                        Err(EvalError::Continue) => continue,
+                        Err(other) => return Err(other),
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        if scope_pushed {
+            self.pop_scope();
+        }
+        result
     }
 
     fn expand_iterable(&self, iterable: Value) -> Result<Vec<Value>, EvalError> {
@@ -1579,11 +1658,47 @@ impl CaptureNameCollector {
                 }
             }
             ExprKind::For(expr) => {
-                self.visit_expr(&expr.iterable);
-                self.push_scope();
-                self.bind_name(&expr.pattern);
-                self.visit_block(&expr.body);
-                self.pop_scope();
+                let scope_pushed = expr.init.is_some();
+                if scope_pushed {
+                    self.push_scope();
+                }
+                if let Some(init) = &expr.init {
+                    match init.as_ref() {
+                        BlockItem::LocalValue(value) => {
+                            self.visit_expr(&value.initializer);
+                            self.bind_name(&value.name);
+                        }
+                        BlockItem::Assignment(assignment) => {
+                            self.visit_expr(&assignment.value);
+                        }
+                        BlockItem::CompoundAssignment(assignment) => {
+                            self.visit_expr(&assignment.value);
+                        }
+                        BlockItem::Expr(e) => {
+                            self.visit_expr(e);
+                        }
+                        _ => {}
+                    }
+                }
+                match &expr.header {
+                    ForHeader::In {
+                        iterable,
+                        pattern,
+                    } => {
+                        self.visit_expr(iterable);
+                        self.push_scope();
+                        self.bind_name(pattern);
+                        self.visit_block(&expr.body);
+                        self.pop_scope();
+                    }
+                    ForHeader::Condition(condition) => {
+                        self.visit_expr(condition);
+                        self.visit_block(&expr.body);
+                    }
+                }
+                if scope_pushed {
+                    self.pop_scope();
+                }
             }
             ExprKind::Lambda(lambda) => {
                 self.push_scope();
@@ -1650,6 +1765,7 @@ impl CaptureNameCollector {
                         }
                     }
                 }
+                BlockItem::Break(_) | BlockItem::Continue(_) => {}
                 BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
@@ -1814,6 +1930,8 @@ impl UserFunction {
         match context.eval_expr(&self.body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Break) => Err(EvalError::Break),
+            Err(EvalError::Continue) => Err(EvalError::Continue),
             Err(EvalError::Message(message)) => Err(EvalError::Message(message)),
         }
     }
@@ -1901,6 +2019,8 @@ impl GenericFunction {
         let result = match context.eval_expr(&self.body) {
             Ok(value) => Ok(value),
             Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Break) => Err(EvalError::Break),
+            Err(EvalError::Continue) => Err(EvalError::Continue),
             Err(EvalError::Message(message)) => Err(EvalError::Message(message)),
         };
         drop(context);
@@ -2359,6 +2479,8 @@ impl RangeValue {
 enum EvalError {
     Message(String),
     Return(Value),
+    Break,
+    Continue,
 }
 
 fn assign_arguments(

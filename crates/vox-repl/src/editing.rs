@@ -154,6 +154,8 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
             BlockItem::CompoundAssignment(assignment) => &assignment.span,
             BlockItem::Return(statement) => &statement.span,
             BlockItem::Panic(statement) => &statement.span,
+            BlockItem::Break(statement) => &statement.span,
+            BlockItem::Continue(statement) => &statement.span,
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => &expr.span,
         },
     };

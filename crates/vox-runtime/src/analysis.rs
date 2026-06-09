@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
-    Expr, ExprKind, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
-    StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
-    ValueDecl,
+    Expr, ExprKind, ForHeader, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability,
+    QualifiedName, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
+    UpdatedPathSegment, ValueDecl,
 };
 use vox_core::{
     host::PackageManifest,
@@ -880,24 +880,102 @@ impl<'a> TypeEngine<'a> {
                 Ok(ty)
             }
             ExprKind::For(expr) => {
-                let iterable = self.infer_expr(&expr.iterable, scope)?;
-                match iterable {
-                    ReplType::List(item) | ReplType::Range(item) => {
-                        let mut loop_scope = scope.clone();
-                        loop_scope.values.insert(
-                            expr.pattern.clone(),
-                            LocalBinding {
-                                ty: *item,
-                                mutable: false,
-                            },
-                        );
-                        self.infer_block(&expr.body, &mut loop_scope)?;
+                let mut loop_scope = scope.clone();
+                if let Some(init) = &expr.init {
+                    match init.as_ref() {
+                        BlockItem::LocalValue(value) => {
+                            self.infer_local_value(value, &mut loop_scope)?;
+                        }
+                        BlockItem::Assignment(assignment) => {
+                            let current = loop_scope
+                                .values
+                                .get(&assignment.name)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("unknown local `{}`", assignment.name)
+                                })?;
+                            if !current.mutable {
+                                return Err(format!(
+                                    "cannot assign to immutable local `{}`",
+                                    assignment.name
+                                ));
+                            }
+                            let next =
+                                self.infer_expr(&assignment.value, &mut loop_scope)?;
+                            if !next.is_assignable_to(&current.ty) {
+                                return Err(format!(
+                                    "cannot assign `{}` to `{}`",
+                                    next.render(),
+                                    current.ty.render()
+                                ));
+                            }
+                        }
+                        BlockItem::CompoundAssignment(assignment) => {
+                            let current = loop_scope
+                                .values
+                                .get(&assignment.name)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    format!("unknown local `{}`", assignment.name)
+                                })?;
+                            if !current.mutable {
+                                return Err(format!(
+                                    "cannot assign to immutable local `{}`",
+                                    assignment.name
+                                ));
+                            }
+                            let rhs =
+                                self.infer_expr(&assignment.value, &mut loop_scope)?;
+                            self.infer_compound_assignment(
+                                &current.ty,
+                                &rhs,
+                                assignment.op,
+                            )?;
+                        }
+                        BlockItem::Expr(expr) => {
+                            self.infer_expr(expr, &mut loop_scope)?;
+                        }
+                        _ => {
+                            return Err(
+                                "unsupported statement in `for` header".to_owned()
+                            );
+                        }
                     }
-                    other => {
-                        return Err(format!(
-                            "for-loop requires an iterable list or range, found `{}`",
-                            other.render()
-                        ));
+                }
+                match &expr.header {
+                    ForHeader::In {
+                        pattern,
+                        iterable,
+                    } => {
+                        let iterable = self.infer_expr(iterable, &mut loop_scope)?;
+                        match iterable {
+                            ReplType::List(item) | ReplType::Range(item) => {
+                                loop_scope.values.insert(
+                                    pattern.clone(),
+                                    LocalBinding {
+                                        ty: *item,
+                                        mutable: false,
+                                    },
+                                );
+                                self.infer_block(&expr.body, &mut loop_scope)?;
+                            }
+                            other => {
+                                return Err(format!(
+                                    "for-loop requires an iterable list or range, found `{}`",
+                                    other.render()
+                                ));
+                            }
+                        }
+                    }
+                    ForHeader::Condition(condition) => {
+                        let cond = self.infer_expr(condition, &mut loop_scope)?;
+                        if !matches!(cond, ReplType::Bool) {
+                            return Err(format!(
+                                "for condition must be `Bool`, found `{}`",
+                                cond.render()
+                            ));
+                        }
+                        self.infer_block(&expr.body, &mut loop_scope)?;
                     }
                 }
                 Ok(ReplType::Unit)
@@ -1009,6 +1087,9 @@ impl<'a> TypeEngine<'a> {
                         .unwrap_or(ReplType::Unit));
                 }
                 BlockItem::Panic(_) => return Ok(ReplType::Unknown("Never".to_owned())),
+                BlockItem::Break(_) | BlockItem::Continue(_) => {
+                    return Ok(ReplType::Unknown("Never".to_owned()))
+                }
                 BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                     self.infer_expr(expr, &mut nested)?;
                 }
@@ -1071,6 +1152,12 @@ impl<'a> TypeEngine<'a> {
                 Err("`return` may only be used inside a function body".to_owned())
             }
             BlockItem::Panic(_) => Ok(()),
+            BlockItem::Break(_) => {
+                Err("`break` may only be used inside a `for` loop".to_owned())
+            }
+            BlockItem::Continue(_) => {
+                Err("`continue` may only be used inside a `for` loop".to_owned())
+            }
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.infer_expr(expr, scope)?;
                 Ok(())
@@ -1742,11 +1829,55 @@ impl<'a> CaptureNameCollector<'a> {
                 }
             }
             ExprKind::For(expr) => {
-                self.visit_expr(&expr.iterable);
-                self.push_scope();
-                self.bind_name(&expr.pattern);
-                self.visit_block_contents(&expr.body);
-                self.pop_scope();
+                let scope_pushed = expr.init.is_some();
+                if scope_pushed {
+                    self.push_scope();
+                }
+                if let Some(init) = &expr.init {
+                    match init.as_ref() {
+                        BlockItem::LocalValue(value) => {
+                            self.visit_expr(&value.initializer);
+                            self.bind_name(&value.name);
+                        }
+                        BlockItem::Assignment(assignment) => {
+                            self.capture_name(&QualifiedName {
+                                segments: vec![assignment.name.clone()],
+                                span: assignment.span.clone(),
+                            });
+                            self.visit_expr(&assignment.value);
+                        }
+                        BlockItem::CompoundAssignment(assignment) => {
+                            self.capture_name(&QualifiedName {
+                                segments: vec![assignment.name.clone()],
+                                span: assignment.span.clone(),
+                            });
+                            self.visit_expr(&assignment.value);
+                        }
+                        BlockItem::Expr(e) => {
+                            self.visit_expr(e);
+                        }
+                        _ => {}
+                    }
+                }
+                match &expr.header {
+                    ForHeader::In {
+                        iterable,
+                        pattern,
+                    } => {
+                        self.visit_expr(iterable);
+                        self.push_scope();
+                        self.bind_name(pattern);
+                        self.visit_block_contents(&expr.body);
+                        self.pop_scope();
+                    }
+                    ForHeader::Condition(condition) => {
+                        self.visit_expr(condition);
+                        self.visit_block_contents(&expr.body);
+                    }
+                }
+                if scope_pushed {
+                    self.pop_scope();
+                }
             }
             ExprKind::Lambda(lambda) => {
                 self.push_scope();
@@ -1818,6 +1949,7 @@ impl<'a> CaptureNameCollector<'a> {
                         }
                     }
                 }
+                BlockItem::Break(_) | BlockItem::Continue(_) => {}
                 BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }

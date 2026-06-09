@@ -133,6 +133,8 @@ fn compute_semantic_tokens(source: &str) -> Vec<SemanticToken> {
             TokenKind::Integer(_) | TokenKind::Float(_) => TOKEN_NUMBER,
             TokenKind::StringLiteral(_) => TOKEN_STRING,
             TokenKind::As
+            | TokenKind::Break
+            | TokenKind::Continue
             | TokenKind::Dyn
             | TokenKind::Econ
             | TokenKind::Else
@@ -301,10 +303,37 @@ fn build_symbol_table(unit: &vox_compiler::frontend::ast::FrontendUnit) -> HashM
                 }
             }
             ExprKind::For(for_expr) => {
-                symbols.insert(for_expr.pattern.clone(), for_expr.span.clone());
-                walk_expr(&for_expr.iterable, symbols);
-                walk_block_items(&for_expr.body.items, symbols);
-                if let Some(ref trailing) = for_expr.body.trailing {
+                use vox_compiler::frontend::ast::ForHeader;
+                if let Some(ref init) = for_expr.init {
+                    match init.as_ref() {
+                        BlockItem::LocalValue(lv) => {
+                            symbols.insert(lv.name.clone(), lv.span.clone());
+                            walk_expr(&lv.initializer, symbols);
+                        }
+                        BlockItem::Assignment(a) => walk_expr(&a.value, symbols),
+                        BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, symbols),
+                        BlockItem::Return(r) => {
+                            if let Some(ref val) = r.value {
+                                walk_expr(val, symbols);
+                            }
+                        }
+                        BlockItem::Expr(e) => walk_expr(e, symbols),
+                        BlockItem::BlockStatement(e) => walk_expr(e, symbols),
+                        _ => {}
+                    }
+                }
+                let body = for_expr.body();
+                match &for_expr.header {
+                    ForHeader::In { pattern, iterable } => {
+                        symbols.insert(pattern.clone(), body.span.clone());
+                        walk_expr(iterable, symbols);
+                    }
+                    ForHeader::Condition(condition) => {
+                        walk_expr(condition, symbols);
+                    }
+                }
+                walk_block_items(&body.items, symbols);
+                if let Some(ref trailing) = body.trailing {
                     walk_expr(trailing, symbols);
                 }
             }
@@ -409,6 +438,8 @@ fn build_symbol_table(unit: &vox_compiler::frontend::ast::FrontendUnit) -> HashM
                     }
                 }
                 BlockItem::Panic(_) => {}
+                BlockItem::Break(_) => {}
+                BlockItem::Continue(_) => {}
                 BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, symbols),
             }
         }
@@ -543,15 +574,32 @@ fn find_name_at_offset(
                 }
             }
             ExprKind::For(for_expr) => {
-                if let Some(name) = find_in_expr(&for_expr.iterable, source, offset) {
-                    return Some(name);
+                use vox_compiler::frontend::ast::ForHeader;
+                if let Some(ref init) = for_expr.init {
+                    if let Some(name) = find_in_block_item(init.as_ref(), source, offset) {
+                        return Some(name);
+                    }
                 }
-                for item in &for_expr.body.items {
+                let body = match &for_expr.header {
+                    ForHeader::In { iterable, .. } => {
+                        if let Some(name) = find_in_expr(iterable, source, offset) {
+                            return Some(name);
+                        }
+                        &for_expr.body
+                    }
+                    ForHeader::Condition(condition) => {
+                        if let Some(name) = find_in_expr(condition, source, offset) {
+                            return Some(name);
+                        }
+                        &for_expr.body
+                    }
+                };
+                for item in &body.items {
                     if let Some(name) = find_in_block_item(item, source, offset) {
                         return Some(name);
                     }
                 }
-                if let Some(ref trailing) = for_expr.body.trailing {
+                if let Some(ref trailing) = body.trailing {
                     if let Some(name) = find_in_expr(trailing, source, offset) {
                         return Some(name);
                     }
@@ -702,6 +750,8 @@ fn find_name_at_offset(
                 None => None,
             },
             BlockItem::Panic(_) => None,
+            BlockItem::Break(_) => None,
+            BlockItem::Continue(_) => None,
             BlockItem::BlockStatement(e) | BlockItem::Expr(e) => find_in_expr(e, source, offset),
         }
     }
@@ -868,11 +918,24 @@ fn collect_references(
                 }
             }
             ExprKind::For(for_expr) => {
-                collect_in_expr(&for_expr.iterable, target, spans);
-                for item in &for_expr.body.items {
+                use vox_compiler::frontend::ast::ForHeader;
+                if let Some(ref init) = for_expr.init {
+                    collect_in_block_item(init.as_ref(), target, spans);
+                }
+                let body = match &for_expr.header {
+                    ForHeader::In { iterable, .. } => {
+                        collect_in_expr(iterable, target, spans);
+                        &for_expr.body
+                    }
+                    ForHeader::Condition(condition) => {
+                        collect_in_expr(condition, target, spans);
+                        &for_expr.body
+                    }
+                };
+                for item in &body.items {
                     collect_in_block_item(item, target, spans);
                 }
-                if let Some(ref trailing) = for_expr.body.trailing {
+                if let Some(ref trailing) = body.trailing {
                     collect_in_expr(trailing, target, spans);
                 }
             }
@@ -976,6 +1039,8 @@ fn collect_references(
                 }
             }
             BlockItem::Panic(_) => {}
+            BlockItem::Break(_) => {}
+            BlockItem::Continue(_) => {}
             BlockItem::BlockStatement(e) | BlockItem::Expr(e) => collect_in_expr(e, target, spans),
         }
     }
@@ -1053,6 +1118,8 @@ fn find_call_at_offset(
                                 }
                             }
                             BlockItem::Panic(_) => {}
+                            BlockItem::Break(_) => {}
+                            BlockItem::Continue(_) => {}
                             BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
                         }
                     }
@@ -1074,6 +1141,8 @@ fn find_call_at_offset(
                                     }
                                 }
                                 BlockItem::Panic(_) => {}
+                                BlockItem::Break(_) => {}
+                                BlockItem::Continue(_) => {}
                                 BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
                             }
                         }
@@ -1093,6 +1162,8 @@ fn find_call_at_offset(
                                     }
                                 }
                                 BlockItem::Panic(_) => {}
+                                BlockItem::Break(_) => {}
+                                BlockItem::Continue(_) => {}
                                 BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
                             }
                         }
@@ -1111,8 +1182,28 @@ fn find_call_at_offset(
                     }
                 }
                 ExprKind::For(for_expr) => {
-                    walk_expr(&for_expr.iterable, offset, best);
-                    for item in &for_expr.body.items {
+                    use vox_compiler::frontend::ast::ForHeader;
+                    if let Some(ref init) = for_expr.init {
+                        match init.as_ref() {
+                            BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                            BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
+                            BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                            BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            BlockItem::BlockStatement(e) => walk_expr(e, offset, best),
+                            _ => {}
+                        }
+                    }
+                    let body = match &for_expr.header {
+                        ForHeader::In { iterable, .. } => {
+                            walk_expr(iterable, offset, best);
+                            &for_expr.body
+                        }
+                        ForHeader::Condition(condition) => {
+                            walk_expr(condition, offset, best);
+                            &for_expr.body
+                        }
+                    };
+                    for item in &body.items {
                         match item {
                             BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
                             BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
@@ -1123,10 +1214,12 @@ fn find_call_at_offset(
                                 }
                             }
                             BlockItem::Panic(_) => {}
+                            BlockItem::Break(_) => {}
+                            BlockItem::Continue(_) => {}
                             BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
                         }
                     }
-                    if let Some(ref trailing) = for_expr.body.trailing {
+                    if let Some(ref trailing) = body.trailing {
                         walk_expr(trailing, offset, best);
                     }
                 }
@@ -1198,6 +1291,8 @@ fn find_call_at_offset(
                                     }
                                 }
                                 BlockItem::Panic(_) => {}
+                                BlockItem::Break(_) => {}
+                                BlockItem::Continue(_) => {}
                                 BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
                             }
                         }

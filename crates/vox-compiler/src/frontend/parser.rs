@@ -7,13 +7,14 @@ use vox_core::{
 
 use crate::frontend::{
     ast::{
-        Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentOp, CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind,
-        ForExpr, FrontendUnit, FunctionDecl, GenericParameter, IfBranch, IfExpr, ImportDecl,
-        IntrinsicExpr, LambdaExpr, LambdaParameter, LocalValueDecl, Mutability, PanicStatement,
-        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField,
-        ReturnStatement, StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
-        UpdatedArg, UpdatedIntrinsic, UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
+        Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, BreakStatement,
+        CompilationUnit, CompoundAssignmentOp, CompoundAssignmentStatement, ContinueStatement,
+        EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader, FrontendUnit, FunctionDecl,
+        GenericParameter, IfBranch, IfExpr, ImportDecl, IntrinsicExpr, LambdaExpr,
+        LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
+        QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement,
+        StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg,
+        UpdatedIntrinsic, UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
     },
     lexer::{LexedStringPart, Lexer, Token, TokenKind},
 };
@@ -180,6 +181,14 @@ impl Parser {
             return self.error_here("`return` may only be used inside a function body");
         }
 
+        if self.at(TokenKind::Break) {
+            return self.error_here("`break` may only be used inside a `for` loop");
+        }
+
+        if self.at(TokenKind::Continue) {
+            return self.error_here("`continue` may only be used inside a `for` loop");
+        }
+
         if self.consume(TokenKind::Semicolon) {
             return Ok(None);
         }
@@ -341,6 +350,28 @@ impl Parser {
         self.expect_simple(TokenKind::Assign, "expected `=` in value declaration")?;
         let initializer = self.parse_expr()?;
         self.expect_simple(TokenKind::Semicolon, "expected `;` after local declaration")?;
+        Ok(LocalValueDecl {
+            mutability,
+            name,
+            ty,
+            initializer,
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_local_value_decl_for_header(
+        &mut self,
+    ) -> Result<LocalValueDecl, DiagnosticBag> {
+        let start = self.current().span.start;
+        let mutability = self.parse_mutability()?;
+        let (name, _) = self.expect_identifier("expected binding name")?;
+        let ty = if self.consume(TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect_simple(TokenKind::Assign, "expected `=` in value declaration")?;
+        let initializer = self.parse_expr()?;
         Ok(LocalValueDecl {
             mutability,
             name,
@@ -1264,6 +1295,16 @@ impl Parser {
                 continue;
             }
 
+            if self.at(TokenKind::Break) {
+                items.push(BlockItem::Break(self.parse_break_statement()?));
+                continue;
+            }
+
+            if self.at(TokenKind::Continue) {
+                items.push(BlockItem::Continue(self.parse_continue_statement()?));
+                continue;
+            }
+
             if self.at(TokenKind::For) || self.at(TokenKind::If) || self.at(TokenKind::When) {
                 let expr = self.parse_expr()?;
                 items.push(BlockItem::BlockStatement(expr));
@@ -1352,10 +1393,9 @@ impl Parser {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::For, "expected `for`")?;
         self.expect_simple(TokenKind::LParen, "expected `(` after `for`")?;
-        let (pattern, _) = self.expect_identifier("expected loop pattern")?;
-        self.expect_simple(TokenKind::In, "expected `in` in `for` loop")?;
-        let iterable = self.parse_expr()?;
-        self.expect_simple(TokenKind::RParen, "expected `)` after `for` header")?;
+
+        let init = self.parse_for_init()?;
+        let header = self.parse_for_header()?;
         let body = self.parse_block_expr_required()?;
         let end = body.span.end;
         let ExprKind::Block(block) = body.kind else {
@@ -1363,13 +1403,119 @@ impl Parser {
         };
         Ok(Expr {
             kind: ExprKind::For(ForExpr {
-                pattern,
-                iterable: Box::new(iterable),
+                init: init.map(Box::new),
+                header,
                 body: block,
                 span: TextSpan::new(start, end),
             }),
             span: TextSpan::new(start, end),
         })
+    }
+
+    fn parse_for_init(&mut self) -> Result<Option<BlockItem>, DiagnosticBag> {
+        if self.at(TokenKind::Val) || self.at(TokenKind::Var) {
+            let decl = self.parse_local_value_decl_for_header()?;
+            self.expect_simple(TokenKind::Semicolon, "expected `;` in `for` header")?;
+            return Ok(Some(BlockItem::LocalValue(decl)));
+        }
+
+        if let TokenKind::Identifier(_) = self.current().kind {
+            let checkpoint = self.index;
+            let (name, _) = self.expect_identifier("")?;
+            if matches!(
+                self.peek_kind(0),
+                Some(TokenKind::Assign)
+                    | Some(TokenKind::PlusEq)
+                    | Some(TokenKind::MinusEq)
+                    | Some(TokenKind::StarEq)
+                    | Some(TokenKind::SlashEq)
+                    | Some(TokenKind::PercentEq)
+            ) {
+                self.index = checkpoint;
+                let stmt = self.try_parse_assignment_for_header(name)?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` in `for` header")?;
+                return Ok(Some(stmt));
+            }
+            self.index = checkpoint;
+        }
+
+        let checkpoint = self.index;
+        let expr = self.parse_expr()?;
+        if self.consume(TokenKind::Semicolon) {
+            return Ok(Some(BlockItem::Expr(expr)));
+        }
+        self.index = checkpoint;
+        Ok(None)
+    }
+
+    fn parse_for_header(&mut self) -> Result<ForHeader, DiagnosticBag> {
+        let expr = self.parse_expr()?;
+        if self.consume(TokenKind::In) {
+            let pattern = if let ExprKind::Name(ref name) = expr.kind {
+                if name.segments.len() != 1 {
+                    return self
+                        .error_here("expected a single identifier as loop pattern");
+                }
+                name.segments[0].clone()
+            } else {
+                return self.error_here("expected an identifier as loop pattern");
+            };
+            let iterable = self.parse_expr()?;
+            self.expect_simple(TokenKind::RParen, "expected `)` after `for` header")?;
+            Ok(ForHeader::In {
+                pattern,
+                iterable: Box::new(iterable),
+            })
+        } else if self.consume(TokenKind::RParen) {
+            Ok(ForHeader::Condition(Box::new(expr)))
+        } else {
+            self.error_here("expected `in`, `;`, or `)` in `for` header")
+        }
+    }
+
+    fn try_parse_assignment_for_header(&mut self, name: String) -> Result<BlockItem, DiagnosticBag> {
+        let start = self.current().span.start;
+        match self.current().kind.clone() {
+            TokenKind::Identifier(_) => {}
+            _ => unreachable!(),
+        }
+        self.bump();
+        match self.bump().kind {
+            TokenKind::Assign => {
+                let value = self.parse_expr()?;
+                let end = value.span.end;
+                Ok(BlockItem::Assignment(AssignmentStatement {
+                    name,
+                    value,
+                    span: TextSpan::new(start, end),
+                }))
+            }
+            TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq => {
+                let kind = self.previous().kind.clone();
+                let op = match kind {
+                    TokenKind::PlusEq => CompoundAssignmentOp::Add,
+                    TokenKind::MinusEq => CompoundAssignmentOp::Subtract,
+                    TokenKind::StarEq => CompoundAssignmentOp::Multiply,
+                    TokenKind::SlashEq => CompoundAssignmentOp::Divide,
+                    TokenKind::PercentEq => CompoundAssignmentOp::Remainder,
+                    _ => unreachable!(),
+                };
+                let value = self.parse_expr()?;
+                Ok(BlockItem::CompoundAssignment(
+                    CompoundAssignmentStatement {
+                        name,
+                        op,
+                        value,
+                        span: TextSpan::new(start, self.previous().span.end),
+                    },
+                ))
+            }
+            _ => unreachable!(),
+        }
     }
 
     fn parse_return_statement(&mut self) -> Result<ReturnStatement, DiagnosticBag> {
@@ -1404,6 +1550,24 @@ impl Parser {
         self.expect_simple(TokenKind::Semicolon, "expected `;` after panic statement")?;
         Ok(PanicStatement {
             message,
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_break_statement(&mut self) -> Result<BreakStatement, DiagnosticBag> {
+        let start = self.current().span.start;
+        self.expect_simple(TokenKind::Break, "expected `break`")?;
+        self.expect_simple(TokenKind::Semicolon, "expected `;` after break statement")?;
+        Ok(BreakStatement {
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_continue_statement(&mut self) -> Result<ContinueStatement, DiagnosticBag> {
+        let start = self.current().span.start;
+        self.expect_simple(TokenKind::Continue, "expected `continue`")?;
+        self.expect_simple(TokenKind::Semicolon, "expected `;` after continue statement")?;
+        Ok(ContinueStatement {
             span: TextSpan::new(start, self.previous().span.end),
         })
     }

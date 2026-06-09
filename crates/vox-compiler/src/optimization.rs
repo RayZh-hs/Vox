@@ -16,7 +16,7 @@ use crate::frontend::{
     FrontendUnit,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, Expr, ExprKind, ForExpr, FunctionDecl, IfExpr,
+        CompoundAssignmentStatement, Expr, ExprKind, ForExpr, ForHeader, FunctionDecl, IfExpr,
         IntrinsicExpr, RangeExpr, RecordFieldInit, ReturnStatement, StringLiteral, StringPart,
         TopLevelItem, ValueDecl, WhenExpr,
     },
@@ -336,6 +336,7 @@ fn visit_block_item(item: &BlockItem, features: &mut RankFeatures) {
         }
         BlockItem::Return(statement) => visit_return(statement, features),
         BlockItem::Panic(statement) => visit_string_literal(&statement.message, features),
+        BlockItem::Break(_) | BlockItem::Continue(_) => {}
         BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => visit_expr(expr, features),
     }
 }
@@ -352,8 +353,19 @@ fn visit_compound_assignment(
 }
 
 fn visit_for(statement: &ForExpr, features: &mut RankFeatures) {
-    visit_expr(&statement.iterable, features);
-    visit_block(&statement.body, features);
+    if let Some(init) = &statement.init {
+        visit_block_item(init, features);
+    }
+    match &statement.header {
+        ForHeader::In { iterable, .. } => {
+            visit_expr(iterable, features);
+            visit_block(&statement.body, features);
+        }
+        ForHeader::Condition(condition) => {
+            visit_expr(condition, features);
+            visit_block(&statement.body, features);
+        }
+    }
 }
 
 fn visit_return(statement: &ReturnStatement, features: &mut RankFeatures) {

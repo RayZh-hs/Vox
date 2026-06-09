@@ -14,6 +14,8 @@ pub enum TokenKind {
     Float(String),
     StringLiteral(LexedStringLiteral),
     As,
+    Break,
+    Continue,
     Dyn,
     Econ,
     Else,
@@ -786,6 +788,8 @@ fn flush_text(parts: &mut Vec<LexedStringPart>, text: &mut String) {
 fn keyword_kind(ident: &str) -> Option<TokenKind> {
     Some(match ident {
         "as" => TokenKind::As,
+        "break" => TokenKind::Break,
+        "continue" => TokenKind::Continue,
         "dyn" => TokenKind::Dyn,
         "econ" => TokenKind::Econ,
         "else" => TokenKind::Else,

@@ -19,9 +19,9 @@ use crate::frontend::{
     FrontendUnit,
     ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
-        ExprKind, FunctionDecl, IfExpr, IntrinsicExpr, LocalValueDecl, Mutability, QualifiedName,
-        StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp, UpdatedPathSegment,
-        ValueDecl, WhenExpr,
+        ExprKind, ForHeader, FunctionDecl, IfExpr, IntrinsicExpr, LocalValueDecl,
+        Mutability, QualifiedName, StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp,
+        UpdatedPathSegment, ValueDecl, WhenExpr,
     },
 };
 
@@ -229,6 +229,12 @@ struct BodyBuilder {
     next_version: u32,
     next_value: u32,
     next_block: u32,
+    loop_stack: Vec<LoopContext>,
+}
+
+struct LoopContext {
+    continue_target: MirBlockId,
+    break_target: MirBlockId,
 }
 
 impl BodyBuilder {
@@ -265,6 +271,7 @@ impl BodyBuilder {
             next_version: 0,
             next_value: 0,
             next_block: 1,
+            loop_stack: Vec::new(),
         }
     }
 
@@ -366,6 +373,30 @@ impl BodyBuilder {
                     &statement.message,
                 )));
                 self.current = self.new_block("after_panic");
+            }
+            BlockItem::Break(_) => {
+                let target = self
+                    .loop_stack
+                    .last()
+                    .expect("break outside loop")
+                    .break_target;
+                self.terminate(MirTerminator::Jump {
+                    target,
+                    args: Vec::new(),
+                });
+                self.current = self.new_block("after_break");
+            }
+            BlockItem::Continue(_) => {
+                let target = self
+                    .loop_stack
+                    .last()
+                    .expect("continue outside loop")
+                    .continue_target;
+                self.terminate(MirTerminator::Jump {
+                    target,
+                    args: Vec::new(),
+                });
+                self.current = self.new_block("after_continue");
             }
             BlockItem::Expr(expr) | BlockItem::BlockStatement(expr) => {
                 let value = self.lower_expr(expr);
@@ -834,49 +865,89 @@ impl BodyBuilder {
         for_expr: &crate::frontend::ast::ForExpr,
         span: Option<vox_core::diagnostics::TextSpan>,
     ) -> MirValueId {
-        let iterable = self.lower_expr(&for_expr.iterable);
-        let iterator = self.emit_op(
-            MirOpKind::Iterator,
-            vec![iterable],
-            span.clone(),
-        );
-        let header = self.new_block("for_header");
-        let body_block = self.new_block("for_body");
-        let exit = self.new_block("for_exit");
-        self.terminate(MirTerminator::Jump {
-            target: header,
-            args: Vec::new(),
-        });
+        if let Some(init) = &for_expr.init {
+            self.lower_block_item(init);
+        }
 
-        self.current = header;
-        let item = self.emit_op(
-            MirOpKind::IteratorNext,
-            vec![iterator],
-            span.clone(),
-        );
-        self.terminate(MirTerminator::Branch {
-            condition: item,
-            then_target: body_block,
-            then_args: Vec::new(),
-            else_target: exit,
-            else_args: Vec::new(),
-        });
+        match &for_expr.header {
+            ForHeader::In {
+                pattern,
+                iterable,
+            } => {
+                let iterable = self.lower_expr(iterable);
+                let iterator =
+                    self.emit_op(MirOpKind::Iterator, vec![iterable], span.clone());
+                let header = self.new_block("for_header");
+                let body_block = self.new_block("for_body");
+                let exit = self.new_block("for_exit");
+                self.terminate(MirTerminator::Jump {
+                    target: header,
+                    args: Vec::new(),
+                });
 
-        self.current = body_block;
-        self.push_scope();
-        self.declare_binding(
-            for_expr.pattern.clone(),
-            MirMutability::Val,
-            None,
-            span.clone(),
-            item,
-            MirVersionSource::Loop,
-        );
-        self.lower_block_expr(&for_expr.body);
-        self.pop_scope();
-        self.jump_to_join_if_open(header, Vec::new());
-        self.current = exit;
-        self.emit_unit()
+                self.current = header;
+                let item =
+                    self.emit_op(MirOpKind::IteratorNext, vec![iterator], span.clone());
+                self.terminate(MirTerminator::Branch {
+                    condition: item,
+                    then_target: body_block,
+                    then_args: Vec::new(),
+                    else_target: exit,
+                    else_args: Vec::new(),
+                });
+
+                self.current = body_block;
+                self.push_scope();
+                self.declare_binding(
+                    pattern.clone(),
+                    MirMutability::Val,
+                    None,
+                    span.clone(),
+                    item,
+                    MirVersionSource::Loop,
+                );
+                self.loop_stack.push(LoopContext {
+                    continue_target: header,
+                    break_target: exit,
+                });
+                self.lower_block_expr(&for_expr.body);
+                self.loop_stack.pop();
+                self.pop_scope();
+                self.jump_to_join_if_open(header, Vec::new());
+                self.current = exit;
+                self.emit_unit()
+            }
+            ForHeader::Condition(condition) => {
+                let header = self.new_block("for_header");
+                let body_block = self.new_block("for_body");
+                let exit = self.new_block("for_exit");
+                self.terminate(MirTerminator::Jump {
+                    target: header,
+                    args: Vec::new(),
+                });
+
+                self.current = header;
+                let cond = self.lower_expr(condition);
+                self.terminate(MirTerminator::Branch {
+                    condition: cond,
+                    then_target: body_block,
+                    then_args: Vec::new(),
+                    else_target: exit,
+                    else_args: Vec::new(),
+                });
+
+                self.current = body_block;
+                self.loop_stack.push(LoopContext {
+                    continue_target: header,
+                    break_target: exit,
+                });
+                self.lower_block_expr(&for_expr.body);
+                self.loop_stack.pop();
+                self.jump_to_join_if_open(header, Vec::new());
+                self.current = exit;
+                self.emit_unit()
+            }
+        }
     }
 
     fn lower_arguments(&mut self, arguments: &[Argument]) -> Vec<MirValueId> {

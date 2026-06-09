@@ -5,9 +5,10 @@ use vox_compiler::frontend::{
     analyze_source,
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
-        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, FunctionDecl, IfExpr,
-        IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr, ReturnStatement,
-        StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic, WhenArm, WhenExpr,
+        CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader,
+        FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName,
+        RangeExpr, ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg,
+        UpdatedIntrinsic, WhenArm, WhenExpr,
     },
 };
 use vox_core::{
@@ -1583,6 +1584,7 @@ impl<'a> FunctionCallCollector<'a> {
                 }
                 BlockItem::Return(statement) => self.visit_return(statement),
                 BlockItem::Panic(statement) => self.visit_string_literal(&statement.message),
+                BlockItem::Break(_) | BlockItem::Continue(_) => {}
                 BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => self.visit_expr(expr),
             }
         }
@@ -1605,11 +1607,40 @@ impl<'a> FunctionCallCollector<'a> {
     }
 
     fn visit_for(&mut self, statement: &ForExpr) {
-        self.visit_expr(&statement.iterable);
-        self.push_scope();
-        self.bind_name(&statement.pattern);
-        self.visit_block_contents(&statement.body);
-        self.pop_scope();
+        let scope_pushed = statement.init.is_some();
+        if scope_pushed {
+            self.push_scope();
+        }
+        if let Some(init) = &statement.init {
+            match init.as_ref() {
+                BlockItem::LocalValue(value) => self.visit_local_value(value),
+                BlockItem::Assignment(assignment) => self.visit_assignment(assignment),
+                BlockItem::CompoundAssignment(assignment) => {
+                    self.visit_compound_assignment(assignment)
+                }
+                BlockItem::Expr(expr) => self.visit_expr(expr),
+                _ => {}
+            }
+        }
+        match &statement.header {
+            ForHeader::In {
+                pattern,
+                iterable,
+            } => {
+                self.visit_expr(iterable);
+                self.push_scope();
+                self.bind_name(pattern);
+                self.visit_block_contents(&statement.body);
+                self.pop_scope();
+            }
+            ForHeader::Condition(condition) => {
+                self.visit_expr(condition);
+                self.visit_block_contents(&statement.body);
+            }
+        }
+        if scope_pushed {
+            self.pop_scope();
+        }
     }
 
     fn visit_return(&mut self, statement: &ReturnStatement) {
@@ -1657,6 +1688,8 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
             BlockItem::CompoundAssignment(assignment) => &assignment.span,
             BlockItem::Return(statement) => &statement.span,
             BlockItem::Panic(statement) => &statement.span,
+            BlockItem::Break(statement) => &statement.span,
+            BlockItem::Continue(statement) => &statement.span,
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => &expr.span,
         },
     };

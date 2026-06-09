@@ -76,6 +76,16 @@ private fun statements(limit: Int): Int {
         val seen = item;
         seen;
     }
+    var i: Int = 0;
+    for (i < limit) {
+        i += 1;
+    }
+    for (val j: Int = 0; j < limit) {
+        total += j;
+    }
+    for (val k: Int = 0; k in 0..limit) {
+        total += k;
+    }
     if (total > 10) {
         return total;
     };
