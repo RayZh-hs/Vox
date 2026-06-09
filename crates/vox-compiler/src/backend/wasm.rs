@@ -142,7 +142,7 @@ fn infer_value_types(body: &MirBody) -> Result<BTreeMap<MirValueId, WasmType>, S
         let ty = match &op.kind {
             MirOpKind::Literal(value) => wasm_type_from_literal(value),
             MirOpKind::Unit => None,
-            MirOpKind::Use(_) | MirOpKind::TypeRefine(_) => {
+            MirOpKind::Use(_) | MirOpKind::NonNull | MirOpKind::TypeRefine(_) => {
                 op.args.first().and_then(|arg| types.get(arg)).copied()
             }
             MirOpKind::Unary(name) => {
@@ -175,7 +175,6 @@ fn infer_value_types(body: &MirBody) -> Result<BTreeMap<MirValueId, WasmType>, S
             | MirOpKind::Updated { .. }
             | MirOpKind::Call { .. }
             | MirOpKind::Econ { .. }
-            | MirOpKind::NonNull
             | MirOpKind::SafeProject(_)
             | MirOpKind::Iterator
             | MirOpKind::IteratorNext
@@ -204,7 +203,7 @@ fn emit_op(
             emit_literal(value, code)?;
             emit_result_set(op, local_indices, code)?;
         }
-        MirOpKind::Use(_) | MirOpKind::TypeRefine(_) => {
+        MirOpKind::Use(_) | MirOpKind::NonNull | MirOpKind::TypeRefine(_) => {
             let source = one_arg(op)?;
             emit_local_get(source, local_indices, code)?;
             emit_result_set(op, local_indices, code)?;
@@ -253,7 +252,6 @@ fn emit_op(
         | MirOpKind::Updated { .. }
         | MirOpKind::Call { .. }
         | MirOpKind::Econ { .. }
-        | MirOpKind::NonNull
         | MirOpKind::SafeProject(_)
         | MirOpKind::Iterator
         | MirOpKind::IteratorNext
