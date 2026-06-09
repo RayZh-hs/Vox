@@ -734,6 +734,266 @@ fn find_name_at_offset(
     None
 }
 
+fn collect_references(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    _source: &str,
+    target: &str,
+) -> Vec<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::ast::*;
+    let mut spans = Vec::new();
+
+    fn collect_type_syntax(ty: &TypeSyntax, target: &str, spans: &mut Vec<vox_core::diagnostics::TextSpan>) {
+        match &ty.kind {
+            TypeKind::Function { parameters, result } => {
+                for param in parameters {
+                    collect_type_syntax(param, target, spans);
+                }
+                collect_type_syntax(result, target, spans);
+            }
+            TypeKind::Nullable(inner) => collect_type_syntax(inner, target, spans),
+            TypeKind::Named { name, arguments } => {
+                if name.segments.last().map(|s| s.as_str()) == Some(target) {
+                    spans.push(name.span.clone());
+                }
+                for arg in arguments {
+                    collect_type_syntax(arg, target, spans);
+                }
+            }
+            TypeKind::Dyn(name) => {
+                if name.segments.last().map(|s| s.as_str()) == Some(target) {
+                    spans.push(name.span.clone());
+                }
+            }
+            TypeKind::Grouped(inner) => collect_type_syntax(inner, target, spans),
+            TypeKind::Tuple(items) => {
+                for item in items {
+                    collect_type_syntax(item, target, spans);
+                }
+            }
+            TypeKind::Record(fields) => {
+                for field in fields {
+                    collect_type_syntax(&field.ty, target, spans);
+                }
+            }
+        }
+    }
+
+    fn collect_in_expr(expr: &Expr, target: &str, spans: &mut Vec<vox_core::diagnostics::TextSpan>) {
+        match &expr.kind {
+            ExprKind::Name(qname) => {
+                if qname.segments.last().map(|s| s.as_str()) == Some(target) {
+                    spans.push(qname.span.clone());
+                }
+            }
+            ExprKind::ReceiverCall { receiver, callee, arguments } => {
+                if callee.segments.last().map(|s| s.as_str()) == Some(target) {
+                    spans.push(callee.span.clone());
+                }
+                collect_in_expr(receiver, target, spans);
+                for arg in arguments {
+                    match arg {
+                        Argument::Positional(e) | Argument::Named { value: e, .. } => {
+                            collect_in_expr(e, target, spans);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        match &expr.kind {
+            ExprKind::Block(block) => {
+                for item in &block.items {
+                    collect_in_block_item(item, target, spans);
+                }
+                if let Some(ref trailing) = block.trailing {
+                    collect_in_expr(trailing, target, spans);
+                }
+            }
+            ExprKind::If(if_expr) => {
+                for branch in &if_expr.branches {
+                    collect_in_expr(&branch.condition, target, spans);
+                    for item in &branch.body.items {
+                        collect_in_block_item(item, target, spans);
+                    }
+                    if let Some(ref trailing) = branch.body.trailing {
+                        collect_in_expr(trailing, target, spans);
+                    }
+                }
+                if let Some(ref else_branch) = if_expr.else_branch {
+                    for item in &else_branch.items {
+                        collect_in_block_item(item, target, spans);
+                    }
+                    if let Some(ref trailing) = else_branch.trailing {
+                        collect_in_expr(trailing, target, spans);
+                    }
+                }
+            }
+            ExprKind::When(when_expr) => {
+                collect_in_expr(&when_expr.subject, target, spans);
+                for arm in &when_expr.arms {
+                    collect_type_syntax(&arm.ty, target, spans);
+                    collect_in_expr(&arm.body, target, spans);
+                }
+                if let Some(ref else_arm) = when_expr.else_arm {
+                    collect_in_expr(else_arm, target, spans);
+                }
+            }
+            ExprKind::For(for_expr) => {
+                collect_in_expr(&for_expr.iterable, target, spans);
+                for item in &for_expr.body.items {
+                    collect_in_block_item(item, target, spans);
+                }
+                if let Some(ref trailing) = for_expr.body.trailing {
+                    collect_in_expr(trailing, target, spans);
+                }
+            }
+            ExprKind::Lambda(lambda) => {
+                for param in &lambda.parameters {
+                    if let Some(ref ty) = param.ty {
+                        collect_type_syntax(ty, target, spans);
+                    }
+                }
+                collect_in_expr(&lambda.body, target, spans);
+            }
+            ExprKind::Call { callee, arguments } => {
+                collect_in_expr(callee, target, spans);
+                for arg in arguments {
+                    match arg {
+                        Argument::Positional(e) | Argument::Named { value: e, .. } => {
+                            collect_in_expr(e, target, spans);
+                        }
+                    }
+                }
+            }
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                for item in items {
+                    collect_in_expr(item, target, spans);
+                }
+            }
+            ExprKind::Record(fields) => {
+                for field in fields {
+                    if let Some(ref ty) = field.ty {
+                        collect_type_syntax(ty, target, spans);
+                    }
+                    collect_in_expr(&field.value, target, spans);
+                }
+            }
+            ExprKind::Index { target: tgt, index } => {
+                collect_in_expr(tgt, target, spans);
+                collect_in_expr(index, target, spans);
+            }
+            ExprKind::Field { target: tgt, .. }
+            | ExprKind::SafeField { target: tgt, .. }
+            | ExprKind::NonNull { target: tgt } => {
+                collect_in_expr(tgt, target, spans);
+            }
+            ExprKind::Unary { expr: inner, .. } => collect_in_expr(inner, target, spans),
+            ExprKind::Binary { left, right, .. } => {
+                collect_in_expr(left, target, spans);
+                collect_in_expr(right, target, spans);
+            }
+            ExprKind::Range(range) => {
+                if let Some(ref start) = range.start {
+                    collect_in_expr(start, target, spans);
+                }
+                if let Some(ref end) = range.end {
+                    collect_in_expr(end, target, spans);
+                }
+            }
+            ExprKind::Intrinsic(intr) => match intr {
+                IntrinsicExpr::Updated(u) => {
+                    collect_in_expr(&u.target, target, spans);
+                    for upd in &u.updates {
+                        collect_in_expr(&upd.value, target, spans);
+                    }
+                }
+                IntrinsicExpr::Econ(e) => {
+                    collect_type_syntax(&e.ty, target, spans);
+                    for item in &e.body.items {
+                        collect_in_block_item(item, target, spans);
+                    }
+                    if let Some(ref trailing) = e.body.trailing {
+                        collect_in_expr(trailing, target, spans);
+                    }
+                }
+            },
+            ExprKind::Name(_)
+            | ExprKind::ReceiverCall { .. }
+            | ExprKind::Integer(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::String(_) => {}
+        }
+    }
+
+    fn collect_in_block_item(
+        item: &BlockItem,
+        target: &str,
+        spans: &mut Vec<vox_core::diagnostics::TextSpan>,
+    ) {
+        match item {
+            BlockItem::LocalValue(lv) => {
+                if let Some(ref ty) = lv.ty {
+                    collect_type_syntax(ty, target, spans);
+                }
+                collect_in_expr(&lv.initializer, target, spans);
+            }
+            BlockItem::Assignment(a) => collect_in_expr(&a.value, target, spans),
+            BlockItem::CompoundAssignment(ca) => collect_in_expr(&ca.value, target, spans),
+            BlockItem::Return(r) => {
+                if let Some(ref val) = r.value {
+                    collect_in_expr(val, target, spans);
+                }
+            }
+            BlockItem::Panic(_) => {}
+            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => collect_in_expr(e, target, spans),
+        }
+    }
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                for param in &f.parameters {
+                    collect_type_syntax(&param.ty, target, &mut spans);
+                    if let Some(ref default) = param.default {
+                        collect_in_expr(default, target, &mut spans);
+                    }
+                }
+                if let Some(ref ret) = f.return_type {
+                    collect_type_syntax(ret, target, &mut spans);
+                }
+                collect_in_expr(&f.body, target, &mut spans);
+            }
+            TopLevelItem::Value(v) => {
+                if let Some(ref ty) = v.ty {
+                    collect_type_syntax(ty, target, &mut spans);
+                }
+                collect_in_expr(&v.initializer, target, &mut spans);
+            }
+            TopLevelItem::Param(p) => {
+                collect_type_syntax(&p.ty, target, &mut spans);
+                if let Some(ref default) = p.default {
+                    collect_in_expr(default, target, &mut spans);
+                }
+            }
+            TopLevelItem::Import(i) => {
+                if i.module.segments.last().map(|s| s.as_str()) == Some(target) {
+                    spans.push(i.module.span.clone());
+                }
+            }
+            TopLevelItem::Statement(s) => collect_in_block_item(s, target, &mut spans),
+        }
+    }
+
+    if let Some(ref result) = unit.syntax.result {
+        collect_in_expr(result, target, &mut spans);
+    }
+
+    spans
+}
+
 fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option<GotoDefinitionResponse> {
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
@@ -776,6 +1036,7 @@ impl LanguageServer for VoxLanguageServer {
                     label: None,
                 })),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -885,5 +1146,57 @@ impl LanguageServer for VoxLanguageServer {
             )),
             None => Ok(None),
         }
+    }
+
+    async fn references(
+        &self,
+        params: ReferenceParams,
+    ) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri.clone();
+        let source = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&uri)
+            .cloned();
+
+        let text = match source {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let source_text = SourceText::new("", 0, &text);
+        let unit = match frontend::analyze_source(&source_text) {
+            Ok(u) => u,
+            Err(_) => return Ok(None),
+        };
+
+        let offset = position_to_byte_offset(&text, params.text_document_position.position);
+        let name = match find_name_at_offset(&unit, &text, offset) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        let mut spans = collect_references(&unit, &text, &name);
+
+        if params.context.include_declaration {
+            let symbols = build_symbol_table(&unit);
+            if let Some(decl_span) = symbols.get(&name) {
+                spans.push(decl_span.clone());
+            }
+        }
+
+        spans.sort_by_key(|s| s.start);
+        spans.dedup_by_key(|s| s.start);
+
+        let locations: Vec<Location> = spans
+            .into_iter()
+            .map(|span| Location {
+                uri: uri.clone(),
+                range: byte_span_to_range(&text, span.start, span.end),
+            })
+            .collect();
+
+        Ok(Some(locations))
     }
 }
