@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+wasmtime.workspace = true
 vox-compiler = { path = "../vox-compiler" }
 vox-core = { path = "../vox-core" }

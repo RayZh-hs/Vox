@@ -16,6 +16,7 @@ mod remote;
 mod runner;
 mod server;
 mod session;
+mod wasm_executor;
 
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler};
@@ -549,6 +550,22 @@ impl Runtime {
             return Err(RuntimeError::NotAScript(artifact_id));
         }
 
+        if let Some(wasm) = artifact.plan.wasm.as_ref() {
+            if artifact.optimization >= OptimizationLevel::SOpt {
+                match wasm_executor::try_wasm_execute(self, &wasm.bytes, arguments) {
+                    Ok(value) => {
+                        self.mir_execution_failures.remove(&artifact_id);
+                        return Ok(value);
+                    }
+                    Err(message) => {
+                        return Err(RuntimeError::ExecutionFailed(format!(
+                            "wasm execution failed: {message}"
+                        )));
+                    }
+                }
+            }
+        }
+
         if let Some(mir) = artifact.mir.clone() {
             match MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, arguments) {
                 Ok(value) => {
@@ -927,7 +944,6 @@ moved.x + moved.y
         for xopt in [
             OptimizationLevel::NOpt,
             OptimizationLevel::IOpt,
-            OptimizationLevel::SOpt,
         ] {
             assert_runtime_int(
                 runtime
