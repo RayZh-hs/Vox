@@ -232,7 +232,7 @@ impl<'a> MirExecutor<'a> {
             }
             MirOpKind::TypeTest(ty) => {
                 let value = self.single_arg(op)?;
-                Some(InlineValue::Bool(matches_type_name(&value, ty)))
+                Some(InlineValue::Bool(matches_type_name(self, &value, ty)))
             }
             MirOpKind::TypeRefine(_) => Some(self.single_arg(op)?),
             MirOpKind::CacheGet(_) => None,
@@ -708,17 +708,50 @@ fn expect_bool(value: InlineValue, label: &str) -> Result<bool, String> {
     }
 }
 
-fn matches_type_name(value: &InlineValue, ty: &str) -> bool {
-    match (ty, value) {
-        ("Int", InlineValue::Int(_))
-        | ("Float", InlineValue::Float(_))
-        | ("Bool", InlineValue::Bool(_))
-        | ("String", InlineValue::String(_))
-        | ("Null", InlineValue::Null) => true,
-        ("Unit", InlineValue::Tuple(items)) => items.is_empty(),
-        _ => false,
+fn matches_type_name(executor: &MirExecutor<'_>, value: &InlineValue, ty: &str) -> bool {
+        match (ty, value) {
+            ("Int", InlineValue::Int(_))
+            | ("Float", InlineValue::Float(_))
+            | ("Bool", InlineValue::Bool(_))
+            | ("String", InlineValue::String(_))
+            | ("Null", InlineValue::Null) => return true,
+            ("Unit", InlineValue::Tuple(items)) => return items.is_empty(),
+            _ => {}
+        }
+
+        let InlineValue::Handle(handle_id) = value else {
+            return false;
+        };
+
+        let Some(summary) = executor.runtime.describe_handle(*handle_id) else {
+            return false;
+        };
+        let handle_type = &summary.type_name;
+
+        if handle_type == ty
+            || handle_type.ends_with(&format!(".{}", ty))
+            || ty.ends_with(&format!(".{}", handle_type))
+        {
+            return true;
+        }
+
+        for manifest in executor.runtime.host.packages() {
+            for (trait_qt, impl_types) in &manifest.trait_impls {
+                let full_trait_name = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
+                if full_trait_name == ty || trait_qt.name == ty {
+                    for impl_qt in impl_types {
+                        let full_impl_name =
+                            format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                        if *handle_type == full_impl_name || *handle_type == impl_qt.name {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
     }
-}
 
 fn split_qualified_host_name(callee: &str) -> Option<(ModulePath, String)> {
     let (package, function) = callee.rsplit_once('.')?;

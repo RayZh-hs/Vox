@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     source::ModulePath,
@@ -75,6 +75,7 @@ pub struct PackageManifest {
     pub types: Vec<TypeSpec>,
     pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
+    pub trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>>,
 }
 
 #[derive(Debug, Clone, Default)]

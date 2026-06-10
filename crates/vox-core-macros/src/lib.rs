@@ -3,7 +3,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::{
     parse::Parser, parse_macro_input, punctuated::Punctuated, Attribute, DeriveInput, Error, FnArg,
-    ItemFn, ItemTrait, LitStr, Meta, Pat, ReturnType, Token, TraitItem,
+    ItemFn, ItemImpl, ItemTrait, LitStr, Meta, Pat, ReturnType, Token, TraitItem, Type,
 };
 
 #[proc_macro_derive(VoxExport, attributes(vox))]
@@ -33,9 +33,20 @@ pub fn vox_fn(args: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_attribute]
+pub fn vox_trait_impl(args: TokenStream, item: TokenStream) -> TokenStream {
+    let _args = parse_attr_args(args);
+    let item = parse_macro_input!(item as ItemImpl);
+    match expand_vox_trait_impl(item) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
 fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let ident = &input.ident;
     let vox_name = exported_name_from_attrs(&input.attrs)?.unwrap_or_else(|| ident.to_string());
+    let trait_impls = trait_impls_from_attrs(&input.attrs, &vox_name)?;
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => fields.named.iter().collect::<Vec<_>>(),
@@ -128,6 +139,8 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
                 order: line!(),
             }
         }
+
+        #(#trait_impls)*
     })
 }
 
@@ -261,6 +274,51 @@ fn expand_vox_fn(
     })
 }
 
+fn expand_vox_trait_impl(item: ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    let Some((_, trait_path, _)) = &item.trait_ else {
+        return Err(Error::new_spanned(
+            item.impl_token,
+            "#[vox_trait_impl] requires `impl Trait for Type` syntax",
+        ));
+    };
+
+    let trait_name = trait_path
+        .segments
+        .last()
+        .map(|seg| seg.ident.to_string())
+        .ok_or_else(|| {
+            Error::new_spanned(trait_path, "could not extract trait name")
+        })?;
+
+    let Type::Path(type_path) = &*item.self_ty else {
+        return Err(Error::new_spanned(
+            &item.self_ty,
+            "#[vox_trait_impl] requires a named struct type",
+        ));
+    };
+
+    let struct_name = type_path
+        .path
+        .segments
+        .last()
+        .map(|seg| seg.ident.to_string())
+        .ok_or_else(|| {
+            Error::new_spanned(type_path, "could not extract struct name")
+        })?;
+
+    Ok(quote! {
+        #item
+
+        ::vox_core::external_export::inventory::submit! {
+            ::vox_core::external_export::ExportedTraitImplRegistration {
+                struct_vox_name: #struct_name,
+                trait_vox_name: #trait_name,
+                order: line!(),
+            }
+        }
+    })
+}
+
 fn parse_attr_args(args: TokenStream) -> syn::Result<Vec<Meta>> {
     let parser = Punctuated::<Meta, Token![,]>::parse_terminated;
     parser
@@ -275,6 +333,35 @@ fn exported_name_from_attrs(attrs: &[Attribute]) -> syn::Result<Option<String>> 
         }
     }
     Ok(None)
+}
+
+fn trait_impls_from_attrs(
+    attrs: &[Attribute],
+    vox_name: &str,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut submissions = Vec::new();
+    for attr in attrs {
+        if attr.path().is_ident("vox") {
+            for entry in parse_nested_meta(attr)? {
+                let Meta::NameValue(value) = entry else {
+                    continue;
+                };
+                if value.path.is_ident("trait_impl") {
+                    let trait_name = expect_lit_str(&value.value, "trait_impl")?.value();
+                    submissions.push(quote! {
+                        ::vox_core::external_export::inventory::submit! {
+                            ::vox_core::external_export::ExportedTraitImplRegistration {
+                                struct_vox_name: #vox_name,
+                                trait_vox_name: #trait_name,
+                                order: line!(),
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+    Ok(submissions)
 }
 
 fn exported_name_from_meta(meta: &[Meta]) -> syn::Result<Option<String>> {

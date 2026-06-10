@@ -1,0 +1,10 @@
+script fixtures.when_passing.trait_else;
+
+import image;
+
+param filter: dyn image.Filter;
+val result = when (filter) {
+    is image.Blur -> "blur";
+    else -> "unknown filter";
+};
+result

@@ -15,4 +15,4 @@ pub mod source;
 pub mod types;
 pub mod value;
 
-pub use vox_core_macros::{VoxExport, vox_fn, vox_trait};
+pub use vox_core_macros::{VoxExport, vox_fn, vox_trait, vox_trait_impl};

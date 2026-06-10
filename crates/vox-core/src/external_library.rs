@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -55,6 +56,7 @@ impl ExternalLibrary {
                 types: Vec::new(),
                 traits: Vec::new(),
                 functions: Vec::new(),
+                trait_impls: BTreeMap::new(),
             },
         })
     }
@@ -237,6 +239,15 @@ pub fn encode_package_manifest(
         encode_function_export_kind(&mut writer, &function.export)?;
     }
 
+    writer.write_len(manifest.trait_impls.len(), "trait impls")?;
+    for (trait_name, impls) in &manifest.trait_impls {
+        encode_qualified_type_name(&mut writer, trait_name)?;
+        writer.write_len(impls.len(), "trait impl entry")?;
+        for struct_name in impls {
+            encode_qualified_type_name(&mut writer, struct_name)?;
+        }
+    }
+
     Ok(writer.into_inner())
 }
 
@@ -310,12 +321,25 @@ pub fn decode_package_manifest(
         });
     }
 
+    let trait_impls_count = reader.read_u32()? as usize;
+    let mut trait_impls = BTreeMap::new();
+    for _ in 0..trait_impls_count {
+        let trait_name = decode_qualified_type_name(&mut reader)?;
+        let impl_count = reader.read_u32()? as usize;
+        let mut impls = BTreeSet::new();
+        for _ in 0..impl_count {
+            impls.insert(decode_qualified_type_name(&mut reader)?);
+        }
+        trait_impls.insert(trait_name, impls);
+    }
+
     reader.finish()?;
     Ok(PackageManifest {
         package,
         types,
         traits,
         functions,
+        trait_impls,
     })
 }
 

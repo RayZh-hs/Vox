@@ -1291,29 +1291,34 @@ impl<'a> EvalContext<'a> {
                     self.matches_type(value, inner)
                 }
             }
-            TypeKind::Named { name, arguments } => match name.to_source_string().as_str() {
-                "Int" => Ok(matches!(value, Value::Int(_))),
-                "Float" => Ok(matches!(value, Value::Float(_))),
-                "Bool" => Ok(matches!(value, Value::Bool(_))),
-                "String" => Ok(matches!(value, Value::String(_))),
-                "Unit" => Ok(matches!(value, Value::Tuple(items) if items.is_empty())),
-                "List" => match (value, arguments.as_slice()) {
-                    (Value::List(items), [item_ty]) => items
-                        .iter()
-                        .map(|item| self.matches_type(item, item_ty))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map(|matches| matches.into_iter().all(|matched| matched)),
-                    (Value::List(_), _) => Ok(true),
-                    _ => Ok(false),
-                },
-                "Econ" => match (value, arguments.as_slice()) {
-                    (Value::Econ(inner), [inner_ty]) => self.matches_type(inner, inner_ty),
-                    (Value::Econ(_), _) => Ok(true),
-                    _ => Ok(false),
-                },
-                _ => Ok(false),
-            },
-            TypeKind::Dyn(_) => Ok(false),
+            TypeKind::Named { name, arguments } => {
+                let ty_name = name.to_source_string();
+                match ty_name.as_str() {
+                    "Int" => Ok(matches!(value, Value::Int(_))),
+                    "Float" => Ok(matches!(value, Value::Float(_))),
+                    "Bool" => Ok(matches!(value, Value::Bool(_))),
+                    "String" => Ok(matches!(value, Value::String(_))),
+                    "Unit" => Ok(matches!(value, Value::Tuple(items) if items.is_empty())),
+                    "List" => match (value, arguments.as_slice()) {
+                        (Value::List(items), [item_ty]) => items
+                            .iter()
+                            .map(|item| self.matches_type(item, item_ty))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map(|matches| matches.into_iter().all(|matched| matched)),
+                        (Value::List(_), _) => Ok(true),
+                        _ => Ok(false),
+                    },
+                    "Econ" => match (value, arguments.as_slice()) {
+                        (Value::Econ(inner), [inner_ty]) => self.matches_type(inner, inner_ty),
+                        (Value::Econ(_), _) => Ok(true),
+                        _ => Ok(false),
+                    },
+                    _ => self.matches_named_type(value, &ty_name),
+                }
+            }
+            TypeKind::Dyn(trait_name) => {
+                self.matches_dyn_trait(value, trait_name)
+            }
             TypeKind::Grouped(inner) => self.matches_type(value, inner),
             TypeKind::Tuple(items) => match value {
                 Value::Tuple(values) => {
@@ -1351,6 +1356,46 @@ impl<'a> EvalContext<'a> {
             }
             TypeKind::Function { .. } => Ok(matches!(value, Value::Function(_))),
         }
+    }
+
+    fn matches_named_type(&self, value: &Value, ty_name: &str) -> Result<bool, EvalError> {
+        match value {
+            Value::Handle(_, summary) => {
+                let handle_type = &summary.type_name;
+                Ok(handle_type == ty_name
+                    || handle_type.ends_with(&format!(".{}", ty_name))
+                    || ty_name.ends_with(&format!(".{}", handle_type)))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn matches_dyn_trait(
+        &self,
+        value: &Value,
+        trait_name: &QualifiedName,
+    ) -> Result<bool, EvalError> {
+        let Value::Handle(_, summary) = value else {
+            return Ok(false);
+        };
+        let handle_type = &summary.type_name;
+        let trait_str = trait_name.to_source_string();
+
+        for manifest in self.runtime.host.packages() {
+            for (trait_qt, impl_types) in &manifest.trait_impls {
+                let full_trait_name = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
+                if full_trait_name == trait_str || trait_qt.name == trait_str {
+                    for impl_qt in impl_types {
+                        let full_impl_name =
+                            format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                        if *handle_type == full_impl_name || *handle_type == impl_qt.name {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn expect_bool(&self, value: Value, label: &str) -> Result<bool, EvalError> {

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -486,6 +486,7 @@ fn host_manifest() -> PackageManifest {
             purity: Purity::Pure,
             export: FunctionExportKind::Function,
         }],
+        trait_impls: BTreeMap::new(),
     }
 }
 
@@ -495,6 +496,7 @@ fn tools_manifest() -> PackageManifest {
         types: Vec::new(),
         traits: Vec::new(),
         functions: Vec::new(),
+        trait_impls: BTreeMap::new(),
     }
 }
 
@@ -505,19 +507,35 @@ fn image_manifest() -> PackageManifest {
 
     PackageManifest {
         package: package.clone(),
-        types: vec![TypeSpec {
-            name: qualified_type(&package, "Image"),
-            fields: vec![
-                FieldSpec {
-                    name: "width".to_owned(),
-                    ty: VoxType::Int,
-                },
-                FieldSpec {
-                    name: "height".to_owned(),
-                    ty: VoxType::Int,
-                },
-            ],
-        }],
+        types: vec![
+            TypeSpec {
+                name: qualified_type(&package, "Image"),
+                fields: vec![
+                    FieldSpec {
+                        name: "width".to_owned(),
+                        ty: VoxType::Int,
+                    },
+                    FieldSpec {
+                        name: "height".to_owned(),
+                        ty: VoxType::Int,
+                    },
+                ],
+            },
+            TypeSpec {
+                name: qualified_type(&package, "Blur"),
+                fields: vec![FieldSpec {
+                    name: "radius".to_owned(),
+                    ty: VoxType::Float,
+                }],
+            },
+            TypeSpec {
+                name: qualified_type(&package, "Sharpen"),
+                fields: vec![FieldSpec {
+                    name: "amount".to_owned(),
+                    ty: VoxType::Float,
+                }],
+            },
+        ],
         traits: vec![TraitSpec {
             name: qualified_type(&package, "Filter"),
             methods: vec![TraitMethodSpec {
@@ -641,6 +659,17 @@ fn image_manifest() -> PackageManifest {
                 export: FunctionExportKind::Function,
             },
         ],
+        trait_impls: {
+            let mut impls = BTreeMap::new();
+            impls.insert(
+                qualified_type(&package, "Filter"),
+                BTreeSet::from([
+                    qualified_type(&package, "Blur"),
+                    qualified_type(&package, "Sharpen"),
+                ]),
+            );
+            impls
+        },
     }
 }
 

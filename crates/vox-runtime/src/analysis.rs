@@ -5,7 +5,7 @@ use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
     Expr, ExprKind, ForHeader, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability,
     QualifiedName, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
-    UpdatedPathSegment, ValueDecl,
+    UpdatedPathSegment, ValueDecl, WhenExpr,
 };
 use vox_core::{
     host::PackageManifest,
@@ -859,7 +859,7 @@ impl<'a> TypeEngine<'a> {
                 Ok(ty)
             }
             ExprKind::When(expr) => {
-                let _subject = self.infer_expr(&expr.subject, scope)?;
+                let subject_ty = self.infer_expr(&expr.subject, scope)?;
                 let mut ty = ReplType::Unknown("Unknown".to_owned());
                 for arm in &expr.arms {
                     let mut nested = scope.clone();
@@ -877,6 +877,7 @@ impl<'a> TypeEngine<'a> {
                 if let Some(else_arm) = &expr.else_arm {
                     ty = ReplType::unify(ty, self.infer_expr(else_arm, scope)?);
                 }
+                self.check_when_exhaustiveness(expr, &subject_ty)?;
                 Ok(ty)
             }
             ExprKind::For(expr) => {
@@ -1035,6 +1036,66 @@ impl<'a> TypeEngine<'a> {
             IntrinsicExpr::Updated(updated) => self.infer_updated(updated, scope),
             IntrinsicExpr::Econ(econ) => self.infer_econ(econ, scope),
         }
+    }
+
+    fn check_when_exhaustiveness(
+        &self,
+        expr: &WhenExpr,
+        subject_ty: &ReplType,
+    ) -> Result<(), String> {
+        let ReplType::DynTrait(trait_name) = subject_ty else {
+            return Ok(());
+        };
+
+        let mut implementing_structs: BTreeSet<String> = BTreeSet::new();
+        for manifest in self.manifests.values() {
+            for (trait_qt, impls) in &manifest.trait_impls {
+                let full_trait = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
+                if full_trait == *trait_name || trait_qt.name == *trait_name {
+                    for impl_qt in impls {
+                        let full_name = format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                        implementing_structs.insert(full_name);
+                        implementing_structs.insert(impl_qt.name.clone());
+                    }
+                }
+            }
+        }
+
+        if implementing_structs.is_empty() {
+            return Ok(());
+        }
+
+        if expr.else_arm.is_some() {
+            return Ok(());
+        }
+
+        let mut uncovered: BTreeSet<String> = implementing_structs;
+        for arm in &expr.arms {
+            let arm_type_str = arm.ty.to_source_string();
+            if arm_type_str.starts_with("dyn ") {
+                continue;
+            }
+            uncovered.remove(&arm_type_str);
+            let mut to_remove = Vec::new();
+            for name in &uncovered {
+                if arm_type_str.ends_with(&format!(".{}", name)) {
+                    to_remove.push(name.clone());
+                }
+            }
+            for name in to_remove {
+                uncovered.remove(&name);
+            }
+        }
+
+        if !uncovered.is_empty() {
+            let missing: Vec<String> = uncovered.into_iter().collect();
+            return Err(format!(
+                "`when` expression is not exhaustive: missing arm(s) for type(s) {}",
+                missing.join(", ")
+            ));
+        }
+
+        Ok(())
     }
 
     fn infer_block(&self, block: &BlockExpr, scope: &mut TypeScope) -> Result<ReplType, String> {

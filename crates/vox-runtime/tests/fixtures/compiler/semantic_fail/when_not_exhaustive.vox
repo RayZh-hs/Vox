@@ -1,0 +1,10 @@
+script fixtures.when_failing.not_exhaustive;
+
+import image;
+
+param filter: dyn image.Filter;
+val result = when (filter) {
+    is image.Blur -> "blur";
+    // missing image.Sharpen arm, no else
+};
+result

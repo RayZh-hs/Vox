@@ -28,7 +28,7 @@ pub struct RecordField {
     pub ty: VoxType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct QualifiedTypeName {
     pub module: ModulePath,
     pub name: String,

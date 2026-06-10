@@ -1,0 +1,10 @@
+script fixtures.when_passing.trait_exhaustive;
+
+import image;
+
+param filter: dyn image.Filter;
+val result = when (filter) {
+    is image.Blur -> "blur";
+    is image.Sharpen -> "sharpen";
+};
+result

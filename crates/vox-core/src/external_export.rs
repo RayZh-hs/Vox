@@ -62,15 +62,24 @@ pub struct ExportedTraitMethodRegistration {
     pub order: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExportedTraitImplRegistration {
+    pub struct_vox_name: &'static str,
+    pub trait_vox_name: &'static str,
+    pub order: u32,
+}
+
 inventory::collect!(ExportedSurfaceRegistration);
 inventory::collect!(ExportedFunctionRegistration);
 inventory::collect!(ExportedTraitMethodRegistration);
+inventory::collect!(ExportedTraitImplRegistration);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedPackageExports {
     pub types: Vec<TypeSpec>,
     pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
+    pub trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>>,
 }
 
 pub fn extend_manifest_with_registered_exports(
@@ -82,6 +91,7 @@ pub fn extend_manifest_with_registered_exports(
         types: collected.types,
         traits: collected.traits,
         functions: collected.functions,
+        trait_impls: collected.trait_impls,
     })
 }
 
@@ -256,6 +266,7 @@ pub fn collect_registered_package_exports(
         types,
         traits,
         functions,
+        trait_impls: collect_trait_impls(package, &surface_registry),
     })
 }
 
@@ -616,5 +627,42 @@ impl DelimiterDepth {
 
     fn is_balanced(&self) -> bool {
         self.angles == 0 && self.parens == 0 && self.braces == 0 && self.brackets == 0
+    }
+}
+
+fn collect_trait_impls(
+    package: &ModulePath,
+    _surface_registry: &BTreeMap<&str, ExportedSurfaceRegistration>,
+) -> BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>> {
+    let mut trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>> = BTreeMap::new();
+    let registered = inventory::iter::<ExportedTraitImplRegistration>
+        .into_iter()
+        .copied()
+        .collect::<Vec<_>>();
+
+    for reg in registered {
+        let trait_name = parse_qualified_name(package, reg.trait_vox_name);
+        let struct_name = parse_qualified_name(package, reg.struct_vox_name);
+        trait_impls
+            .entry(trait_name)
+            .or_default()
+            .insert(struct_name);
+    }
+
+    trait_impls
+}
+
+fn parse_qualified_name(package: &ModulePath, raw: &str) -> QualifiedTypeName {
+    if let Some((module_str, name)) = raw.rsplit_once('.') {
+        if let Ok(module) = ModulePath::parse(module_str) {
+            return QualifiedTypeName {
+                module,
+                name: name.to_owned(),
+            };
+        }
+    }
+    QualifiedTypeName {
+        module: package.clone(),
+        name: raw.to_owned(),
     }
 }

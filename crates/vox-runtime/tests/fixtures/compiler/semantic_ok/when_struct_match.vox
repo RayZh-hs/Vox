@@ -1,0 +1,10 @@
+script fixtures.when_passing.struct_match;
+
+import image;
+
+val img: image.Image = image.load("test.png");
+val result = when (img) {
+    is image.Image as i -> "got image";
+    else -> "other";
+};
+result

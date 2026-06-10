@@ -151,6 +151,7 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
         types: Vec::new(),
         traits: Vec::new(),
         functions: Vec::new(),
+        trait_impls: BTreeMap::new(),
     };
     let header = ExternalLibraryHeader {
         manifest,
