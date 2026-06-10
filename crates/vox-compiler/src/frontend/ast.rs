@@ -50,6 +50,7 @@ impl SurfaceParameter {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrontendUnit {
+    pub docs: Vec<String>,
     pub header: SurfaceHeader,
     pub parameters: Vec<SurfaceParameter>,
     pub syntax: CompilationUnit,
@@ -71,10 +72,17 @@ impl FrontendUnit {
             .collect();
 
         Self {
+            docs: Vec::new(),
             header: syntax.header.clone(),
             parameters,
             syntax,
         }
+    }
+
+    pub fn from_syntax_with_docs(syntax: CompilationUnit, docs: Vec<String>) -> Self {
+        let mut unit = Self::from_syntax(syntax);
+        unit.docs = docs;
+        unit
     }
 }
 

@@ -36,6 +36,7 @@ impl Parser {
     }
 
     pub fn parse_unit(&mut self) -> Result<FrontendUnit, DiagnosticBag> {
+        let package_docs = self.take_doc_comments();
         let header = self.parse_header()?;
         self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")?;
 
@@ -76,7 +77,7 @@ impl Parser {
             if matches!(header.kind, ModuleKind::Package) {
                 self.validate_package_items(&syntax)?;
             }
-            return Ok(FrontendUnit::from_syntax(syntax));
+            return Ok(FrontendUnit::from_syntax_with_docs(syntax, package_docs.clone()));
         }
 
         let end = self.current().span.end;
@@ -89,7 +90,7 @@ impl Parser {
         if matches!(header.kind, ModuleKind::Package) {
             self.validate_package_items(&syntax)?;
         }
-        Ok(FrontendUnit::from_syntax(syntax))
+        Ok(FrontendUnit::from_syntax_with_docs(syntax, package_docs.clone()))
     }
 
     fn parse_header(&mut self) -> Result<SurfaceHeader, DiagnosticBag> {

@@ -186,3 +186,43 @@ total
 
 Use scripts for entrypoints and one-off execution. Use packages for code you
 want to import elsewhere.
+
+## Documentation Comments
+
+Vox uses `///` for documentation comments, similar to Rust. Doc comments
+annotate declarations and are shown in editor hover:
+
+```vox
+/// Computes the greatest common divisor of two integers.
+/// Uses the Euclidean algorithm.
+fun gcd(a: Int, b: Int): Int {
+    if (b == 0) {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+/// The default scaling factor.
+val defaultScale: Float = 2.0;   /// Applied to all coordinate-transforms.
+```
+
+Doc comments come in two forms:
+- **Head docstrings**: `///` lines that appear directly before a declaration
+  (`val`, `var`, `fun`, `import`, `param`). These describe the declaration they
+  precede.
+- **Body docstrings**: `///` inside a function body provide additional
+  documentation for the function. A `///` on the same line as a value
+  declaration (after the `;`) is a body docstring for that value.
+
+A `package` or `script` header may also be preceded by `///` lines to document
+the module:
+
+```vox
+/// Geometry utilities for 2D and 3D coordinate transforms.
+package geo.transform;
+```
+
+**Important**: Every `///` comment must annotate either a `val`/`var`, `fun`,
+`import`, `param`, or the `package`/`script` header. The language server will
+raise a warning if a doc comment is not attached to any declaration.

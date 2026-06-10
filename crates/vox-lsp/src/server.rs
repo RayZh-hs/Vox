@@ -26,10 +26,15 @@ fn collect_diagnostics(path: &str, source: &str) -> Option<Vec<Diagnostic>> {
     let source_text = SourceText::new(path, 0, source);
     let result = frontend::analyze_source(&source_text);
 
-    match result {
-        Ok(_) => Some(Vec::new()),
-        Err(bag) => Some(convert_diagnostics(&source_text.text, bag)),
-    }
+    let mut diagnostics = match result {
+        Ok(_) => Vec::new(),
+        Err(bag) => convert_diagnostics(&source_text.text, bag),
+    };
+
+    let doc_warnings = collect_docstring_warnings(source);
+    diagnostics.extend(doc_warnings);
+
+    Some(diagnostics)
 }
 
 fn convert_diagnostics(source: &str, bag: DiagnosticBag) -> Vec<Diagnostic> {
@@ -37,6 +42,114 @@ fn convert_diagnostics(source: &str, bag: DiagnosticBag) -> Vec<Diagnostic> {
         .into_iter()
         .map(|diag| convert_diagnostic(source, diag))
         .collect()
+}
+
+fn collect_docstring_warnings(source: &str) -> Vec<Diagnostic> {
+    use vox_compiler::frontend::lexer::{Lexer, TokenKind};
+
+    let tokens = match Lexer::new(source, 0).lex() {
+        Ok(tokens) => tokens,
+        Err(_) => return Vec::new(),
+    };
+
+    let source_text = SourceText::new("", 0, source);
+    let unit = frontend::analyze_source(&source_text).ok();
+
+    let mut warnings = Vec::new();
+    let mut depth = 0u32;
+    let mut i = 0;
+
+    while i < tokens.len() {
+        let token = &tokens[i];
+        match &token.kind {
+            TokenKind::DocComment(_) => {
+                if is_valid_doc_comment(&tokens, i, depth, &unit) {
+                    i += 1;
+                    continue;
+                }
+                let range = byte_span_to_range(source, token.span.start, token.span.end);
+                warnings.push(Diagnostic {
+                    range,
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("vox".to_string()),
+                    message: "doc comment is not attached to a declaration".to_string(),
+                    ..Default::default()
+                });
+            }
+            TokenKind::LBrace => depth += 1,
+            TokenKind::RBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    warnings
+}
+
+fn is_valid_doc_comment(
+    tokens: &[vox_compiler::frontend::lexer::Token],
+    pos: usize,
+    depth: u32,
+    unit: &Option<vox_compiler::frontend::ast::FrontendUnit>,
+) -> bool {
+    use vox_compiler::frontend::lexer::TokenKind;
+
+    if depth > 0 {
+        return true;
+    }
+
+    if let Some(unit) = unit {
+        let span = &tokens[pos].span;
+        for item in &unit.syntax.items {
+            if is_doc_inside_span(span, &item_span(item)) {
+                return true;
+            }
+        }
+        if is_doc_inside_span(span, &unit.header.span) {
+            return true;
+        }
+        if pos == 0 {
+            return true;
+        }
+    }
+
+    let mut j = pos + 1;
+    while j < tokens.len() {
+        match &tokens[j].kind {
+            TokenKind::DocComment(_) | TokenKind::LBrace | TokenKind::RBrace => {
+                j += 1;
+                continue;
+            }
+            TokenKind::Package
+            | TokenKind::Script
+            | TokenKind::Evil
+            | TokenKind::Import
+            | TokenKind::Val
+            | TokenKind::Var
+            | TokenKind::Fun
+            | TokenKind::Param
+            | TokenKind::Public
+            | TokenKind::Private => return true,
+            _ => return false,
+        }
+    }
+
+    false
+}
+
+fn item_span(item: &vox_compiler::frontend::ast::TopLevelItem) -> vox_core::diagnostics::TextSpan {
+    use vox_compiler::frontend::ast::*;
+    match item {
+        TopLevelItem::Import(i) => i.span.clone(),
+        TopLevelItem::Param(p) => p.span.clone(),
+        TopLevelItem::Value(v) => v.span.clone(),
+        TopLevelItem::Function(f) => f.span.clone(),
+        TopLevelItem::Statement(s) => block_item_span(s),
+    }
+}
+
+fn is_doc_inside_span(doc_span: &vox_core::diagnostics::TextSpan, decl_span: &vox_core::diagnostics::TextSpan) -> bool {
+    doc_span.start >= decl_span.start && doc_span.end <= decl_span.end
 }
 
 fn convert_diagnostic(source: &str, diag: vox_core::diagnostics::Diagnostic) -> Diagnostic {
@@ -1666,56 +1779,340 @@ fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option
 }
 
 fn compute_hover(source: &str, position: Position) -> Option<Hover> {
-    let source_text = SourceText::new("", 0, source);
-    let unit = frontend::analyze_source(&source_text).ok()?;
     let offset = position_to_byte_offset(source, position);
+    let source_text = SourceText::new("", 0, source);
 
-    let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
+    let (unit, parse_diags) = match frontend::analyze_source(&source_text) {
+        Ok(unit) => (Some(unit), DiagnosticBag::default()),
+        Err(bag) => (None, bag),
+    };
 
-    if let Some(ty) = env.find_type_at_offset(offset) {
-        let name = find_name_at_offset(&unit, source, offset)
-            .or_else(|| identifier_at_offset(source, offset).map(String::from));
-        let label = match name {
-            Some(name) => format!("{}: {}", name, ty.render()),
-            None => ty.render(),
-        };
-        return Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(label)),
-            range: None,
-        });
-    }
+    let env = unit
+        .as_ref()
+        .and_then(|u| vox_runtime::infer_environment(&u.syntax, &[]).ok());
 
-    let name = find_name_at_offset(&unit, source, offset)?;
+    let mut parts: Vec<String> = Vec::new();
 
-    for binding in &env.bindings {
-        if binding.name == name {
-            let contents = HoverContents::Scalar(MarkedString::String(format!(
-                "{}: {}",
-                binding.name,
-                binding.ty.render()
-            )));
-            return Some(Hover { contents, range: None });
+    if let Some(ref unit) = unit {
+        if let Some(hover_line) = build_decl_hover_line(source, unit, offset) {
+            parts.push(format!("```vox\n{}\n```", hover_line));
         }
     }
 
-    for func in &env.functions {
-        if func.name == name {
-            let sig = format!(
-                "fun {}({}) -> {}",
-                func.name,
-                func.parameters
-                    .iter()
-                    .map(|p| format!("{}: {}", p.name, p.ty.render()))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                func.return_type.render()
-            );
-            let contents = HoverContents::Scalar(MarkedString::String(sig));
-            return Some(Hover { contents, range: None });
+    let head_docs = unit
+        .as_ref()
+        .and_then(|u| find_head_docs_at_offset(u, offset));
+    let body_docs = unit.as_ref().and_then(|u| find_body_docs(source, u, offset));
+
+    if let Some(ref docs) = head_docs {
+        for line in docs {
+            parts.push(line.clone());
+        }
+    }
+    if let Some(ref docs) = body_docs {
+        for line in docs {
+            parts.push(line.clone());
+        }
+    }
+
+    if let Some(ref env) = env {
+        if let Some(ty) = env.find_type_at_offset(offset) {
+            let name = unit
+                .as_ref()
+                .and_then(|u| find_name_at_offset(u, source, offset))
+                .or_else(|| identifier_at_offset(source, offset).map(String::from));
+            if parts.is_empty() {
+                let label = match name {
+                    Some(n) => format!("```vox\n{}: {}\n```", n, ty.render()),
+                    None => format!("```vox\n{}\n```", ty.render()),
+                };
+                parts.push(label);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        if let Some(ref unit) = unit {
+            if let Some(name) = find_name_at_offset(unit, source, offset) {
+                if let Some(ref env) = env {
+                    for binding in &env.bindings {
+                        if binding.name == name {
+                            parts.push(format!(
+                                "```vox\n{}: {}\n```",
+                                binding.name,
+                                binding.ty.render()
+                            ));
+                            break;
+                        }
+                    }
+                    if parts.is_empty() {
+                        for func in &env.functions {
+                            if func.name == name {
+                                let sig = format!(
+                                    "fun {}({}) -> {}",
+                                    func.name,
+                                    func.parameters
+                                        .iter()
+                                        .map(|p| format!("{}: {}", p.name, p.ty.render()))
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    func.return_type.render()
+                                );
+                                parts.push(format!("```vox\n{}\n```", sig));
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    let name_at = identifier_at_offset(source, offset);
+                    if name_at == Some(&name) || name_at.is_none() {
+                        parts.push(format!("```vox\n{}\n```", name));
+                    }
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() && unit.is_none() {
+        let ident = identifier_at_offset(source, offset).map(String::from);
+        if let Some(ref name) = ident {
+            parts.push(format!("```vox\n{}\n```", name));
+        }
+    }
+
+    let diags = unit
+        .as_ref()
+        .map(|_| parse_diags.iter().collect::<Vec<_>>())
+        .unwrap_or_else(|| parse_diags.iter().collect::<Vec<_>>());
+
+    for diag in diags {
+        let diag_offset = diag.span.as_ref().map(|s| s.start).unwrap_or(0);
+        let diag_end = diag.span.as_ref().map(|s| s.end).unwrap_or(0);
+        if diag_offset <= offset && offset < diag_end {
+            parts.push(format!("---\n*{}:* {}", severity_label(diag.severity), diag.message));
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let contents = HoverContents::Markup(MarkupContent {
+        kind: MarkupKind::Markdown,
+        value: parts.join("\n"),
+    });
+
+    Some(Hover { contents, range: None })
+}
+
+fn severity_label(severity: vox_core::diagnostics::Severity) -> &'static str {
+    match severity {
+        vox_core::diagnostics::Severity::Note => "Note",
+        vox_core::diagnostics::Severity::Warning => "Warning",
+        vox_core::diagnostics::Severity::Error => "Error",
+    }
+}
+
+fn build_decl_hover_line(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    offset: usize,
+) -> Option<String> {
+    use vox_compiler::frontend::ast::*;
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                if offset >= f.span.start && offset < f.span.end {
+                    return Some(extract_source_line(source, f.span.start, f.span.end));
+                }
+            }
+            TopLevelItem::Value(v) => {
+                if offset >= v.span.start && offset < v.span.end {
+                    return Some(extract_source_line(source, v.span.start, v.span.end));
+                }
+            }
+            TopLevelItem::Param(p) => {
+                if offset >= p.span.start && offset < p.span.end {
+                    return Some(extract_source_line(source, p.span.start, p.span.end));
+                }
+            }
+            TopLevelItem::Import(i) => {
+                if offset >= i.span.start && offset < i.span.end {
+                    return Some(extract_source_line(source, i.span.start, i.span.end));
+                }
+            }
+            TopLevelItem::Statement(s) => {
+                let span = block_item_span(s);
+                if offset >= span.start && offset < span.end {
+                    return Some(extract_source_line(source, span.start, span.end));
+                }
+            }
+        }
+    }
+
+    if offset >= unit.header.span.start && offset < unit.header.span.end {
+        return Some(extract_source_line(
+            source,
+            unit.header.span.start,
+            unit.header.span.end,
+        ));
+    }
+
+    if let Some(ref result) = unit.syntax.result {
+        if offset >= result.span.start && offset < result.span.end {
+            return Some(extract_source_line(source, result.span.start, result.span.end));
         }
     }
 
     None
+}
+
+fn block_item_span(item: &vox_compiler::frontend::ast::BlockItem) -> vox_core::diagnostics::TextSpan {
+    use vox_compiler::frontend::ast::*;
+    match item {
+        BlockItem::LocalValue(lv) => lv.span.clone(),
+        BlockItem::Assignment(a) => a.span.clone(),
+        BlockItem::CompoundAssignment(ca) => ca.span.clone(),
+        BlockItem::Return(r) => r.span.clone(),
+        BlockItem::Panic(p) => p.span.clone(),
+        BlockItem::Break(b) => b.span.clone(),
+        BlockItem::Continue(c) => c.span.clone(),
+        BlockItem::BlockStatement(e) | BlockItem::Expr(e) => e.span.clone(),
+    }
+}
+
+fn extract_source_line(source: &str, start: usize, end: usize) -> String {
+    let start = start.min(source.len());
+    let end = end.min(source.len());
+
+    let line_start = source[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[end..].find('\n').map(|i| end + i).unwrap_or(source.len());
+
+    source[line_start..line_end].trim_end().to_string()
+}
+
+fn find_head_docs_at_offset(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    offset: usize,
+) -> Option<Vec<String>> {
+    use vox_compiler::frontend::ast::*;
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                if offset >= f.span.start && offset < f.span.end && !f.docs.is_empty() {
+                    return Some(
+                        f.docs
+                            .iter()
+                            .map(|d| d.trim_end().to_string())
+                            .collect(),
+                    );
+                }
+            }
+            TopLevelItem::Value(v) => {
+                if offset >= v.span.start && offset < v.span.end && !v.docs.is_empty() {
+                    return Some(
+                        v.docs
+                            .iter()
+                            .map(|d| d.trim_end().to_string())
+                            .collect(),
+                    );
+                }
+            }
+            TopLevelItem::Param(p) => {
+                if offset >= p.span.start && offset < p.span.end && !p.docs.is_empty() {
+                    return Some(
+                        p.docs
+                            .iter()
+                            .map(|d| d.trim_end().to_string())
+                            .collect(),
+                    );
+                }
+            }
+            TopLevelItem::Import(i) => {
+                if offset >= i.span.start && offset < i.span.end && !i.docs.is_empty() {
+                    return Some(
+                        i.docs
+                            .iter()
+                            .map(|d| d.trim_end().to_string())
+                            .collect(),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if offset >= unit.header.span.start && offset < unit.header.span.end && !unit.docs.is_empty() {
+        return Some(unit.docs.iter().map(|d| d.trim_end().to_string()).collect());
+    }
+
+    None
+}
+
+fn find_body_docs(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    offset: usize,
+) -> Option<Vec<String>> {
+    use vox_compiler::frontend::ast::*;
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(f) => {
+                if offset >= f.span.start && offset < f.span.end {
+                    let body_docs = collect_function_body_docs(source, f);
+                    if !body_docs.is_empty() {
+                        return Some(body_docs);
+                    }
+                }
+            }
+            TopLevelItem::Value(v) => {
+                if offset >= v.span.start && offset < v.span.end {
+                    let trailing = collect_value_trailing_docs(source, &v.span);
+                    if !trailing.is_empty() {
+                        return Some(trailing);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn collect_function_body_docs(
+    source: &str,
+    func: &vox_compiler::frontend::ast::FunctionDecl,
+) -> Vec<String> {
+    let body_str = &source[func.body.span.start..func.body.span.end];
+    let mut docs = Vec::new();
+
+    for line in body_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("///") {
+            docs.push(trimmed.to_string());
+        }
+    }
+
+    docs
+}
+
+fn collect_value_trailing_docs(
+    source: &str,
+    span: &vox_core::diagnostics::TextSpan,
+) -> Vec<String> {
+    let decl_str = &source[span.start..span.end];
+    let after_last_semi = decl_str.rfind(';').map(|i| i + 1).unwrap_or(0);
+    let rest = &decl_str[after_last_semi..];
+    let trimmed = rest.trim();
+    if trimmed.starts_with("///") {
+        vec![trimmed.to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 #[tower_lsp::async_trait]
