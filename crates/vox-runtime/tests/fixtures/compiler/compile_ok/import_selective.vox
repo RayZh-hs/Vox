@@ -1,0 +1,3 @@
+script fixtures.compile.import_selective;
+
+import image.(blur, load);

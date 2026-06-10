@@ -9,10 +9,10 @@ use vox_compiler::{
     TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
-        ExprKind, ForHeader, FunctionDecl, IntrinsicExpr, LambdaParameter, Mutability,
-        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral,
-        StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
-        UpdatedPathSegment, ValueDecl,
+        ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter,
+        Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit,
+        StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
+        UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
     },
 };
 use vox_core::{
@@ -159,7 +159,7 @@ struct ModuleState {
     artifact_id: ArtifactId,
     optimization: vox_core::opt::OptimizationLevel,
     name: String,
-    imports: Vec<ModulePath>,
+    imports: Vec<ImportDecl>,
     parameters: Vec<ParamDecl>,
     result: Option<Expr>,
     values: BTreeMap<String, ValueDecl>,
@@ -184,14 +184,7 @@ impl ModuleState {
             artifact_id,
             optimization: artifact.optimization,
             name: artifact.module.as_str(),
-            imports: script
-                .imports
-                .iter()
-                .map(|import| {
-                    ModulePath::parse(&import.module.to_source_string())
-                        .expect("parsed import paths should be valid module paths")
-                })
-                .collect(),
+            imports: script.imports.clone(),
             parameters: script.parameters.clone(),
             result: script.syntax.result.clone(),
             values: BTreeMap::new(),
@@ -362,18 +355,30 @@ impl ModuleState {
         runtime: &Runtime,
         name: &QualifiedName,
     ) -> Result<Option<HostFunction>, String> {
+        if name.segments.len() == 1 {
+            return self.resolve_unqualified_host_function(runtime, &name.segments[0]);
+        }
+
         for length in (1..name.segments.len()).rev() {
             let package = name.segments[..length].join(".");
-            let Some(imported) = self
-                .imports
-                .iter()
-                .find(|candidate| candidate.as_str() == package)
-            else {
+            let Some(import_decl) = self.find_import_by_path(&package) else {
                 continue;
             };
-            let Some(manifest) = runtime.package_manifest(imported) else {
+            let module_path = ModulePath::parse(&import_decl.module.to_source_string())
+                .expect("parsed import paths should be valid module paths");
+            let Some(manifest) = runtime.package_manifest(&module_path) else {
                 return Err(format!("package `{package}` is not mounted"));
             };
+
+            if let Some(items) = &import_decl.items {
+                if name.segments.len() != length + 1 {
+                    continue;
+                }
+                let symbol = &name.segments[length];
+                if !items.iter().any(|item| item.name == *symbol) {
+                    continue;
+                }
+            }
 
             if name.segments.len() != length + 1 {
                 continue;
@@ -381,11 +386,70 @@ impl ModuleState {
 
             let symbol = &name.segments[length];
             if let Some(function) = manifest.functions.iter().find(|item| &item.name == symbol) {
-                return Ok(Some(HostFunction::from_spec(imported.clone(), function)));
+                return Ok(Some(HostFunction::from_spec(module_path, function)));
             }
         }
 
         Ok(None)
+    }
+
+    fn resolve_unqualified_host_function(
+        &self,
+        runtime: &Runtime,
+        symbol: &str,
+    ) -> Result<Option<HostFunction>, String> {
+        let mut candidates: Vec<(ModulePath, FunctionSpec)> = Vec::new();
+        for import_decl in &self.imports {
+            let module_path = ModulePath::parse(&import_decl.module.to_source_string())
+                .expect("parsed import paths should be valid module paths");
+            let Some(manifest) = runtime.package_manifest(&module_path) else {
+                continue;
+            };
+
+            if let Some(items) = &import_decl.items {
+                if let Some(item) = items.iter().find(|item| {
+                    let effective = item.alias.as_ref().unwrap_or(&item.name);
+                    effective == symbol
+                }) {
+                    if let Some(function) = manifest
+                        .functions
+                        .iter()
+                        .find(|f| f.name == item.name)
+                        .cloned()
+                    {
+                        candidates.push((module_path, function));
+                    }
+                }
+                continue;
+            }
+
+            if let Some(function) = manifest
+                .functions
+                .iter()
+                .find(|f| f.name == symbol)
+                .cloned()
+            {
+                candidates.push((module_path, function));
+            }
+        }
+
+        match candidates.len() {
+            0 => Ok(None),
+            1 => {
+                let (package, function) = candidates.into_iter().next().unwrap();
+                Ok(Some(HostFunction::from_spec(package, &function)))
+            }
+            _ => Err(format!(
+                "ambiguous name `{symbol}` (imported from multiple packages)"
+            )),
+        }
+    }
+
+    fn find_import_by_path(&self, path: &str) -> Option<&ImportDecl> {
+        self.imports.iter().find(|import| {
+            import.module.to_source_string() == path
+                || import.alias.as_ref().is_some_and(|alias| alias == path)
+        })
     }
 
     fn top_level_value(

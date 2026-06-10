@@ -8,7 +8,7 @@ use vox_compiler::frontend::ast::{
     UpdatedPathSegment, ValueDecl, WhenExpr,
 };
 use vox_core::{
-    host::PackageManifest,
+    host::{FunctionSpec, PackageManifest},
     source::{ModuleKind, ModulePath},
 };
 
@@ -322,6 +322,7 @@ struct FunctionInfo {
 #[derive(Debug, Clone)]
 struct ImportedPackage {
     manifest: Option<PackageManifest>,
+    selective: Option<Vec<(String, Option<String>)>>,
 }
 
 struct TypeEngine<'a> {
@@ -329,6 +330,7 @@ struct TypeEngine<'a> {
     module: String,
     manifests: BTreeMap<String, PackageManifest>,
     imports: BTreeMap<String, ImportedPackage>,
+    module_aliases: BTreeMap<String, String>,
     values: BTreeMap<String, ValueInfo>,
     functions: BTreeMap<String, FunctionInfo>,
     expr_types: RefCell<BTreeMap<usize, (usize, ReplType)>>,
@@ -345,6 +347,7 @@ impl<'a> TypeEngine<'a> {
                 .map(|manifest| (manifest.package.as_str(), manifest))
                 .collect(),
             imports: BTreeMap::new(),
+            module_aliases: BTreeMap::new(),
             values: BTreeMap::new(),
             functions: BTreeMap::new(),
             expr_types: RefCell::new(BTreeMap::new()),
@@ -408,10 +411,30 @@ impl<'a> TypeEngine<'a> {
                     .get(&name)
                     .cloned()
                     .ok_or_else(|| format!("imported package `{name}` is not mounted"))?;
+
+                let selective = import.items.as_ref().map(|items| {
+                    items
+                        .iter()
+                        .map(|item| (item.name.clone(), item.alias.clone()))
+                        .collect::<Vec<_>>()
+                });
+
+                if let Some(alias) = &import.alias {
+                    self.imports.insert(
+                        alias.clone(),
+                        ImportedPackage {
+                            manifest: Some(manifest.clone()),
+                            selective: selective.clone(),
+                        },
+                    );
+                    self.module_aliases.insert(alias.clone(), name.clone());
+                }
+
                 self.imports.insert(
                     name.clone(),
                     ImportedPackage {
                         manifest: Some(manifest),
+                        selective,
                     },
                 );
             }
@@ -1588,6 +1611,9 @@ impl<'a> TypeEngine<'a> {
             if let Some(kind) = predefined_type_name_kind(local) {
                 return Err(type_name_used_as_value_error(local, kind));
             }
+            if let Some(result) = self.resolve_unqualified_name(local)? {
+                return Ok(result);
+            }
             return Err(format!("unknown name `{local}`"));
         }
 
@@ -1601,6 +1627,61 @@ impl<'a> TypeEngine<'a> {
         }
 
         self.resolve_imported_name(name)
+    }
+
+    fn resolve_unqualified_name(&self, local: &str) -> Result<Option<ReplType>, String> {
+        let mut candidates: Vec<(String, &FunctionSpec)> = Vec::new();
+        for (import_path, imported) in &self.imports {
+            if let Some(manifest) = &imported.manifest {
+                if let Some(selective) = &imported.selective {
+                    for (name, alias) in selective {
+                        let effective = alias.as_ref().unwrap_or(name);
+                        if effective == local {
+                            if let Some(func) = manifest
+                                .functions
+                                .iter()
+                                .find(|f| &f.name == name)
+                            {
+                                candidates.push((import_path.clone(), func));
+                            }
+                        }
+                    }
+                } else {
+                    if let Some(func) = manifest
+                        .functions
+                        .iter()
+                        .find(|f| f.name == local)
+                    {
+                        candidates.push((import_path.clone(), func));
+                    }
+                }
+            }
+        }
+
+        match candidates.len() {
+            0 => Ok(None),
+            1 => {
+                let (_path, func) = candidates.into_iter().next().unwrap();
+                Ok(Some(ReplType::Function {
+                    parameters: func
+                        .parameters
+                        .iter()
+                        .map(|p| from_vox_host_type(&p.ty))
+                        .collect(),
+                    result: Box::new(from_vox_host_type(&func.return_type)),
+                }))
+            }
+            _ => {
+                let names = candidates
+                    .iter()
+                    .map(|(path, _)| format!("`{path}.{}`", local))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "ambiguous name `{local}` (imported from multiple packages: {names})"
+                ))
+            }
+        }
     }
 
     fn resolve_local_qualified_name(&self, name: &QualifiedName) -> Option<String> {
@@ -1625,6 +1706,16 @@ impl<'a> TypeEngine<'a> {
             let Some(manifest) = &imported.manifest else {
                 return Err(format!("package `{package}` is not mounted"));
             };
+
+            if let Some(selective) = &imported.selective {
+                if name.segments.len() != length + 1 {
+                    continue;
+                }
+                let symbol = &name.segments[length];
+                if !selective.iter().any(|(n, _)| n == symbol) {
+                    continue;
+                }
+            }
 
             if name.segments.len() == length + 1 {
                 let symbol = &name.segments[length];

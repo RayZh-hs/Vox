@@ -15,6 +15,8 @@ use vox_core::{
 
 use crate::backend::BackendPipeline;
 use crate::frontend::{FrontendUnit, analyze_source};
+use crate::frontend::ast::TopLevelItem;
+use crate::imports::{resolve_imports, ImportResolution};
 use crate::mir::{MirPassFn, lower_mir};
 use crate::optimization::{OptimizationPipeline, derive_rankings};
 use crate::treewalk::TreewalkScript;
@@ -70,7 +72,12 @@ impl Compiler {
                         OptimizationSubject::Function(_) => None,
                     })
                     .expect("module ranking should always be present");
-                let mut mir = lower_mir(&frontend, request.optimization, &optimization_rankings);
+                let mut mir = lower_mir(
+                    &frontend,
+                    request.optimization,
+                    &optimization_rankings,
+                    build_import_resolution(&frontend, &request.host),
+                );
                 let mut optimization_summary =
                     OptimizationPipeline::for_level(pipeline_optimization)
                         .run(&mut mir, custom_mir_passes);
@@ -132,6 +139,19 @@ fn collect_dependencies(request: &CompileRequest) -> Vec<DependencyFingerprint> 
             revision: request.source.origin.revision,
         })
         .collect()
+}
+
+fn build_import_resolution(frontend: &FrontendUnit, host: &HostRegistry) -> ImportResolution {
+    let imports: Vec<_> = frontend
+        .syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Import(import) => Some(import.clone()),
+            _ => None,
+        })
+        .collect();
+    resolve_imports(&imports, host)
 }
 
 pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {

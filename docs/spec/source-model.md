@@ -140,3 +140,66 @@ In scripts:
 
 - declarations remain script-local regardless of visibility spelling;
 - `public` has no import/export effect.
+
+## 7. Imports
+
+An import declaration makes symbols from another package available in the
+current module. There are three import forms:
+
+```ebnf
+ImportDecl
+  ::= "import" ModulePath ";"
+   |  "import" ModulePath "as" Identifier ";"
+   |  "import" ModulePath "." "(" ImportItem ("," ImportItem)* ","? ")" ";"
+
+ImportItem
+  ::= Identifier
+   |  Identifier "as" Identifier
+```
+
+### 7.1. Wildcard Import
+
+A bare import makes all public symbols from the target package available. If a
+symbol name is provided by exactly one imported package, it may be used
+unqualified. If multiple imports provide the same name, that symbol must be used
+with a qualified path.
+
+```
+import foo.bar;     // foo.bar provides baz and qux
+baz();              // ok: only foo.bar provides baz
+foo.bar.qux();      // always works
+```
+
+### 7.2. Module Alias
+
+The `as` keyword creates a local alias for the module path.
+
+```
+import foo.bar as other;
+other.baz();        // equivalent to foo.bar.baz()
+```
+
+Module aliases may be combined with selective imports.
+
+```
+import foo.bar as other.(baz);   // alias + selective
+other.baz();                     // ok
+```
+
+### 7.3. Selective Import
+
+A parenthesised list after a `.` imports only the named symbols, with optional
+per-item aliasing.
+
+```
+import foo.bar.(baz, goo as go);
+baz();              // shorthand: equivalent to foo.bar.baz
+go();               // aliased: equivalent to foo.bar.goo
+foo.bar.goo();      // original name still works
+```
+
+### 7.4. Public Import Aliasing
+
+When two import paths refer to the same underlying function implementation
+(e.g. a package re-exports another's symbol under the same name), they are not
+considered a naming conflict for unqualified name resolution.

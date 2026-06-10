@@ -10,7 +10,7 @@ use crate::frontend::{
         Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, BreakStatement,
         CompilationUnit, CompoundAssignmentOp, CompoundAssignmentStatement, ContinueStatement,
         EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader, FrontendUnit, FunctionDecl,
-        GenericParameter, IfBranch, IfExpr, ImportDecl, IntrinsicExpr, LambdaExpr,
+        GenericParameter, IfBranch, IfExpr, ImportDecl, ImportItem, IntrinsicExpr, LambdaExpr,
         LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
         QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement,
         StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg,
@@ -275,7 +275,49 @@ impl Parser {
     ) -> Result<ImportDecl, DiagnosticBag> {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::Import, "expected `import`")?;
-        let module = self.parse_qualified_name()?;
+        let module = self.parse_import_module_path()?;
+
+        let alias = if self.consume(TokenKind::As) {
+            let (alias_name, _) = self.expect_identifier("expected alias name after `as`")?;
+            Some(alias_name)
+        } else {
+            None
+        };
+
+        let items = if self.consume(TokenKind::Dot) {
+            self.expect_simple(
+                TokenKind::LParen,
+                "expected `(` after `.` for selective import list",
+            )?;
+            let mut items = Vec::new();
+            while !self.at(TokenKind::RParen) {
+                let item_start = self.current().span.start;
+                let (name, _) = self.expect_identifier("expected imported name")?;
+                let item_alias = if self.consume(TokenKind::As) {
+                    let (alias_name, _) =
+                        self.expect_identifier("expected alias name after `as`")?;
+                    Some(alias_name)
+                } else {
+                    None
+                };
+                items.push(ImportItem {
+                    name,
+                    alias: item_alias,
+                    span: TextSpan::new(item_start, self.previous().span.end),
+                });
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+            }
+            self.expect_simple(TokenKind::RParen, "expected `)` after selective import list")?;
+            Some(items)
+        } else {
+            None
+        };
+
         self.expect_simple(
             TokenKind::Semicolon,
             "expected `;` after import declaration",
@@ -284,7 +326,31 @@ impl Parser {
             docs,
             visibility,
             module,
+            alias,
+            items,
             span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_import_module_path(&mut self) -> Result<QualifiedName, DiagnosticBag> {
+        let start = self.current().span.start;
+        let (first, _) = self.expect_identifier("expected module path")?;
+        let mut segments = vec![first];
+        loop {
+            if !self.at(TokenKind::Dot) {
+                break;
+            }
+            if self.peek_kind(1) == Some(TokenKind::LParen) {
+                break;
+            }
+            self.consume(TokenKind::Dot);
+            let (segment, _) = self.expect_identifier("expected identifier after `.`")?;
+            segments.push(segment);
+        }
+        let end = self.previous().span.end;
+        Ok(QualifiedName {
+            segments,
+            span: TextSpan::new(start, end),
         })
     }
 

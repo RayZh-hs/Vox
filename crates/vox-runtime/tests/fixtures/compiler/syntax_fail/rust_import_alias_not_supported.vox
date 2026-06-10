@@ -1,3 +1,0 @@
-script fixtures.syntax.fail.rust_alias;
-
-import image as img;

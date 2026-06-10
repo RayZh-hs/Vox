@@ -24,6 +24,7 @@ use crate::frontend::{
         UpdatedPathSegment, ValueDecl, WhenExpr,
     },
 };
+use crate::imports::ImportResolution;
 
 pub type MirPassFn = fn(&mut MirModule) -> MirPassReport;
 
@@ -38,14 +39,16 @@ pub(crate) fn lower_mir(
     frontend: &FrontendUnit,
     optimization: OptimizationLevel,
     rankings: &[vox_core::opt::OptimizationRanking],
+    import_resolution: ImportResolution,
 ) -> MirModule {
-    MirLowerer::new(frontend, optimization, rankings).lower_module()
+    MirLowerer::new(frontend, optimization, rankings, import_resolution).lower_module()
 }
 
 struct MirLowerer<'a> {
     frontend: &'a FrontendUnit,
     optimization: OptimizationLevel,
     rankings: &'a [vox_core::opt::OptimizationRanking],
+    import_resolution: ImportResolution,
     next_body: u32,
 }
 
@@ -54,11 +57,13 @@ impl<'a> MirLowerer<'a> {
         frontend: &'a FrontendUnit,
         optimization: OptimizationLevel,
         rankings: &'a [vox_core::opt::OptimizationRanking],
+        import_resolution: ImportResolution,
     ) -> Self {
         Self {
             frontend,
             optimization,
             rankings,
+            import_resolution,
             next_body: 0,
         }
     }
@@ -101,6 +106,7 @@ impl<'a> MirLowerer<'a> {
             purity,
             self.rank_for(OptimizationSubject::Module),
             Some(unit.span.clone()),
+            self.import_resolution.clone(),
         );
 
         for parameter in &self.frontend.parameters {
@@ -149,6 +155,7 @@ impl<'a> MirLowerer<'a> {
             },
             self.rank_for(OptimizationSubject::Function(function.name.clone())),
             Some(function.span.clone()),
+            self.import_resolution.clone(),
         );
 
         for parameter in &function.parameters {
@@ -182,6 +189,7 @@ impl<'a> MirLowerer<'a> {
             Purity::Pure,
             self.rank_for(OptimizationSubject::Module),
             Some(value.span.clone()),
+            self.import_resolution.clone(),
         );
         let result = body.lower_expr(&value.initializer);
         body.terminate(MirTerminator::Return(result));
@@ -225,6 +233,7 @@ struct BodyBuilder {
     blocks: Vec<MirBlock>,
     current: MirBlockId,
     scopes: Vec<BTreeMap<String, BindingRef>>,
+    import_resolution: ImportResolution,
     next_binding: u32,
     next_version: u32,
     next_value: u32,
@@ -245,6 +254,7 @@ impl BodyBuilder {
         purity: Purity,
         rank: OptimizationRank,
         span: Option<vox_core::diagnostics::TextSpan>,
+        import_resolution: ImportResolution,
     ) -> Self {
         let entry = MirBlockId(0);
         Self {
@@ -267,6 +277,7 @@ impl BodyBuilder {
             }],
             current: entry,
             scopes: vec![BTreeMap::new()],
+            import_resolution,
             next_binding: 0,
             next_version: 0,
             next_value: 0,
@@ -485,9 +496,10 @@ impl BodyBuilder {
             ExprKind::Name(name) => self.lower_name(name, Some(expr.span.clone())),
             ExprKind::Call { callee, arguments } => {
                 let args = self.lower_arguments(arguments);
+                let resolved = self.resolve_callee_label(callee);
                 self.emit_op(
                     MirOpKind::Call {
-                        callee: callee_label(callee),
+                        callee: resolved,
                         purity: Purity::Pure,
                     },
                     args,
@@ -2022,5 +2034,48 @@ fn callee_label(expr: &Expr) -> String {
         ExprKind::Name(name) => name.to_source_string(),
         ExprKind::Field { target, name } => format!("{}.{}", callee_label(target), name),
         _ => "<expr>".to_owned(),
+    }
+}
+
+impl BodyBuilder {
+    fn resolve_callee_label(&self, callee: &Expr) -> String {
+        match &callee.kind {
+            ExprKind::Name(name) => {
+                let label = name.to_source_string();
+                if self.resolve_binding(&label).is_some() {
+                    return label;
+                }
+                if let Some(resolved) = self.import_resolution.unqualified.get(&label) {
+                    return resolved.clone();
+                }
+                if name.segments.len() > 1
+                    && let Some(resolved) = self.resolve_module_prefix(&name.segments)
+                {
+                    return resolved;
+                }
+                label
+            }
+            ExprKind::Field { target, name } => {
+                let prefix = callee_label(target);
+                if let Some(resolved_prefix) =
+                    self.import_resolution.module_aliases.get(&prefix)
+                {
+                    return format!("{}.{}", resolved_prefix, name);
+                }
+                format!("{}.{}", prefix, name)
+            }
+            _ => callee_label(callee),
+        }
+    }
+
+    fn resolve_module_prefix(&self, segments: &[String]) -> Option<String> {
+        for split in (1..segments.len()).rev() {
+            let prefix = segments[..split].join(".");
+            if let Some(resolved) = self.import_resolution.module_aliases.get(&prefix) {
+                let rest = segments[split..].join(".");
+                return Some(format!("{}.{}", resolved, rest));
+            }
+        }
+        None
     }
 }

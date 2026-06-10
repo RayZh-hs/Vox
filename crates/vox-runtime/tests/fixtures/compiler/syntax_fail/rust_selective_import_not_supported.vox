@@ -1,3 +1,0 @@
-script fixtures.syntax.fail.rust_selective;
-
-import image.{blur};

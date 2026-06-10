@@ -1,0 +1,3 @@
+script fixtures.compile.import_full;
+
+import image;

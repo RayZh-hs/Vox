@@ -108,6 +108,15 @@ pub struct ImportDecl {
     pub docs: Vec<String>,
     pub visibility: Visibility,
     pub module: QualifiedName,
+    pub alias: Option<String>,
+    pub items: Option<Vec<ImportItem>>,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportItem {
+    pub name: String,
+    pub alias: Option<String>,
     pub span: TextSpan,
 }
 
