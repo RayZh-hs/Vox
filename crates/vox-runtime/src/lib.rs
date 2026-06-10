@@ -223,6 +223,52 @@ impl Runtime {
         Ok(ids)
     }
 
+    pub fn mount_vox_file(&mut self, path: &Path) -> Result<LibraryId, String> {
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| format!("non-UTF8 path: {}", path.display()))?;
+        let source = SourceText::new(path_str, 0, text);
+        let voxlib_bytes =
+            vox_compiler::compile_to_voxlib(vox_compiler::CompileRequest {
+                source,
+                optimization: self.default_xopt,
+                optimization_overrides: BTreeMap::new(),
+                host: self.host.clone(),
+            })
+            .map_err(|error| {
+                format!("failed to compile {}: {error}", path.display())
+            })?;
+        let header = decode_external_library_file(&voxlib_bytes).map_err(|error| {
+            format!(
+                "failed to decode compiled voxlib from {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(self.mount_library(header.manifest))
+    }
+
+    pub fn mount_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
+        let entries = fs::read_dir(dir)
+            .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| format!("directory read error: {error}"))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("vox") => ids.push(self.mount_vox_file(&path)?),
+                Some("voxlib") => ids.push(self.mount_voxlib_file(&path)?),
+                _ => {}
+            }
+        }
+        Ok(ids)
+    }
+
     pub fn mount_host_library<I>(
         &mut self,
         manifest: PackageManifest,
