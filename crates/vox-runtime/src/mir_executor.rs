@@ -22,21 +22,29 @@ struct IteratorState {
 pub struct MirExecutor<'a> {
     runtime: &'a mut Runtime,
     module: &'a MirModule,
-    values: BTreeMap<MirValueId, InlineValue>,
-    versions: BTreeMap<MirVersionId, InlineValue>,
-    version_to_value: BTreeMap<MirVersionId, MirValueId>,
+    values: Vec<Option<InlineValue>>,
+    versions: Vec<Option<InlineValue>>,
+    version_to_binding: Vec<MirValueId>,
     iterators: BTreeMap<MirValueId, IteratorState>,
+    block_index: Vec<usize>,
+    max_value_id: usize,
+    max_version_id: usize,
 }
+
+const UNINIT_VALUE: MirValueId = MirValueId(u32::MAX);
 
 impl<'a> MirExecutor<'a> {
     pub fn new(runtime: &'a mut Runtime, _artifact_id: ArtifactId, module: &'a MirModule) -> Self {
         Self {
             runtime,
             module,
-            values: BTreeMap::new(),
-            versions: BTreeMap::new(),
-            version_to_value: BTreeMap::new(),
+            values: Vec::new(),
+            versions: Vec::new(),
+            version_to_binding: Vec::new(),
             iterators: BTreeMap::new(),
+            block_index: Vec::new(),
+            max_value_id: 0,
+            max_version_id: 0,
         }
     }
 
@@ -61,9 +69,18 @@ impl<'a> MirExecutor<'a> {
         arguments: &[RuntimeValue],
         parameter_specs: Option<&[ParameterSpec]>,
     ) -> Result<InlineValue, String> {
-        self.values.clear();
-        self.versions.clear();
-        self.version_to_value.clear();
+        let mv = body.values.iter().map(|v| v.id.0 as usize).max().unwrap_or(0);
+        let mp = body.parameters.iter().map(|p| p.0 as usize).max().unwrap_or(0);
+        self.max_value_id = mv.max(mp);
+        self.max_version_id = body
+            .versions
+            .iter()
+            .map(|v| v.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        self.values = vec![None; self.max_value_id + 1];
+        self.versions = vec![None; self.max_version_id + 1];
+        self.version_to_binding = vec![UNINIT_VALUE; self.max_version_id + 1];
         self.iterators.clear();
 
         for binding in &body.bindings {
@@ -71,9 +88,20 @@ impl<'a> MirExecutor<'a> {
                 if let Some(binding_version) = body.versions.iter().find(|v| v.id == *first_version) {
                     let identity_value = binding_version.value;
                     for &version_id in &binding.versions {
-                        self.version_to_value.insert(version_id, identity_value);
+                        let idx = version_id.0 as usize;
+                        if idx < self.version_to_binding.len() {
+                            self.version_to_binding[idx] = identity_value;
+                        }
                     }
                 }
+            }
+        }
+
+        self.block_index = vec![0; body.blocks.len()];
+        for (i, b) in body.blocks.iter().enumerate() {
+            let bid = b.id.0 as usize;
+            if bid < self.block_index.len() {
+                self.block_index[bid] = i;
             }
         }
 
@@ -98,8 +126,10 @@ impl<'a> MirExecutor<'a> {
         }
 
         for (value, argument) in body.parameters.iter().zip(arguments) {
-            self.values
-                .insert(*value, inline_value_from_runtime(argument));
+            let idx = value.0 as usize;
+            if idx < self.values.len() {
+                self.values[idx] = Some(inline_value_from_runtime(argument));
+            }
         }
 
         let mut current = body
@@ -108,14 +138,16 @@ impl<'a> MirExecutor<'a> {
             .map(|block| block.id)
             .ok_or_else(|| "MIR body does not contain an entry block".to_owned())?;
         loop {
-            let block = block_by_id(body, current)?;
+            let block = &body.blocks[self.block_index[current.0 as usize]];
             for op in &block.ops {
                 self.eval_op(op)?;
             }
 
             match &block.terminator {
                 MirTerminator::Jump { target, args } => {
-                    self.bind_block_args(body, *target, args)?;
+                    if !args.is_empty() {
+                        self.bind_block_args(body, *target, args)?;
+                    }
                     current = *target;
                 }
                 MirTerminator::Branch {
@@ -127,10 +159,14 @@ impl<'a> MirExecutor<'a> {
                 } => {
                     let condition = expect_bool(self.value(*condition)?, "branch condition")?;
                     if condition {
-                        self.bind_block_args(body, *then_target, then_args)?;
+                        if !then_args.is_empty() {
+                            self.bind_block_args(body, *then_target, then_args)?;
+                        }
                         current = *then_target;
                     } else {
-                        self.bind_block_args(body, *else_target, else_args)?;
+                        if !else_args.is_empty() {
+                            self.bind_block_args(body, *else_target, else_args)?;
+                        }
                         current = *else_target;
                     }
                 }
@@ -152,7 +188,7 @@ impl<'a> MirExecutor<'a> {
         target: MirBlockId,
         args: &[MirValueId],
     ) -> Result<(), String> {
-        let block = block_by_id(body, target)?;
+        let block = &body.blocks[self.block_index[target.0 as usize]];
         if block.parameters.len() != args.len() {
             return Err(format!(
                 "block %bb{} expects {} argument(s), received {}",
@@ -167,7 +203,10 @@ impl<'a> MirExecutor<'a> {
             .map(|arg| self.value(*arg))
             .collect::<Result<Vec<_>, _>>()?;
         for (parameter, value) in block.parameters.iter().zip(values) {
-            self.values.insert(*parameter, value);
+            let idx = parameter.0 as usize;
+            if idx < self.values.len() {
+                self.values[idx] = Some(value);
+            }
         }
         Ok(())
     }
@@ -184,19 +223,24 @@ impl<'a> MirExecutor<'a> {
                     .copied()
                     .ok_or_else(|| "bind op missing source value".to_owned())
                     .and_then(|value| self.value(value))?;
-                if let Some(&binding_value_id) = self.version_to_value.get(version) {
-                    self.values.insert(binding_value_id, value.clone());
+                let vidx = version.0 as usize;
+                let bv = self.version_to_binding.get(vidx).copied().unwrap_or(UNINIT_VALUE);
+                if bv != UNINIT_VALUE {
+                    let bidx = bv.0 as usize;
+                    if bidx < self.values.len() && vidx < self.versions.len() {
+                        self.values[bidx] = Some(value.clone());
+                        self.versions[vidx] = self.values[bidx].clone();
+                    }
                 }
-                self.versions.insert(*version, value);
                 None
             }
             MirOpKind::Unary(name) => {
-                let value = self.single_arg(op)?;
-                Some(eval_unary(name, value)?)
+                let value = self.single_arg_ref(op)?;
+                Some(eval_unary_ref(name, value)?)
             }
             MirOpKind::Binary(name) => {
-                let (left, right) = self.two_args(op)?;
-                Some(eval_binary(name, left, right)?)
+                let (left, right) = self.two_args_ref(op)?;
+                Some(eval_binary_ref(name, left, right)?)
             }
             MirOpKind::Tuple { .. } => Some(InlineValue::Tuple(self.arg_values(op)?)),
             MirOpKind::Record { fields } => {
@@ -282,7 +326,10 @@ impl<'a> MirExecutor<'a> {
                     result_id.0
                 )
             })?;
-            self.values.insert(result_id, value);
+            let idx = result_id.0 as usize;
+            if idx < self.values.len() {
+                self.values[idx] = Some(value);
+            }
         }
         Ok(())
     }
@@ -309,11 +356,17 @@ impl<'a> MirExecutor<'a> {
                 .into_iter()
                 .map(runtime_value_from_inline)
                 .collect::<Vec<_>>();
-            let saved_values = self.values.clone();
-            let saved_versions = self.versions.clone();
+            let saved_values = std::mem::take(&mut self.values);
+            let saved_versions = std::mem::take(&mut self.versions);
+            let saved_v2b = std::mem::take(&mut self.version_to_binding);
+            let saved_iters = std::mem::take(&mut self.iterators);
+            let saved_blocks = std::mem::take(&mut self.block_index);
             let result = self.run_body(&function, &arguments, None);
             self.values = saved_values;
             self.versions = saved_versions;
+            self.version_to_binding = saved_v2b;
+            self.iterators = saved_iters;
+            self.block_index = saved_blocks;
             return result;
         }
 
@@ -398,6 +451,9 @@ impl<'a> MirExecutor<'a> {
     }
 
     fn arg_values(&self, op: &MirOp) -> Result<Vec<InlineValue>, String> {
+        if op.args.is_empty() {
+            return Ok(Vec::new());
+        }
         op.args
             .iter()
             .map(|arg| self.value(*arg))
@@ -414,6 +470,22 @@ impl<'a> MirExecutor<'a> {
         self.value(*value)
     }
 
+    fn single_arg_ref(&self, op: &MirOp) -> Result<&InlineValue, String> {
+        let [value] = op.args.as_slice() else {
+            return Err(format!(
+                "MIR op `{}` expects one argument",
+                op_kind_label(&op.kind)
+            ));
+        };
+        let idx = value.0 as usize;
+        if idx < self.values.len() {
+            if let Some(v) = &self.values[idx] {
+                return Ok(v);
+            }
+        }
+        Err(format!("MIR op `{}` value not defined", op_kind_label(&op.kind)))
+    }
+
     fn two_args(&self, op: &MirOp) -> Result<(InlineValue, InlineValue), String> {
         let [left, right] = op.args.as_slice() else {
             return Err(format!(
@@ -421,31 +493,54 @@ impl<'a> MirExecutor<'a> {
                 op_kind_label(&op.kind)
             ));
         };
-        Ok((self.value(*left)?, self.value(*right)?))
+        let l = self.value(*left)?;
+        let r = self.value(*right)?;
+        Ok((l, r))
     }
 
+    fn two_args_ref(&self, op: &MirOp) -> Result<(&InlineValue, &InlineValue), String> {
+        let [left, right] = op.args.as_slice() else {
+            return Err(format!(
+                "MIR op `{}` expects two arguments",
+                op_kind_label(&op.kind)
+            ));
+        };
+        let li = left.0 as usize;
+        let ri = right.0 as usize;
+        if li < self.values.len() && ri < self.values.len() {
+            if let (Some(l), Some(r)) = (&self.values[li], &self.values[ri]) {
+                return Ok((l, r));
+            }
+        }
+        Err(format!("MIR op `{}` value not defined", op_kind_label(&op.kind)))
+    }
+
+    #[inline(always)]
     fn value(&self, id: MirValueId) -> Result<InlineValue, String> {
-        self.values
-            .get(&id)
-            .cloned()
-            .or_else(|| {
-                self.module.bodies.iter().find_map(|body| {
-                    body.values
-                        .iter()
-                        .find(|value| value.id == id)
-                        .and_then(|value| match &value.definition {
-                            MirValueDefinition::Unit => Some(InlineValue::Tuple(Vec::new())),
-                            _ => None,
-                        })
+        let idx = id.0 as usize;
+        if idx < self.values.len() {
+            if let Some(value) = &self.values[idx] {
+                return Ok(value.clone());
+            }
+        }
+        self.module
+            .bodies
+            .iter()
+            .find_map(|body| {
+                body.values.iter().find(|value| value.id == id).and_then(|value| match &value.definition {
+                    MirValueDefinition::Unit => Some(InlineValue::Tuple(Vec::new())),
+                    _ => None,
                 })
             })
             .ok_or_else(|| format!("MIR value %{} is not defined", id.0))
     }
 
+    #[inline(always)]
     fn version(&self, id: MirVersionId) -> Result<InlineValue, String> {
+        let idx = id.0 as usize;
         self.versions
-            .get(&id)
-            .cloned()
+            .get(idx)
+            .and_then(|v| v.clone())
             .ok_or_else(|| format!("MIR binding version %v{} is not defined", id.0))
     }
 }
@@ -501,101 +596,113 @@ fn block_by_id(body: &MirBody, id: MirBlockId) -> Result<&MirBlock, String> {
 }
 
 fn eval_unary(name: &str, value: InlineValue) -> Result<InlineValue, String> {
+    eval_unary_ref(name, &value)
+}
+
+fn eval_unary_ref(name: &str, value: &InlineValue) -> Result<InlineValue, String> {
     match (name, value) {
-        ("negate", InlineValue::Int(value)) => Ok(InlineValue::Int(-value)),
-        ("negate", InlineValue::Float(value)) => Ok(InlineValue::Float(-value)),
-        ("not", InlineValue::Bool(value)) => Ok(InlineValue::Bool(!value)),
+        ("negate", InlineValue::Int(v)) => Ok(InlineValue::Int(-v)),
+        ("negate", InlineValue::Float(v)) => Ok(InlineValue::Float(-v)),
+        ("not", InlineValue::Bool(v)) => Ok(InlineValue::Bool(!v)),
         ("negate", other) => Err(format!(
             "unary `-` is not defined for {}",
-            type_name(&other)
+            type_name(other)
         )),
         ("not", other) => Err(format!(
             "unary `!` is not defined for {}",
-            type_name(&other)
+            type_name(other)
         )),
         (name, _) => Err(format!("unsupported unary MIR op `{name}`")),
     }
 }
 
 fn eval_binary(name: &str, left: InlineValue, right: InlineValue) -> Result<InlineValue, String> {
+    eval_binary_impl(name, &left, &right)
+}
+
+fn eval_binary_ref(name: &str, left: &InlineValue, right: &InlineValue) -> Result<InlineValue, String> {
+    eval_binary_impl(name, left, right)
+}
+
+fn eval_binary_impl(name: &str, left: &InlineValue, right: &InlineValue) -> Result<InlineValue, String> {
     match (name, left, right) {
         ("add", InlineValue::Int(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Int(left + right))
+            Ok(InlineValue::Int(*left + *right))
         }
         ("subtract", InlineValue::Int(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Int(left - right))
+            Ok(InlineValue::Int(*left - *right))
         }
         ("multiply", InlineValue::Int(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Int(left * right))
+            Ok(InlineValue::Int(*left * *right))
         }
-        ("divide", InlineValue::Int(_), InlineValue::Int(0)) => {
+        ("divide", InlineValue::Int(_), InlineValue::Int(r)) if *r == 0 => {
             Err("integer division by zero".to_owned())
         }
-        ("remainder", InlineValue::Int(_), InlineValue::Int(0)) => {
+        ("remainder", InlineValue::Int(_), InlineValue::Int(r)) if *r == 0 => {
             Err("integer remainder by zero".to_owned())
         }
         ("divide", InlineValue::Int(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Int(left / right))
+            Ok(InlineValue::Int(*left / *right))
         }
         ("remainder", InlineValue::Int(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Int(left % right))
+            Ok(InlineValue::Int(*left % *right))
         }
         ("add", InlineValue::Float(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left + right))
+            Ok(InlineValue::Float(*left + *right))
         }
         ("subtract", InlineValue::Float(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left - right))
+            Ok(InlineValue::Float(*left - *right))
         }
         ("multiply", InlineValue::Float(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left * right))
+            Ok(InlineValue::Float(*left * *right))
         }
         ("divide", InlineValue::Float(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left / right))
+            Ok(InlineValue::Float(*left / *right))
         }
         ("remainder", InlineValue::Float(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left % right))
+            Ok(InlineValue::Float(*left % *right))
         }
         ("add", InlineValue::Int(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left as f64 + right))
+            Ok(InlineValue::Float(*left as f64 + *right))
         }
         ("subtract", InlineValue::Int(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left as f64 - right))
+            Ok(InlineValue::Float(*left as f64 - *right))
         }
         ("multiply", InlineValue::Int(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left as f64 * right))
+            Ok(InlineValue::Float(*left as f64 * *right))
         }
         ("divide", InlineValue::Int(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left as f64 / right))
+            Ok(InlineValue::Float(*left as f64 / *right))
         }
         ("remainder", InlineValue::Int(left), InlineValue::Float(right)) => {
-            Ok(InlineValue::Float(left as f64 % right))
+            Ok(InlineValue::Float(*left as f64 % *right))
         }
         ("add", InlineValue::Float(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Float(left + right as f64))
+            Ok(InlineValue::Float(*left + *right as f64))
         }
         ("subtract", InlineValue::Float(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Float(left - right as f64))
+            Ok(InlineValue::Float(*left - *right as f64))
         }
         ("multiply", InlineValue::Float(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Float(left * right as f64))
+            Ok(InlineValue::Float(*left * *right as f64))
         }
         ("divide", InlineValue::Float(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Float(left / right as f64))
+            Ok(InlineValue::Float(*left / *right as f64))
         }
         ("remainder", InlineValue::Float(left), InlineValue::Int(right)) => {
-            Ok(InlineValue::Float(left % right as f64))
+            Ok(InlineValue::Float(*left % *right as f64))
         }
         ("add", InlineValue::String(left), InlineValue::String(right)) => {
-            Ok(InlineValue::String(left + &right))
+            Ok(InlineValue::String(left.clone() + right))
         }
-        ("range", left, right) => expand_range(left, right, false),
-        ("range_inclusive", left, right) => expand_range(left, right, true),
+        ("range", left, right) => expand_range_ref(left, right, false),
+        ("range_inclusive", left, right) => expand_range_ref(left, right, true),
         ("equal", left, right) => Ok(InlineValue::Bool(left == right)),
         ("not_equal", left, right) => Ok(InlineValue::Bool(left != right)),
-        ("less", left, right) => compare_values(left, right, |ordering| ordering.is_lt()),
-        ("less_equal", left, right) => compare_values(left, right, |ordering| !ordering.is_gt()),
-        ("greater", left, right) => compare_values(left, right, |ordering| ordering.is_gt()),
-        ("greater_equal", left, right) => compare_values(left, right, |ordering| !ordering.is_lt()),
+        ("less", left, right) => compare_values_ref(left, right, |o| o.is_lt()),
+        ("less_equal", left, right) => compare_values_ref(left, right, |o| !o.is_gt()),
+        ("greater", left, right) => compare_values_ref(left, right, |o| o.is_gt()),
+        ("greater_equal", left, right) => compare_values_ref(left, right, |o| !o.is_lt()),
         (name, left, right) => Err(format!(
             "binary `{name}` is not defined for {} and {}",
             type_name(&left),
@@ -609,14 +716,22 @@ fn compare_values(
     right: InlineValue,
     predicate: impl FnOnce(std::cmp::Ordering) -> bool,
 ) -> Result<InlineValue, String> {
-    let ordering = match (&left, &right) {
-        (InlineValue::Int(left), InlineValue::Int(right)) => left.cmp(right),
-        (InlineValue::String(left), InlineValue::String(right)) => left.cmp(right),
+    compare_values_ref(&left, &right, predicate)
+}
+
+fn compare_values_ref(
+    left: &InlineValue,
+    right: &InlineValue,
+    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> Result<InlineValue, String> {
+    let ordering = match (left, right) {
+        (InlineValue::Int(l), InlineValue::Int(r)) => l.cmp(r),
+        (InlineValue::String(l), InlineValue::String(r)) => l.cmp(r),
         _ => {
             return Err(format!(
                 "comparison is not defined for {} and {}",
-                type_name(&left),
-                type_name(&right)
+                type_name(left),
+                type_name(right)
             ));
         }
     };
@@ -866,6 +981,14 @@ fn expand_range(
     inclusive: bool,
 ) -> Result<InlineValue, String> {
     Ok(InlineValue::Tuple(vec![start, end, InlineValue::Bool(inclusive)]))
+}
+
+fn expand_range_ref(
+    start: &InlineValue,
+    end: &InlineValue,
+    inclusive: bool,
+) -> Result<InlineValue, String> {
+    Ok(InlineValue::Tuple(vec![start.clone(), end.clone(), InlineValue::Bool(inclusive)]))
 }
 
 fn expand_iterable(value: &InlineValue) -> Result<Vec<InlineValue>, String> {

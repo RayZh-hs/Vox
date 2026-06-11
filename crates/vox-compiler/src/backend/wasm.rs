@@ -9,7 +9,7 @@ use wasm_encoder::{
 use vox_core::{
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOpKind, MirPathSegment,
-        MirProjection, MirTerminator, MirValueId, MirVersionId,
+        MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId, MirVersionId,
     },
     plan::WasmArtifact,
     types::VoxType,
@@ -80,6 +80,7 @@ struct Ctx {
     version_index: BTreeMap<MirVersionId, u32>,
     version_count: u32,
     version_to_binding_value: BTreeMap<MirVersionId, MirValueId>,
+    known_tags: BTreeMap<MirValueId, i32>,
 }
 
 impl Ctx {
@@ -95,6 +96,7 @@ impl Ctx {
             version_index: BTreeMap::new(),
             version_count: 0,
             version_to_binding_value: BTreeMap::new(),
+            known_tags: BTreeMap::new(),
         };
         ctx.init_for_body(body);
         ctx
@@ -153,6 +155,25 @@ impl Ctx {
         self.version_count = vidx;
 
         self.version_to_binding_value.clear();
+        self.known_tags.clear();
+
+        // Seed known tags from parameter types
+        for p in &body.parameters {
+            if let Some(ty) = body.values.iter().find(|v| v.id == *p).and_then(|v| v.ty.as_ref()) {
+                if let Some(tag) = primitive_tag_for_type(ty) {
+                    self.known_tags.insert(*p, tag);
+                }
+            }
+        }
+
+        // Seed known tags from literal values in the body
+        for v in &body.values {
+            if let MirValueDefinition::Literal = v.definition {
+                if let Some(tag) = literal_tag(v) {
+                    self.known_tags.insert(v.id, tag);
+                }
+            }
+        }
         for binding in &body.bindings {
             if let Some(first_version) = binding.versions.first() {
                 if let Some(bv) = body.versions.iter().find(|v| v.id == *first_version) {
@@ -880,15 +901,7 @@ fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
             } => {
                 let t_i = ctx.block_idx(*then_target);
                 let e_i = ctx.block_idx(*else_target);
-                f.instruction(&Instruction::LocalGet(ctx.tag_local(*condition)));
-                f.instruction(&Instruction::I32Const(TAG_BOOL));
-                f.instruction(&Instruction::I32Ne);
-                f.instruction(&Instruction::If(BlockType::Empty));
-                f.instruction(&Instruction::Unreachable);
-                f.instruction(&Instruction::End);
-                f.instruction(&Instruction::LocalGet(ctx.data_local(*condition)));
-                f.instruction(&Instruction::I64Const(0));
-                f.instruction(&Instruction::I64Ne);
+                emit_branch_condition(*condition, ctx, &mut f);
                 f.instruction(&Instruction::If(BlockType::Empty));
                 bind_block_args(body, *then_target, then_args, ctx, &mut f)?;
                 f.instruction(&Instruction::I32Const(t_i as i32));
@@ -925,6 +938,21 @@ fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
     f.instruction(&Instruction::End);
 
     Ok(f)
+}
+
+fn emit_branch_condition(condition: MirValueId, ctx: &mut Ctx, f: &mut Function) {
+    let check_needed = ctx.known_tags.get(&condition) != Some(&TAG_BOOL);
+    if check_needed {
+        local_get(f, ctx.tag_local(condition));
+        i32(f, TAG_BOOL);
+        f.instruction(&Instruction::I32Ne);
+        f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
+    }
+    local_get(f, ctx.data_local(condition));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64Ne);
 }
 
 fn bind_block_args(
@@ -976,6 +1004,9 @@ fn emit_op(
                     local_get(f, ctx.data_local(arg));
                     local_set(f, ctx.data_local(rid));
                 }
+                if let Some(&tag) = ctx.known_tags.get(&arg) {
+                    record_known_tag(ctx, rid, tag);
+                }
             }
         }
         MirOpKind::TypeRefine(_) => {
@@ -984,6 +1015,9 @@ fn emit_op(
                 local_set(f, ctx.tag_local(rid));
                 local_get(f, ctx.data_local(arg));
                 local_set(f, ctx.data_local(rid));
+                if let Some(&tag) = ctx.known_tags.get(&arg) {
+                    record_known_tag(ctx, rid, tag);
+                }
             }
         }
         MirOpKind::Bind(version) => {
@@ -999,6 +1033,9 @@ fn emit_op(
                     local_set(f, ctx.tag_local(binding_value_id));
                     local_get(f, ctx.data_local(value));
                     local_set(f, ctx.data_local(binding_value_id));
+                    if let Some(&tag) = ctx.known_tags.get(&value) {
+                        record_known_tag(ctx, binding_value_id, tag);
+                    }
                 }
             }
         }
@@ -1023,6 +1060,7 @@ fn emit_op(
         MirOpKind::Unary(name) => {
             if let (Some(rid), Some(&arg)) = (result, args.first()) {
                 emit_unary(name, arg, rid, ctx, f, body)?;
+                track_unary_result_tag(name, arg, rid, ctx, body);
             }
         }
         MirOpKind::Binary(name) => {
@@ -1043,6 +1081,7 @@ fn emit_op(
                 _ => {
                     if let (Some(rid), [left, right]) = (result, s) {
                         emit_binary(name, *left, *right, rid, ctx, f, body)?;
+                        track_binary_result_tag(name, *left, rid, ctx, body);
                     }
                 }
             }
@@ -1327,7 +1366,7 @@ fn eq_cmp(
     right: MirValueId,
     result: MirValueId,
     negate: bool,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     f: &mut Function,
     body: &MirBody,
 ) -> Result<(), String> {
@@ -1346,14 +1385,14 @@ fn eq_cmp(
     } else if left_ty != right_ty {
         i32(f, 0);
     } else if left_ty == WasmScalar::Float {
-        emit_tag_check(f, ctx, left, TAG_FLOAT);
-        emit_tag_check(f, ctx, right, TAG_FLOAT);
+        emit_tag_check_mut(f, ctx, left, TAG_FLOAT);
+        emit_tag_check_mut(f, ctx, right, TAG_FLOAT);
         emit_value_as_f64(f, ctx, left, left_ty);
         emit_value_as_f64(f, ctx, right, right_ty);
         f.instruction(&Instruction::F64Eq);
     } else {
-        emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
-        emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
+        emit_tag_check_mut(f, ctx, left, tag_for_scalar(left_ty)?);
+        emit_tag_check_mut(f, ctx, right, tag_for_scalar(right_ty)?);
         local_get(f, ctx.data_local(left));
         local_get(f, ctx.data_local(right));
         f.instruction(&Instruction::I64Eq);
@@ -1363,6 +1402,7 @@ fn eq_cmp(
     }
     i64_extend(f);
     local_set(f, ctx.data_local(result));
+    record_known_tag(ctx, result, TAG_BOOL);
     Ok(())
 }
 
@@ -1371,15 +1411,15 @@ fn cmp_op(
     right: MirValueId,
     result: MirValueId,
     op: &str,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     f: &mut Function,
     body: &MirBody,
 ) -> Result<(), String> {
     let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
     let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
     if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
-        emit_tag_check(f, ctx, left, TAG_INT);
-        emit_tag_check(f, ctx, right, TAG_INT);
+        emit_tag_check_mut(f, ctx, left, TAG_INT);
+        emit_tag_check_mut(f, ctx, right, TAG_INT);
         local_get(f, ctx.data_local(left));
         local_get(f, ctx.data_local(right));
         match op {
@@ -1390,8 +1430,8 @@ fn cmp_op(
             _ => f.instruction(&Instruction::Unreachable),
         };
     } else {
-        emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
-        emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
+        emit_tag_check_mut(f, ctx, left, tag_for_scalar(left_ty)?);
+        emit_tag_check_mut(f, ctx, right, tag_for_scalar(right_ty)?);
         emit_value_as_f64(f, ctx, left, left_ty);
         emit_value_as_f64(f, ctx, right, right_ty);
         match op {
@@ -1404,6 +1444,7 @@ fn cmp_op(
     }
     i64_extend(f);
     local_set(f, ctx.data_local(result));
+    record_known_tag(ctx, result, TAG_BOOL);
     Ok(())
 }
 
@@ -1419,6 +1460,27 @@ fn emit_numeric_binary(
     let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
     let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
     if matches!(name, "divide" | "remainder") {
+        if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
+            emit_tag_check(f, ctx, left, TAG_INT);
+            emit_tag_check(f, ctx, right, TAG_INT);
+            i32(f, TAG_INT);
+            local_set(f, ctx.tag_local(result));
+            record_known_tag(ctx, result, TAG_INT);
+            local_get(f, ctx.data_local(right));
+            f.instruction(&Instruction::I64Eqz);
+            f.instruction(&Instruction::If(BlockType::Empty));
+            f.instruction(&Instruction::Unreachable);
+            f.instruction(&Instruction::End);
+            local_get(f, ctx.data_local(left));
+            local_get(f, ctx.data_local(right));
+            if name == "divide" {
+                f.instruction(&Instruction::I64DivS);
+            } else {
+                f.instruction(&Instruction::I64RemS);
+            }
+            local_set(f, ctx.data_local(result));
+            return Ok(());
+        }
         return builtin_op_call(
             BuiltinOp::NumericChecked,
             &[left, right],
@@ -1429,10 +1491,11 @@ fn emit_numeric_binary(
         );
     }
     if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
-        emit_tag_check(f, ctx, left, TAG_INT);
-        emit_tag_check(f, ctx, right, TAG_INT);
+        emit_tag_check_mut(f, ctx, left, TAG_INT);
+        emit_tag_check_mut(f, ctx, right, TAG_INT);
         i32(f, TAG_INT);
         local_set(f, ctx.tag_local(result));
+        record_known_tag(ctx, result, TAG_INT);
         local_get(f, ctx.data_local(left));
         local_get(f, ctx.data_local(right));
         match name {
@@ -1477,12 +1540,96 @@ fn emit_value_as_f64(f: &mut Function, ctx: &Ctx, value: MirValueId, ty: WasmSca
 }
 
 fn emit_tag_check(f: &mut Function, ctx: &Ctx, value: MirValueId, expected: i32) {
+    if ctx.known_tags.get(&value) == Some(&expected) {
+        return;
+    }
     local_get(f, ctx.tag_local(value));
     i32(f, expected);
     f.instruction(&Instruction::I32Ne);
     f.instruction(&Instruction::If(BlockType::Empty));
     f.instruction(&Instruction::Unreachable);
     f.instruction(&Instruction::End);
+}
+
+fn emit_tag_check_mut(f: &mut Function, ctx: &mut Ctx, value: MirValueId, expected: i32) {
+    if ctx.known_tags.get(&value) == Some(&expected) {
+        return;
+    }
+    local_get(f, ctx.tag_local(value));
+    i32(f, expected);
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+}
+
+fn record_known_tag(ctx: &mut Ctx, value: MirValueId, tag: i32) {
+    ctx.known_tags.insert(value, tag);
+}
+
+fn primitive_tag_for_type(ty: &VoxType) -> Option<i32> {
+    match ty {
+        VoxType::Int => Some(TAG_INT),
+        VoxType::Float => Some(TAG_FLOAT),
+        VoxType::Bool => Some(TAG_BOOL),
+        VoxType::String => Some(TAG_STRING),
+        VoxType::OpaqueSurface(name) => match name.as_str() {
+            "Int" => Some(TAG_INT),
+            "Float" => Some(TAG_FLOAT),
+            "Bool" => Some(TAG_BOOL),
+            "String" => Some(TAG_STRING),
+            "Null" => Some(TAG_NULL),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn literal_tag(value: &MirValue) -> Option<i32> {
+    match &value.definition {
+        MirValueDefinition::Literal => {
+            match value.ty.as_ref() {
+                Some(VoxType::Int) => Some(TAG_INT),
+                Some(VoxType::OpaqueSurface(s)) if s == "Int" => Some(TAG_INT),
+                Some(VoxType::Float) => Some(TAG_FLOAT),
+                Some(VoxType::OpaqueSurface(s)) if s == "Float" => Some(TAG_FLOAT),
+                Some(VoxType::Bool) => Some(TAG_BOOL),
+                Some(VoxType::OpaqueSurface(s)) if s == "Bool" => Some(TAG_BOOL),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn track_binary_result_tag(name: &str, left: MirValueId, result: MirValueId, ctx: &mut Ctx, body: &MirBody) {
+    match name {
+        "less" | "greater" | "less_equal" | "greater_equal" | "equal" | "not_equal" => {
+            record_known_tag(ctx, result, TAG_BOOL);
+        }
+        "add" | "subtract" | "multiply" | "divide" | "remainder" => {
+            if let Some(WasmScalar::Int) = wasm_scalar_type(body, left) {
+                record_known_tag(ctx, result, TAG_INT);
+            } else if let Some(WasmScalar::Float) = wasm_scalar_type(body, left) {
+                record_known_tag(ctx, result, TAG_FLOAT);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn track_unary_result_tag(name: &str, arg: MirValueId, result: MirValueId, ctx: &mut Ctx, body: &MirBody) {
+    match name {
+        "negate" => {
+            if let Some(WasmScalar::Int) = wasm_scalar_type(body, arg) {
+                record_known_tag(ctx, result, TAG_INT);
+            } else if let Some(WasmScalar::Float) = wasm_scalar_type(body, arg) {
+                record_known_tag(ctx, result, TAG_FLOAT);
+            }
+        }
+        "not" => { record_known_tag(ctx, result, TAG_BOOL); }
+        _ => {}
+    }
 }
 
 fn tag_for_scalar(ty: WasmScalar) -> Result<i32, String> {
