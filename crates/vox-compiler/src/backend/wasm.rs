@@ -28,6 +28,7 @@ pub(crate) enum WasmLowering {
 const TAG_INT: i32 = 0;
 const TAG_FLOAT: i32 = 1;
 const TAG_BOOL: i32 = 2;
+const TAG_STRING: i32 = 3;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
 
@@ -53,6 +54,7 @@ enum BuiltinOp {
     EconNew = 12,
     NonNull = 13,
     SafeProject = 14,
+    StringBinary = 15,
 }
 
 struct Ctx {
@@ -285,7 +287,8 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
             other => Err(format!("unsupported unary op `{other}` in wasm")),
         },
         MirOpKind::Binary(name) => match name.as_str() {
-            "add" | "subtract" | "multiply" | "divide" => {
+            "add" => validate_add_op(body, args),
+            "subtract" | "multiply" | "divide" => {
                 require_numeric_args(body, args, 2, name, true).map(|_| ())
             }
             "remainder" => {
@@ -300,7 +303,7 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
                 }
             }
             "less" | "greater" | "less_equal" | "greater_equal" => {
-                require_numeric_args(body, args, 2, name, true).map(|_| ())
+                validate_order_op(body, args, name)
             }
             "equal" | "not_equal" => {
                 if args.len() != 2 {
@@ -311,7 +314,10 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
                 let right = wasm_scalar_type(body, args[1])
                     .ok_or_else(|| format!("binary op `{name}` has unsupported right operand"))?;
                 if left == right
-                    && matches!(left, WasmScalar::Int | WasmScalar::Float | WasmScalar::Bool)
+                    && matches!(
+                        left,
+                        WasmScalar::Int | WasmScalar::Float | WasmScalar::Bool | WasmScalar::String
+                    )
                 {
                     Ok(())
                 } else {
@@ -372,6 +378,46 @@ fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
         InlineValue::Handle(_) => {
             Err("Handle literals cannot be materialized by wasm yet".to_owned())
         }
+    }
+}
+
+fn validate_add_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("op `add` expected 2 args".to_owned());
+    }
+    let left = wasm_scalar_type(body, args[0])
+        .ok_or_else(|| "op `add` has unsupported left operand".to_owned())?;
+    let right = wasm_scalar_type(body, args[1])
+        .ok_or_else(|| "op `add` has unsupported right operand".to_owned())?;
+    if matches!(left, WasmScalar::String) || matches!(right, WasmScalar::String) {
+        if left == WasmScalar::String && right == WasmScalar::String {
+            Ok(())
+        } else {
+            Err("string add requires both operands to be String in wasm".to_owned())
+        }
+    } else {
+        require_numeric_args(body, args, 2, "add", true).map(|_| ())
+    }
+}
+
+fn validate_order_op(body: &MirBody, args: &[MirValueId], op: &str) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err(format!("op `{op}` expected 2 args"));
+    }
+    let left = wasm_scalar_type(body, args[0])
+        .ok_or_else(|| format!("op `{op}` has unsupported left operand"))?;
+    let right = wasm_scalar_type(body, args[1])
+        .ok_or_else(|| format!("op `{op}` has unsupported right operand"))?;
+    if left == WasmScalar::String || right == WasmScalar::String {
+        if left == WasmScalar::String && right == WasmScalar::String {
+            Ok(())
+        } else {
+            Err(format!(
+                "string comparison `{op}` requires both operands to be String in wasm"
+            ))
+        }
+    } else {
+        require_numeric_args(body, args, 2, op, true).map(|_| ())
     }
 }
 
@@ -466,6 +512,7 @@ enum WasmScalar {
     Int,
     Float,
     Bool,
+    String,
     Null,
 }
 
@@ -475,6 +522,7 @@ impl WasmScalar {
             Self::Int => "Int",
             Self::Float => "Float",
             Self::Bool => "Bool",
+            Self::String => "String",
             Self::Null => "Null",
         }
     }
@@ -554,6 +602,7 @@ fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
         Some(VoxType::Int) => Some(WasmScalar::Int),
         Some(VoxType::Float) => Some(WasmScalar::Float),
         Some(VoxType::Bool) => Some(WasmScalar::Bool),
+        Some(VoxType::String) => Some(WasmScalar::String),
         None => Some(WasmScalar::Null),
         _ => None,
     }
@@ -1027,10 +1076,34 @@ fn emit_binary(
     left: MirValueId,
     right: MirValueId,
     result: MirValueId,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     f: &mut Function,
     body: &MirBody,
 ) -> Result<(), String> {
+    let left_ty = wasm_scalar_type(body, left);
+    let right_ty = wasm_scalar_type(body, right);
+    if left_ty == Some(WasmScalar::String) || right_ty == Some(WasmScalar::String) {
+        if left_ty == Some(WasmScalar::String)
+            && right_ty == Some(WasmScalar::String)
+            && matches!(
+                name,
+                "add" | "equal" | "not_equal" | "less" | "greater" | "less_equal" | "greater_equal"
+            )
+        {
+            return builtin_op_call(
+                BuiltinOp::StringBinary,
+                &[left, right],
+                &[name.as_bytes().to_vec()],
+                result,
+                ctx,
+                f,
+            );
+        }
+        return Err(format!(
+            "binary `{name}` is not supported for String and non-String in wasm"
+        ));
+    }
+
     let cmp = [
         "equal",
         "not_equal",
@@ -1195,7 +1268,7 @@ fn emit_value_as_f64(f: &mut Function, ctx: &Ctx, value: MirValueId, ty: WasmSca
         WasmScalar::Float => {
             f.instruction(&Instruction::F64ReinterpretI64);
         }
-        WasmScalar::Bool | WasmScalar::Null => {
+        WasmScalar::Bool | WasmScalar::String | WasmScalar::Null => {
             f.instruction(&Instruction::Unreachable);
         }
     }
@@ -1215,6 +1288,7 @@ fn tag_for_scalar(ty: WasmScalar) -> Result<i32, String> {
         WasmScalar::Int => Ok(TAG_INT),
         WasmScalar::Float => Ok(TAG_FLOAT),
         WasmScalar::Bool => Ok(TAG_BOOL),
+        WasmScalar::String => Ok(TAG_STRING),
         WasmScalar::Null => Ok(TAG_NULL),
     }
 }

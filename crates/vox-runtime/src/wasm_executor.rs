@@ -214,6 +214,7 @@ fn handle_builtin_op(
         12 => builtin_econ_new(runtime, &args),
         13 => builtin_non_null(&args),
         14 => builtin_safe_project(runtime, &args, &extra),
+        15 => builtin_string_binary(runtime, &args, &extra),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -361,6 +362,34 @@ fn builtin_string_interpolate(
     };
     let handle = runtime.allocate_serializable_handle(summary, HandleData::String(out));
     Ok((TAG_STRING, handle.0 as i64))
+}
+
+fn builtin_string_binary(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if args.len() != 2 || extra.is_empty() {
+        return Err("StringBinary expects two args and an op name".to_owned());
+    }
+    let op = std::str::from_utf8(&extra[0])
+        .map_err(|error| format!("invalid StringBinary op name: {error}"))?;
+    let left = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    let right = wasm_to_data(runtime, args[1].0, args[1].1)?;
+    let (HandleData::String(left), HandleData::String(right)) = (left, right) else {
+        return Err("StringBinary operands must be String".to_owned());
+    };
+
+    match op {
+        "add" => handle_data_result_to_wasm(runtime, HandleData::String(format!("{left}{right}"))),
+        "equal" => Ok((TAG_BOOL, (left == right) as i64)),
+        "not_equal" => Ok((TAG_BOOL, (left != right) as i64)),
+        "less" => Ok((TAG_BOOL, (left < right) as i64)),
+        "greater" => Ok((TAG_BOOL, (left > right) as i64)),
+        "less_equal" => Ok((TAG_BOOL, (left <= right) as i64)),
+        "greater_equal" => Ok((TAG_BOOL, (left >= right) as i64)),
+        other => Err(format!("unsupported StringBinary op `{other}`")),
+    }
 }
 
 fn builtin_project(
