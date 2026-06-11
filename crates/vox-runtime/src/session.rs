@@ -16,7 +16,7 @@ use vox_core::{
     ids::{ArtifactId, HandleId, SessionId},
     opt::OptimizationLevel,
     source::{ModuleKind, SourceText},
-    value::{HandleData, HandleSummary, RuntimeValue},
+    value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
 use crate::{
@@ -28,6 +28,7 @@ use crate::{
 
 const REPL_MODULE: &str = "repl.session";
 const LAST_VALUE_NAME: &str = "__repl_last";
+const CAPTURE_RESULT_FIELD: &str = "__vox_repl_result";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionCompletion {
@@ -192,7 +193,7 @@ impl<R: RuntimeRunner> SessionState<R> {
         self.enforce_incremental_redefinition_policy(&parsed.items)?;
         self.remove_live_bindings_for_items(&parsed.items)?;
 
-        let candidate_items = merge_items(&self.items, parsed.items.clone());
+        let mut candidate_items = merge_items(&self.items, parsed.items.clone());
         let items_changed = candidate_items != self.items;
         let source = self.synthetic_source(
             &candidate_items,
@@ -214,7 +215,28 @@ impl<R: RuntimeRunner> SessionState<R> {
         self.validate_environment(&frontend.syntax)?;
 
         let value = if parsed.result_source.is_some() {
-            let value = self.evaluate_script_source(&source)?;
+            let mutable_names = if has_statement_items(&candidate_items) {
+                Vec::new()
+            } else {
+                mutable_value_names(&candidate_items)
+            };
+            let (value, captured_bindings) = if mutable_names.is_empty() {
+                (self.evaluate_script_source(&source)?, BTreeMap::new())
+            } else {
+                let capture_source = self.synthetic_capture_source(
+                    &candidate_items,
+                    if parsed.uses_last_value {
+                        self.hidden_last_item()
+                    } else {
+                        None
+                    },
+                    parsed.result_source.as_deref().unwrap_or_default(),
+                    &mutable_names,
+                );
+                let capture_value = self.evaluate_script_source(&capture_source)?;
+                unpack_capture_result(capture_value, &mutable_names)?
+            };
+            apply_captured_mutable_values(&mut candidate_items, captured_bindings);
             if items_changed {
                 self.clear_binding_handles()?;
             }
@@ -606,6 +628,35 @@ impl<R: RuntimeRunner> SessionState<R> {
         result: Option<&str>,
     ) -> String {
         render_session_source(&self.live_bindings, items, hidden_last, result)
+    }
+
+    fn synthetic_capture_source(
+        &self,
+        items: &[StoredItem],
+        hidden_last: Option<&StoredItem>,
+        result: &str,
+        mutable_names: &[String],
+    ) -> String {
+        let result_field = capture_result_field(mutable_names);
+        let mut source = render_session_source(&self.live_bindings, items, hidden_last, None);
+        source.push_str("{\n");
+        source.push_str("val ");
+        source.push_str(&result_field);
+        source.push_str(" = ");
+        source.push_str(result);
+        source.push_str(";\n{ ");
+        source.push_str(&result_field);
+        source.push_str(" = ");
+        source.push_str(&result_field);
+        source.push_str(", ");
+        for name in mutable_names {
+            source.push_str(name);
+            source.push_str(" = ");
+            source.push_str(name);
+            source.push_str(", ");
+        }
+        source.push_str("}\n}\n");
+        source
     }
 
     fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, SessionError> {
@@ -1201,6 +1252,123 @@ fn snapshot_items(
 
 fn find_hidden_last(items: &[StoredItem]) -> Option<&StoredItem> {
     items.iter().find(|item| item.is_hidden_last())
+}
+
+fn mutable_value_names(items: &[StoredItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match &item.key {
+            StoredItemKey::Value { name } if item.source.trim_start().starts_with("var ") => {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn has_statement_items(items: &[StoredItem]) -> bool {
+    items
+        .iter()
+        .any(|item| matches!(item.key, StoredItemKey::Statement))
+}
+
+fn capture_result_field(mutable_names: &[String]) -> String {
+    if !mutable_names
+        .iter()
+        .any(|name| name == CAPTURE_RESULT_FIELD)
+    {
+        return CAPTURE_RESULT_FIELD.to_owned();
+    }
+
+    let mut index = 0usize;
+    loop {
+        let candidate = format!("{CAPTURE_RESULT_FIELD}_{index}");
+        if !mutable_names.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn unpack_capture_result(
+    value: RuntimeValue,
+    mutable_names: &[String],
+) -> Result<(RuntimeValue, BTreeMap<String, RuntimeValue>), SessionError> {
+    let result_field = capture_result_field(mutable_names);
+    let RuntimeValue::Inline(InlineValue::Record(mut fields)) = value else {
+        return Err(SessionError::Message(
+            "internal REPL capture did not produce a record".to_owned(),
+        ));
+    };
+
+    let Some(result) = fields.remove(&result_field) else {
+        return Err(SessionError::Message(
+            "internal REPL capture did not include the result value".to_owned(),
+        ));
+    };
+
+    let captured = mutable_names
+        .iter()
+        .filter_map(|name| {
+            fields
+                .remove(name)
+                .map(|value| (name.clone(), runtime_value_from_inline_capture(value)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    Ok((runtime_value_from_inline_capture(result), captured))
+}
+
+fn runtime_value_from_inline_capture(value: InlineValue) -> RuntimeValue {
+    match value {
+        InlineValue::Handle(handle) => RuntimeValue::Handle(handle),
+        other => RuntimeValue::Inline(other),
+    }
+}
+
+fn apply_captured_mutable_values(
+    items: &mut [StoredItem],
+    captured: BTreeMap<String, RuntimeValue>,
+) {
+    if captured.is_empty() {
+        return;
+    }
+
+    for item in items {
+        let StoredItemKey::Value { name } = &item.key else {
+            continue;
+        };
+        let Some(value) = captured.get(name) else {
+            continue;
+        };
+        let Some(source) = render_runtime_value_source(value) else {
+            continue;
+        };
+        if item.source.trim_start().starts_with("var ") {
+            item.source = format!("var {name} = {source};");
+        }
+    }
+}
+
+fn render_runtime_value_source(value: &RuntimeValue) -> Option<String> {
+    match value {
+        RuntimeValue::Inline(value) if inline_value_is_source_literal(value) => {
+            Some(render_inline_value_source(value))
+        }
+        RuntimeValue::Inline(_) | RuntimeValue::Handle(_) => None,
+    }
+}
+
+fn inline_value_is_source_literal(value: &InlineValue) -> bool {
+    match value {
+        InlineValue::Int(_)
+        | InlineValue::Float(_)
+        | InlineValue::Bool(_)
+        | InlineValue::String(_)
+        | InlineValue::Null => true,
+        InlineValue::Tuple(values) => values.iter().all(inline_value_is_source_literal),
+        InlineValue::Record(fields) => fields.values().all(inline_value_is_source_literal),
+        InlineValue::Handle(_) => false,
+    }
 }
 
 fn render_session_source(

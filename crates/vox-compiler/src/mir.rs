@@ -1066,6 +1066,25 @@ impl BodyBuilder {
             self.terminate_with_panic(format!("cannot assign to immutable binding `{name}`"));
             return;
         }
+
+        if !self.loop_stack.is_empty() {
+            let is_outer_binding = self
+                .bindings
+                .iter()
+                .find(|b| b.id == previous.binding)
+                .map_or(false, |b| (b.scope_depth as usize) < self.scopes.len() - 1);
+            if is_outer_binding {
+                self.set_value_version(value, previous.version);
+                self.emit_op_with_result(
+                    None,
+                    MirOpKind::Bind(previous.version),
+                    vec![value],
+                    None,
+                );
+                return;
+            }
+        }
+
         let version_id = self.new_version(previous.binding, value, source);
         if let Some(binding) = self
             .bindings
@@ -1436,10 +1455,34 @@ pub(crate) fn propagate_copies(module: &mut MirModule) -> MirPassReport {
     let mut rewrites = 0;
     let mut removed = 0;
     for body in &mut module.bodies {
+        let mut rebound_versions: BTreeSet<MirVersionId> = BTreeSet::new();
+        {
+            let mut version_bind_blocks: BTreeMap<MirVersionId, BTreeSet<MirBlockId>> =
+                BTreeMap::new();
+            for block in &body.blocks {
+                for op in &block.ops {
+                    if let MirOpKind::Bind(version) = op.kind {
+                        version_bind_blocks
+                            .entry(version)
+                            .or_default()
+                            .insert(block.id);
+                    }
+                }
+            }
+            for (version, blocks) in &version_bind_blocks {
+                if blocks.len() > 1 {
+                    rebound_versions.insert(*version);
+                }
+            }
+        }
+
         let mut aliases = BTreeMap::<MirValueId, MirValueId>::new();
         for block in &body.blocks {
             for op in &block.ops {
-                if matches!(op.kind, MirOpKind::Use(_)) {
+                if let MirOpKind::Use(version) = op.kind {
+                    if rebound_versions.contains(&version) {
+                        continue;
+                    }
                     if let (Some(result), [source]) = (op.result, op.args.as_slice()) {
                         if result != *source {
                             aliases.insert(result, *source);

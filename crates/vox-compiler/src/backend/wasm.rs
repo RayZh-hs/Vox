@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, DataSegment, DataSegmentMode, EntityType,
@@ -9,7 +9,7 @@ use wasm_encoder::{
 use vox_core::{
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOpKind, MirPathSegment,
-        MirProjection, MirTerminator, MirValueId,
+        MirProjection, MirTerminator, MirValueId, MirVersionId,
     },
     plan::WasmArtifact,
     types::VoxType,
@@ -77,6 +77,8 @@ struct Ctx {
     string_offsets: BTreeMap<Vec<u8>, u32>,
     temp_count: u32,
     func_map: BTreeMap<String, u32>,
+    version_index: BTreeMap<MirVersionId, u32>,
+    version_count: u32,
 }
 
 impl Ctx {
@@ -89,6 +91,8 @@ impl Ctx {
             string_offsets: BTreeMap::new(),
             temp_count: 0,
             func_map: BTreeMap::new(),
+            version_index: BTreeMap::new(),
+            version_count: 0,
         };
         ctx.init_for_body(body);
         ctx
@@ -99,6 +103,8 @@ impl Ctx {
         self.value_index.clear();
         self.block_index.clear();
         self.temp_count = 0;
+        self.version_index.clear();
+        self.version_count = 0;
 
         for (i, p) in body.parameters.iter().enumerate() {
             self.parameter_index.insert(*p, i as u32);
@@ -117,6 +123,32 @@ impl Ctx {
         for (i, b) in body.blocks.iter().enumerate() {
             self.block_index.insert(b.id, i as u32);
         }
+
+        let mut version_bind_blocks: BTreeMap<MirVersionId, BTreeSet<MirBlockId>> =
+            BTreeMap::new();
+        for block in &body.blocks {
+            for op in &block.ops {
+                if let MirOpKind::Bind(version) = op.kind {
+                    version_bind_blocks
+                        .entry(version)
+                        .or_default()
+                        .insert(block.id);
+                }
+            }
+        }
+        let mut rebound_versions: BTreeSet<MirVersionId> = BTreeSet::new();
+        for (version, blocks) in &version_bind_blocks {
+            if blocks.len() > 1 {
+                rebound_versions.insert(*version);
+            }
+        }
+
+        let mut vidx = 0u32;
+        for version in &rebound_versions {
+            self.version_index.insert(*version, vidx);
+            vidx += 1;
+        }
+        self.version_count = vidx;
     }
 
     fn intern_string(&mut self, s: &[u8]) -> u32 {
@@ -155,20 +187,30 @@ impl Ctx {
         self.parameter_index.len() as u32 * 2
     }
 
+    fn version_tag_local(&self, version: MirVersionId) -> u32 {
+        let idx = self.version_index.get(&version).copied().unwrap_or(0);
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + idx * 2
+    }
+
+    fn version_data_local(&self, version: MirVersionId) -> u32 {
+        let idx = self.version_index.get(&version).copied().unwrap_or(0);
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + idx * 2 + 1
+    }
+
     fn total_locals(&self) -> u32 {
-        self.num_value_locals() + self.temp_count * 2 + 3
+        self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 3
     }
 
     fn block_id_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2
     }
 
     fn result_tag_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + 1
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 1
     }
 
     fn result_data_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + 2
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 2
     }
 
     fn block_idx(&self, id: MirBlockId) -> usize {
@@ -895,7 +937,22 @@ fn emit_op(
                 emit_tuple_new(&[], rid, ctx, f)?;
             }
         }
-        MirOpKind::Use(_) | MirOpKind::TypeRefine(_) => {
+        MirOpKind::Use(version) => {
+            if let (Some(rid), Some(&arg)) = (result, args.first()) {
+                if ctx.version_index.contains_key(version) {
+                    local_get(f, ctx.version_tag_local(*version));
+                    local_set(f, ctx.tag_local(rid));
+                    local_get(f, ctx.version_data_local(*version));
+                    local_set(f, ctx.data_local(rid));
+                } else {
+                    local_get(f, ctx.tag_local(arg));
+                    local_set(f, ctx.tag_local(rid));
+                    local_get(f, ctx.data_local(arg));
+                    local_set(f, ctx.data_local(rid));
+                }
+            }
+        }
+        MirOpKind::TypeRefine(_) => {
             if let (Some(rid), Some(&arg)) = (result, args.first()) {
                 local_get(f, ctx.tag_local(arg));
                 local_set(f, ctx.tag_local(rid));
@@ -903,7 +960,17 @@ fn emit_op(
                 local_set(f, ctx.data_local(rid));
             }
         }
-        MirOpKind::Bind(_) | MirOpKind::CacheGet(_) | MirOpKind::CachePut(_) | MirOpKind::Drop => {}
+        MirOpKind::Bind(version) => {
+            if let Some(&value) = args.first() {
+                if ctx.version_index.contains_key(version) {
+                    local_get(f, ctx.tag_local(value));
+                    local_set(f, ctx.version_tag_local(*version));
+                    local_get(f, ctx.data_local(value));
+                    local_set(f, ctx.version_data_local(*version));
+                }
+            }
+        }
+        MirOpKind::CacheGet(_) | MirOpKind::CachePut(_) | MirOpKind::Drop => {}
         MirOpKind::NonNull => {
             if let (Some(rid), Some(&arg)) = (result, args.first()) {
                 builtin_op_call(BuiltinOp::NonNull, &[arg], &[], rid, ctx, f)?;
