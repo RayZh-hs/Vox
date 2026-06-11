@@ -79,6 +79,7 @@ struct Ctx {
     func_map: BTreeMap<String, u32>,
     version_index: BTreeMap<MirVersionId, u32>,
     version_count: u32,
+    version_to_binding_value: BTreeMap<MirVersionId, MirValueId>,
 }
 
 impl Ctx {
@@ -93,6 +94,7 @@ impl Ctx {
             func_map: BTreeMap::new(),
             version_index: BTreeMap::new(),
             version_count: 0,
+            version_to_binding_value: BTreeMap::new(),
         };
         ctx.init_for_body(body);
         ctx
@@ -149,6 +151,18 @@ impl Ctx {
             vidx += 1;
         }
         self.version_count = vidx;
+
+        self.version_to_binding_value.clear();
+        for binding in &body.bindings {
+            if let Some(first_version) = binding.versions.first() {
+                if let Some(bv) = body.versions.iter().find(|v| v.id == *first_version) {
+                    let identity_value = bv.value;
+                    for &version_id in &binding.versions {
+                        self.version_to_binding_value.insert(version_id, identity_value);
+                    }
+                }
+            }
+        }
     }
 
     fn intern_string(&mut self, s: &[u8]) -> u32 {
@@ -517,6 +531,7 @@ fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
         | InlineValue::Bool(_)
         | InlineValue::String(_)
         | InlineValue::Null => Ok(()),
+        InlineValue::Tuple(items) if items.is_empty() => Ok(()),
         InlineValue::Tuple(_) => Err("Tuple literals require handle-backed wasm data".to_owned()),
         InlineValue::Record(_) => Err("Record literals require handle-backed wasm data".to_owned()),
         InlineValue::Handle(_) => {
@@ -734,11 +749,15 @@ fn require_numeric_args(
 }
 
 fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
-    matches!(
-        ty,
-        None | Some(VoxType::Int | VoxType::Float | VoxType::Bool | VoxType::String)
-            | Some(VoxType::Tuple(_) | VoxType::Record(_) | VoxType::List(_))
-    )
+    match ty {
+        None => true,
+        Some(VoxType::Int | VoxType::Float | VoxType::Bool | VoxType::String) => true,
+        Some(VoxType::Tuple(_) | VoxType::Record(_) | VoxType::List(_)) => true,
+        Some(VoxType::OpaqueSurface(name)) => {
+            matches!(name.as_str(), "Int" | "Float" | "Bool" | "String" | "Null")
+        }
+        _ => false,
+    }
 }
 
 fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
@@ -747,6 +766,13 @@ fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
         Some(VoxType::Float) => Some(WasmScalar::Float),
         Some(VoxType::Bool) => Some(WasmScalar::Bool),
         Some(VoxType::String) => Some(WasmScalar::String),
+        Some(VoxType::OpaqueSurface(name)) => match name.as_str() {
+            "Int" => Some(WasmScalar::Int),
+            "Float" => Some(WasmScalar::Float),
+            "Bool" => Some(WasmScalar::Bool),
+            "String" => Some(WasmScalar::String),
+            _ => None,
+        },
         None => Some(WasmScalar::Null),
         _ => None,
     }
@@ -967,6 +993,12 @@ fn emit_op(
                     local_set(f, ctx.version_tag_local(*version));
                     local_get(f, ctx.data_local(value));
                     local_set(f, ctx.version_data_local(*version));
+                }
+                if let Some(&binding_value_id) = ctx.version_to_binding_value.get(version) {
+                    local_get(f, ctx.tag_local(value));
+                    local_set(f, ctx.tag_local(binding_value_id));
+                    local_get(f, ctx.data_local(value));
+                    local_set(f, ctx.data_local(binding_value_id));
                 }
             }
         }

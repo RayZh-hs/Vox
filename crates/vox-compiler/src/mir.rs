@@ -1152,11 +1152,17 @@ impl BodyBuilder {
         args: Vec<MirValueId>,
         span: Option<vox_core::diagnostics::TextSpan>,
     ) -> MirValueId {
+        let ty = match &kind {
+            MirOpKind::Literal(val) => Some(mir_type_from_literal(val)),
+            MirOpKind::Binary(name) => Some(mir_type_from_binary_op(name, &args, self)),
+            MirOpKind::Unary(name) => Some(mir_type_from_unary_op(name, &args, self)),
+            _ => None,
+        };
         let definition = match kind {
             MirOpKind::Literal(_) => MirValueDefinition::Literal,
             _ => MirValueDefinition::Op,
         };
-        let value = self.new_value(None, definition, span.clone());
+        let value = self.new_value(ty, definition, span.clone());
         self.emit_op_with_result(Some(value), kind, args, span);
         value
     }
@@ -1263,6 +1269,13 @@ impl BodyBuilder {
             storage: MirStorage::Fresh,
         });
         id
+    }
+
+    fn value_type(&self, id: MirValueId) -> Option<&VoxType> {
+        self.values
+            .iter()
+            .find(|v| v.id == id)
+            .and_then(|v| v.ty.as_ref())
     }
 
     fn new_version(
@@ -2125,5 +2138,47 @@ impl BodyBuilder {
             }
         }
         None
+    }
+}
+
+fn mir_type_from_literal(value: &InlineValue) -> VoxType {
+    match value {
+        InlineValue::Int(_) => VoxType::Int,
+        InlineValue::Float(_) => VoxType::Float,
+        InlineValue::Bool(_) => VoxType::Bool,
+        InlineValue::String(_) => VoxType::String,
+        InlineValue::Null => VoxType::opaque_surface("Null"),
+        InlineValue::Tuple(_) => VoxType::Tuple(Vec::new()),
+        InlineValue::Record(_) => VoxType::Record(Vec::new()),
+        InlineValue::Handle(_) => VoxType::opaque_surface("Handle"),
+    }
+}
+
+fn mir_type_from_binary_op(name: &str, args: &[MirValueId], body: &BodyBuilder) -> VoxType {
+    match name {
+        "less" | "greater" | "less_equal" | "greater_equal" | "equal" | "not_equal" => {
+            VoxType::Bool
+        }
+        "range" | "range_inclusive" => VoxType::Tuple(vec![VoxType::Int, VoxType::Int, VoxType::Bool]),
+        _ => {
+            if let Some(first) = args.first() {
+                body.value_type(*first).cloned().unwrap_or(VoxType::Int)
+            } else {
+                VoxType::Int
+            }
+        }
+    }
+}
+
+fn mir_type_from_unary_op(name: &str, args: &[MirValueId], body: &BodyBuilder) -> VoxType {
+    match name {
+        "not" => VoxType::Bool,
+        _ => {
+            if let Some(first) = args.first() {
+                body.value_type(*first).cloned().unwrap_or(VoxType::Int)
+            } else {
+                VoxType::Int
+            }
+        }
     }
 }

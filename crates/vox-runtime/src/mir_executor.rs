@@ -24,6 +24,7 @@ pub struct MirExecutor<'a> {
     module: &'a MirModule,
     values: BTreeMap<MirValueId, InlineValue>,
     versions: BTreeMap<MirVersionId, InlineValue>,
+    version_to_value: BTreeMap<MirVersionId, MirValueId>,
     iterators: BTreeMap<MirValueId, IteratorState>,
 }
 
@@ -34,6 +35,7 @@ impl<'a> MirExecutor<'a> {
             module,
             values: BTreeMap::new(),
             versions: BTreeMap::new(),
+            version_to_value: BTreeMap::new(),
             iterators: BTreeMap::new(),
         }
     }
@@ -61,7 +63,19 @@ impl<'a> MirExecutor<'a> {
     ) -> Result<InlineValue, String> {
         self.values.clear();
         self.versions.clear();
+        self.version_to_value.clear();
         self.iterators.clear();
+
+        for binding in &body.bindings {
+            if let Some(first_version) = binding.versions.first() {
+                if let Some(binding_version) = body.versions.iter().find(|v| v.id == *first_version) {
+                    let identity_value = binding_version.value;
+                    for &version_id in &binding.versions {
+                        self.version_to_value.insert(version_id, identity_value);
+                    }
+                }
+            }
+        }
 
         if arguments.len() > body.parameters.len() {
             return Err(format!(
@@ -93,13 +107,7 @@ impl<'a> MirExecutor<'a> {
             .first()
             .map(|block| block.id)
             .ok_or_else(|| "MIR body does not contain an entry block".to_owned())?;
-        let mut fuel = 100_000_u32;
         loop {
-            if fuel == 0 {
-                return Err("MIR execution exceeded the control-flow step limit".to_owned());
-            }
-            fuel -= 1;
-
             let block = block_by_id(body, current)?;
             for op in &block.ops {
                 self.eval_op(op)?;
@@ -176,6 +184,9 @@ impl<'a> MirExecutor<'a> {
                     .copied()
                     .ok_or_else(|| "bind op missing source value".to_owned())
                     .and_then(|value| self.value(value))?;
+                if let Some(&binding_value_id) = self.version_to_value.get(version) {
+                    self.values.insert(binding_value_id, value.clone());
+                }
                 self.versions.insert(*version, value);
                 None
             }
