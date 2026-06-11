@@ -900,11 +900,16 @@ impl BodyBuilder {
                 self.current = header;
                 let item =
                     self.emit_op(MirOpKind::IteratorNext, vec![iterator], span.clone());
+                let is_null = self.emit_op(
+                    MirOpKind::TypeTest("Null".to_owned()),
+                    vec![item],
+                    span.clone(),
+                );
                 self.terminate(MirTerminator::Branch {
-                    condition: item,
-                    then_target: body_block,
+                    condition: is_null,
+                    then_target: exit,
                     then_args: Vec::new(),
-                    else_target: exit,
+                    else_target: body_block,
                     else_args: Vec::new(),
                 });
 

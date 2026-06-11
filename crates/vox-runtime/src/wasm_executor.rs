@@ -24,6 +24,13 @@ const TAG_INVALID: i32 = -1;
 #[derive(Debug)]
 struct State {
     runtime: *mut Runtime,
+    iterators: BTreeMap<u64, WasmIteratorState>,
+}
+
+#[derive(Debug)]
+struct WasmIteratorState {
+    items: Vec<HandleData>,
+    position: usize,
 }
 
 pub fn try_wasm_execute(
@@ -40,6 +47,7 @@ pub fn try_wasm_execute(
         &engine,
         State {
             runtime: runtime_ptr,
+            iterators: BTreeMap::new(),
         },
     );
 
@@ -58,8 +66,15 @@ pub fn try_wasm_execute(
             let extra_count = params[4].unwrap_i32() as u32;
             let result_ptr = params[5].unwrap_i32() as u32;
 
-            let state = caller.data();
-            let runtime = unsafe { &mut *state.runtime };
+            let (runtime_ptr, iterators_ptr) = {
+                let state = caller.data_mut();
+                (
+                    state.runtime,
+                    &mut state.iterators as *mut BTreeMap<u64, WasmIteratorState>,
+                )
+            };
+            let runtime = unsafe { &mut *runtime_ptr };
+            let iterators = unsafe { &mut *iterators_ptr };
 
             let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
                 return Err(wasmtime::Error::msg(
@@ -71,6 +86,7 @@ pub fn try_wasm_execute(
                 let data = mem.data(&caller);
                 handle_builtin_op(
                     runtime,
+                    iterators,
                     op_id,
                     args_ptr,
                     arg_count,
@@ -173,6 +189,7 @@ fn write_result_slot(
 
 fn handle_builtin_op(
     runtime: &mut Runtime,
+    iterators: &mut BTreeMap<u64, WasmIteratorState>,
     op_id: i32,
     args_ptr: u32,
     arg_count: u32,
@@ -208,14 +225,15 @@ fn handle_builtin_op(
         6 => builtin_index(runtime, &args),
         7 => builtin_updated(runtime, &args, &extra),
         8 => builtin_type_test(runtime, &args, &extra),
-        9 => builtin_iterator(runtime),
-        10 => builtin_iterator_next(runtime),
+        9 => builtin_iterator(runtime, iterators, &args),
+        10 => builtin_iterator_next(runtime, iterators, &args),
         11 => builtin_lambda_new(runtime, &extra),
         12 => builtin_econ_new(runtime, &args),
         13 => builtin_non_null(&args),
         14 => builtin_safe_project(runtime, &args, &extra),
         15 => builtin_string_binary(runtime, &args, &extra),
         16 => builtin_numeric_checked(runtime, &args, &extra),
+        17 => builtin_range_new(runtime, &args, &extra),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -495,12 +513,138 @@ fn builtin_type_test(
     Ok((TAG_BOOL, result))
 }
 
-fn builtin_iterator(_runtime: &mut Runtime) -> Result<(i32, i64), String> {
-    Err("iterator not implemented".to_owned())
+fn builtin_iterator(
+    runtime: &mut Runtime,
+    iterators: &mut BTreeMap<u64, WasmIteratorState>,
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
+    if args.is_empty() {
+        return Err("Iterator missing argument".to_owned());
+    }
+    let iterable = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    let items = expand_wasm_iterable(&iterable)?;
+    let iterator_id = runtime
+        .allocate_serializable_handle(
+            HandleSummary {
+                type_name: "Iterator".to_owned(),
+                summary: format!("<iterator {} items>", items.len()),
+                bytes: None,
+            },
+            HandleData::Null,
+        )
+        .0;
+    iterators.insert(
+        iterator_id,
+        WasmIteratorState {
+            items,
+            position: 0,
+        },
+    );
+    Ok((TAG_HANDLE, iterator_id as i64))
 }
 
-fn builtin_iterator_next(_runtime: &mut Runtime) -> Result<(i32, i64), String> {
-    Err("iterator_next not implemented".to_owned())
+fn builtin_iterator_next(
+    runtime: &mut Runtime,
+    iterators: &mut BTreeMap<u64, WasmIteratorState>,
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
+    if args.is_empty() {
+        return Err("IteratorNext missing argument".to_owned());
+    }
+    let iterator_id = match wasm_to_inline(runtime, args[0].0, args[0].1)? {
+        InlineValue::Handle(handle) => handle.0,
+        _ => return Err("IteratorNext expects an iterator handle".to_owned()),
+    };
+    let state = iterators
+        .get_mut(&iterator_id)
+        .ok_or_else(|| format!("IteratorNext: unknown iterator {iterator_id}"))?;
+    if state.position < state.items.len() {
+        let item = state.items[state.position].clone();
+        state.position += 1;
+        handle_data_result_to_wasm(runtime, item)
+    } else {
+        Ok((TAG_NULL, 0))
+    }
+}
+
+fn builtin_range_new(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if extra.is_empty() {
+        return Err("RangeNew missing op name".to_owned());
+    }
+    let op = std::str::from_utf8(&extra[0])
+        .map_err(|error| format!("invalid RangeNew op name: {error}"))?;
+    let inclusive = op == "range_inclusive";
+    if args.is_empty() {
+        return Err("range requires at least one bound".to_owned());
+    }
+    let start = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let end = if args.len() >= 2 {
+        Some(wasm_to_inline(runtime, args[1].0, args[1].1)?)
+    } else {
+        None
+    };
+    let start_int = match start {
+        InlineValue::Int(v) => v,
+        _ => return Err("Range bounds must be Int".to_owned()),
+    };
+    let end_int = match &end {
+        Some(InlineValue::Int(v)) => *v,
+        Some(_) => return Err("Range bounds must be Int".to_owned()),
+        None => i64::MAX,
+    };
+    let summary_text = if let Some(InlineValue::Int(e)) = &end {
+        if inclusive {
+            format!("{start_int}..={e}")
+        } else {
+            format!("{start_int}..{e}")
+        }
+    } else {
+        format!("{start_int}..")
+    };
+    let summary = HandleSummary {
+        type_name: "Range".to_owned(),
+        summary: summary_text,
+        bytes: None,
+    };
+    let handle = runtime.allocate_serializable_handle(
+        summary,
+        HandleData::Tuple(vec![
+            HandleData::Int(start_int),
+            HandleData::Int(end_int),
+            HandleData::Bool(inclusive),
+        ]),
+    );
+    Ok((TAG_HANDLE, handle.0 as i64))
+}
+
+fn expand_wasm_iterable(data: &HandleData) -> Result<Vec<HandleData>, String> {
+    match data {
+        HandleData::List(items) => Ok(items.clone()),
+        HandleData::Tuple(items) if items.len() == 3 => {
+            if let (
+                HandleData::Int(start),
+                HandleData::Int(end),
+                HandleData::Bool(inclusive),
+            ) = (&items[0], &items[1], &items[2])
+            {
+                let end_bound = if *inclusive { *end + 1 } else { *end };
+                let count = (end_bound - *start).max(0) as usize;
+                Ok((0..count)
+                    .map(|i| HandleData::Int(*start + i as i64))
+                    .collect())
+            } else {
+                Err("range requires Int bounds".to_owned())
+            }
+        }
+        _ => Err(format!(
+            "iteration is not supported for {}",
+            handle_data_type_name(data)
+        )),
+    }
 }
 
 fn builtin_lambda_new(runtime: &mut Runtime, extra: &[Vec<u8>]) -> Result<(i32, i64), String> {

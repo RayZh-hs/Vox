@@ -14,11 +14,17 @@ use vox_core::{
 
 use crate::{HostCallArgument, Runtime};
 
+struct IteratorState {
+    items: Vec<InlineValue>,
+    position: usize,
+}
+
 pub struct MirExecutor<'a> {
     runtime: &'a mut Runtime,
     module: &'a MirModule,
     values: BTreeMap<MirValueId, InlineValue>,
     versions: BTreeMap<MirVersionId, InlineValue>,
+    iterators: BTreeMap<MirValueId, IteratorState>,
 }
 
 impl<'a> MirExecutor<'a> {
@@ -28,6 +34,7 @@ impl<'a> MirExecutor<'a> {
             module,
             values: BTreeMap::new(),
             versions: BTreeMap::new(),
+            iterators: BTreeMap::new(),
         }
     }
 
@@ -54,6 +61,7 @@ impl<'a> MirExecutor<'a> {
     ) -> Result<InlineValue, String> {
         self.values.clear();
         self.versions.clear();
+        self.iterators.clear();
 
         if arguments.len() > body.parameters.len() {
             return Err(format!(
@@ -238,7 +246,19 @@ impl<'a> MirExecutor<'a> {
             MirOpKind::CacheGet(_) => None,
             MirOpKind::CachePut(_) => None,
             MirOpKind::Drop => None,
-            MirOpKind::Iterator | MirOpKind::IteratorNext | MirOpKind::Unknown(_) => {
+            MirOpKind::Iterator => {
+                let rid = op
+                    .result
+                    .ok_or_else(|| "iterator op missing result".to_owned())?;
+                Some(self.eval_iterator(rid, &op.args)?)
+            }
+            MirOpKind::IteratorNext => {
+                let [iter] = op.args.as_slice() else {
+                    return Err("iterator_next expects one argument".to_owned());
+                };
+                Some(self.eval_iterator_next(*iter)?)
+            }
+            MirOpKind::Unknown(_) => {
                 return Err(format!("unsupported MIR op `{}`", op_kind_label(&op.kind)));
             }
         };
@@ -302,6 +322,31 @@ impl<'a> MirExecutor<'a> {
         }
 
         Err(format!("MIR call target `{callee}` is not executable yet"))
+    }
+
+    fn eval_iterator(&mut self, result: MirValueId, args: &[MirValueId]) -> Result<InlineValue, String> {
+        let [iterable] = args else {
+            return Err("iterator expects one argument".to_owned());
+        };
+        let iterable_value = self.value(*iterable)?;
+        let items = expand_iterable(&iterable_value)?;
+        self.iterators
+            .insert(result, IteratorState { items, position: 0 });
+        Ok(InlineValue::Tuple(Vec::new()))
+    }
+
+    fn eval_iterator_next(&mut self, iter: MirValueId) -> Result<InlineValue, String> {
+        let state = self
+            .iterators
+            .get_mut(&iter)
+            .ok_or_else(|| "iterator_next on unknown iterator".to_owned())?;
+        if state.position < state.items.len() {
+            let item = state.items[state.position].clone();
+            state.position += 1;
+            Ok(item)
+        } else {
+            Ok(InlineValue::Null)
+        }
     }
 
     fn materialize_list(&mut self, values: Vec<InlineValue>) -> InlineValue {
@@ -532,6 +577,8 @@ fn eval_binary(name: &str, left: InlineValue, right: InlineValue) -> Result<Inli
         ("add", InlineValue::String(left), InlineValue::String(right)) => {
             Ok(InlineValue::String(left + &right))
         }
+        ("range", left, right) => expand_range(left, right, false),
+        ("range_inclusive", left, right) => expand_range(left, right, true),
         ("equal", left, right) => Ok(InlineValue::Bool(left == right)),
         ("not_equal", left, right) => Ok(InlineValue::Bool(left != right)),
         ("less", left, right) => compare_values(left, right, |ordering| ordering.is_lt()),
@@ -799,5 +846,38 @@ fn op_kind_label(kind: &MirOpKind) -> &'static str {
         MirOpKind::CachePut(_) => "cache_put",
         MirOpKind::Drop => "drop",
         MirOpKind::Unknown(_) => "unknown",
+    }
+}
+
+fn expand_range(
+    start: InlineValue,
+    end: InlineValue,
+    inclusive: bool,
+) -> Result<InlineValue, String> {
+    Ok(InlineValue::Tuple(vec![start, end, InlineValue::Bool(inclusive)]))
+}
+
+fn expand_iterable(value: &InlineValue) -> Result<Vec<InlineValue>, String> {
+    match value {
+        InlineValue::Tuple(items) if items.len() == 3 => {
+            if let (InlineValue::Int(start), InlineValue::Int(end), InlineValue::Bool(inclusive)) =
+                (&items[0], &items[1], &items[2])
+            {
+                let end = if *inclusive { *end + 1 } else { *end };
+                let count = (end - *start).max(0) as usize;
+                Ok((0..count)
+                    .map(|i| InlineValue::Int(*start + i as i64))
+                    .collect())
+            } else {
+                Err("range requires Int bounds".to_owned())
+            }
+        }
+        InlineValue::Handle(_) => Err(
+            "Handle-backed iterables are not supported by the MIR executor yet".to_owned(),
+        ),
+        _ => Err(format!(
+            "iteration is not supported for {}",
+            type_name(value)
+        )),
     }
 }

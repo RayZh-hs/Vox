@@ -56,6 +56,7 @@ enum BuiltinOp {
     SafeProject = 14,
     StringBinary = 15,
     NumericChecked = 16,
+    RangeNew = 17,
 }
 
 struct Ctx {
@@ -64,34 +65,42 @@ struct Ctx {
     string_data: Vec<u8>,
     string_offsets: BTreeMap<Vec<u8>, u32>,
     temp_count: u32,
+    func_map: BTreeMap<String, u32>,
 }
 
 impl Ctx {
     fn new(body: &MirBody, _module: &MirModule) -> Self {
-        let mut value_index = BTreeMap::new();
+        let mut ctx = Self {
+            value_index: BTreeMap::new(),
+            block_index: BTreeMap::new(),
+            string_data: Vec::new(),
+            string_offsets: BTreeMap::new(),
+            temp_count: 0,
+            func_map: BTreeMap::new(),
+        };
+        ctx.init_for_body(body);
+        ctx
+    }
+
+    fn init_for_body(&mut self, body: &MirBody) {
+        self.value_index.clear();
+        self.block_index.clear();
+        self.temp_count = 0;
         let mut idx = 0u32;
         for v in &body.values {
-            if !value_index.contains_key(&v.id) {
-                value_index.insert(v.id, idx);
+            if !self.value_index.contains_key(&v.id) {
+                self.value_index.insert(v.id, idx);
                 idx += 1;
             }
         }
         for p in &body.parameters {
-            if !value_index.contains_key(p) {
-                value_index.insert(*p, idx);
+            if !self.value_index.contains_key(p) {
+                self.value_index.insert(*p, idx);
                 idx += 1;
             }
         }
-        let mut block_index = BTreeMap::new();
         for (i, b) in body.blocks.iter().enumerate() {
-            block_index.insert(b.id, i as u32);
-        }
-        Self {
-            value_index,
-            block_index,
-            string_data: Vec::new(),
-            string_offsets: BTreeMap::new(),
-            temp_count: 0,
+            self.block_index.insert(b.id, i as u32);
         }
     }
 
@@ -140,7 +149,7 @@ impl Ctx {
     }
 
     fn alloc_temp_value(&mut self) -> MirValueId {
-        let idx = self.num_value_locals() as u32 + self.temp_count as u32;
+        let idx = (self.num_value_locals() / 2) + self.temp_count;
         self.temp_count += 1;
         let id = MirValueId(100000 + idx);
         self.value_index.insert(id, idx);
@@ -150,23 +159,19 @@ impl Ctx {
 
 impl WasmBackend {
     pub(crate) fn lower(&self, module: &MirModule) -> WasmLowering {
-        let Some(body) = module
-            .bodies
-            .iter()
-            .find(|b| matches!(b.kind, MirBodyKind::ScriptEntry))
-        else {
-            return WasmLowering::Unsupported("missing script entry body".to_owned());
-        };
+        if module.bodies.is_empty() {
+            return WasmLowering::Unsupported("module has no MIR bodies".to_owned());
+        }
 
-        if let Err(reason) = validate_wasm_supported(module, body) {
+        if let Err(reason) = validate_wasm_supported(module) {
             return WasmLowering::Unsupported(reason);
         }
 
-        match lower_module(module, body) {
+        match lower_module(module) {
             Ok(bytes) => WasmLowering::Lowered(WasmArtifact {
                 bytes,
                 entry_export: "script_entry".to_owned(),
-                summary: "full script-entry wasm".to_owned(),
+                summary: format!("wasm: {} bodies", module.bodies.len()),
             }),
             Err(reason) => WasmLowering::Unsupported(reason),
         }
@@ -186,10 +191,8 @@ fn local_type_at(ctx: &Ctx, idx: u32) -> ValType {
     }
 }
 
-fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, String> {
-    let mut ctx = Ctx::new(entry_body, module);
-
-    let mut module = Module::new();
+fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
+    let mut wasm = Module::new();
 
     let mut types = wasm_encoder::TypeSection::new();
     types.ty().function([ValType::I32; 6], []);
@@ -197,7 +200,7 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
     types
         .ty()
         .function([ValType::I32], [ValType::I32, ValType::I64]);
-    module.section(&types);
+    wasm.section(&types);
 
     let mut imports = ImportSection::new();
     imports.import(
@@ -213,22 +216,42 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
     );
     imports.import("vox", "__vox_op", EntityType::Function(0));
     imports.import("vox", "__vox_host", EntityType::Function(1));
-    module.section(&imports);
+    wasm.section(&imports);
 
     let mut funcs = FunctionSection::new();
-    funcs.function(2);
-    module.section(&funcs);
+
+    let bodies: Vec<&MirBody> = module
+        .bodies
+        .iter()
+        .filter(|b| !b.blocks.is_empty())
+        .collect();
+
+    let mut func_map: BTreeMap<String, u32> = BTreeMap::new();
+    let mut func_index = 3u32;
+    for body in &bodies {
+        func_map.insert(body.name.clone(), func_index);
+        funcs.function(2);
+        func_index += 1;
+    }
+    wasm.section(&funcs);
 
     let mut exports = ExportSection::new();
-    exports.export("script_entry", ExportKind::Func, 2);
+    exports.export("script_entry", ExportKind::Func, 3);
     exports.export("memory", ExportKind::Memory, 0);
-    module.section(&exports);
+    wasm.section(&exports);
 
-    let body = emit_body(entry_body, &mut ctx)?;
+    let mut ctx = Ctx::new(bodies[0], module);
+    ctx.func_map = func_map;
 
     let mut codes = CodeSection::new();
-    codes.function(&body);
-    module.section(&codes);
+    for (i, body) in bodies.iter().enumerate() {
+        if i > 0 {
+            ctx.init_for_body(body);
+        }
+        let func = emit_body(body, &mut ctx)?;
+        codes.function(&func);
+    }
+    wasm.section(&codes);
 
     if !ctx.string_data.is_empty() {
         let mut data = DataSection::new();
@@ -240,34 +263,46 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
             data: ctx.string_data.clone(),
         };
         data.segment(seg);
-        module.section(&data);
+        wasm.section(&data);
     }
 
-    Ok(module.finish())
+    Ok(wasm.finish())
 }
 
-fn validate_wasm_supported(module: &MirModule, body: &MirBody) -> Result<(), String> {
-    if module.bodies.iter().any(|candidate| {
-        !matches!(candidate.kind, MirBodyKind::ScriptEntry) && !candidate.blocks.is_empty()
-    }) {
-        return Err("non-script MIR bodies are not emitted as wasm yet".to_owned());
+fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
+    let bodies: Vec<&MirBody> = module
+        .bodies
+        .iter()
+        .filter(|b| !b.blocks.is_empty())
+        .collect();
+
+    if bodies.is_empty() {
+        return Err("module has no executable MIR bodies".to_owned());
     }
 
-    for value in &body.values {
-        if !is_supported_wasm_value_type(value.ty.as_ref()) {
-            return Err(format!(
-                "value %{} has unsupported wasm type {}",
-                value.id.0,
-                render_mir_type(value.ty.as_ref())
-            ));
-        }
+    let has_entry = bodies
+        .iter()
+        .any(|b| matches!(b.kind, MirBodyKind::ScriptEntry));
+    if !has_entry {
+        return Err("module must have a ScriptEntry body for wasm".to_owned());
     }
 
-    for block in &body.blocks {
-        for op in &block.ops {
-            validate_wasm_op(body, &op.kind, &op.args)?;
+    for body in &bodies {
+        for value in &body.values {
+            if !is_supported_wasm_value_type(value.ty.as_ref()) {
+                return Err(format!(
+                    "value %{} has unsupported wasm type {}",
+                    value.id.0,
+                    render_mir_type(value.ty.as_ref())
+                ));
+            }
         }
-        validate_wasm_terminator(body, &block.terminator)?;
+        for block in &body.blocks {
+            for op in &block.ops {
+                validate_wasm_op(body, &op.kind, &op.args)?;
+            }
+            validate_wasm_terminator(body, &block.terminator)?;
+        }
     }
 
     Ok(())
@@ -307,7 +342,11 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
                 if left == right
                     && matches!(
                         left,
-                        WasmScalar::Int | WasmScalar::Float | WasmScalar::Bool | WasmScalar::String
+                        WasmScalar::Int
+                            | WasmScalar::Float
+                            | WasmScalar::Bool
+                            | WasmScalar::String
+                            | WasmScalar::Null
                     )
                 {
                     Ok(())
@@ -318,6 +357,13 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
                         right.as_str()
                     ))
                 }
+            }
+            "range" | "range_inclusive" => {
+                let count = args.len();
+                if count > 2 {
+                    return Err(format!("binary op `{name}` expects at most 2 args"));
+                }
+                require_numeric_args(body, args, count, name, false).map(|_| ())
             }
             other => Err(format!("unsupported binary op `{other}` in wasm")),
         },
@@ -330,14 +376,9 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
         MirOpKind::SafeProject(_) => validate_record_like_arg(body, args, "SafeProject"),
         MirOpKind::Index => validate_index_op(body, args),
         MirOpKind::Updated { .. } => validate_updated_op(body, args),
-        MirOpKind::Call { .. }
-        | MirOpKind::Lambda { .. }
-        | MirOpKind::Econ { .. }
-        | MirOpKind::Iterator
-        | MirOpKind::IteratorNext => Err(format!(
-            "MIR op `{}` is not implemented by the wasm backend yet",
-            mir_op_name(kind)
-        )),
+        MirOpKind::Call { .. } => Ok(()),
+        MirOpKind::Lambda { .. } | MirOpKind::Econ { .. } => Ok(()),
+        MirOpKind::Iterator | MirOpKind::IteratorNext => Ok(()),
         MirOpKind::Unknown(_) => Err("unknown MIR op".to_owned()),
     }
 }
@@ -352,7 +393,7 @@ fn validate_wasm_terminator(body: &MirBody, terminator: &MirTerminator) -> Resul
                 Err("wasm branch conditions must be Bool".to_owned())
             }
         }
-        MirTerminator::Panic(_) => Err("panic terminators are not surfaced by wasm yet".to_owned()),
+        MirTerminator::Panic(_) => Ok(()),
         MirTerminator::Unreachable => Ok(()),
     }
 }
@@ -613,6 +654,7 @@ fn render_mir_type(ty: Option<&VoxType>) -> String {
     }
 }
 
+#[allow(dead_code)]
 fn mir_op_name(kind: &MirOpKind) -> &'static str {
     match kind {
         MirOpKind::Literal(_) => "Literal",
@@ -839,8 +881,24 @@ fn emit_op(
         }
         MirOpKind::Binary(name) => {
             let s: &[MirValueId] = args;
-            if let (Some(rid), [left, right]) = (result, s) {
-                emit_binary(name, *left, *right, rid, ctx, f, body)?;
+            match name.as_str() {
+                "range" | "range_inclusive" => {
+                    if let Some(rid) = result {
+                        builtin_op_call(
+                            BuiltinOp::RangeNew,
+                            s,
+                            &[name.as_bytes().to_vec()],
+                            rid,
+                            ctx,
+                            f,
+                        )?;
+                    }
+                }
+                _ => {
+                    if let (Some(rid), [left, right]) = (result, s) {
+                        emit_binary(name, *left, *right, rid, ctx, f, body)?;
+                    }
+                }
             }
         }
         MirOpKind::Tuple { .. } => {
@@ -911,7 +969,11 @@ fn emit_op(
         }
         MirOpKind::Call { callee, .. } => {
             if let Some(rid) = result {
-                emit_host_call(callee, args, rid, ctx, f)?;
+                if let Some(&target_func) = ctx.func_map.get(callee) {
+                    emit_vox_call(args, target_func, rid, ctx, f)?;
+                } else {
+                    emit_host_call(callee, args, rid, ctx, f)?;
+                }
             }
         }
         MirOpKind::Lambda { parameters } => {
@@ -1136,7 +1198,17 @@ fn eq_cmp(
 ) -> Result<(), String> {
     let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
     let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
-    if left_ty != right_ty {
+    if left_ty == WasmScalar::Null || right_ty == WasmScalar::Null {
+        local_get(f, ctx.tag_local(left));
+        i32(f, TAG_NULL);
+        if negate {
+            f.instruction(&Instruction::I32Ne);
+        } else {
+            f.instruction(&Instruction::I32Eq);
+        }
+        i64_extend(f);
+        local_set(f, ctx.data_local(result));
+    } else if left_ty != right_ty {
         i32(f, 0);
     } else if left_ty == WasmScalar::Float {
         emit_tag_check(f, ctx, left, TAG_FLOAT);
@@ -1377,6 +1449,36 @@ fn builtin_predicate(
     builtin_op_call(op, args, extra, result, ctx, f)?;
     i32(f, TAG_BOOL);
     local_set(f, ctx.tag_local(result));
+    Ok(())
+}
+
+fn emit_vox_call(
+    args: &[MirValueId],
+    target_func: u32,
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    for (i, arg) in args.iter().enumerate() {
+        i32(f, (SCRATCH_OFF + 4 + i as u32 * 16) as i32);
+        local_get(f, ctx.tag_local(*arg));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+        i32(f, (SCRATCH_OFF + 8 + i as u32 * 16) as i32);
+        local_get(f, ctx.data_local(*arg));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+    }
+    i32(f, SCRATCH_OFF as i32);
+    f.instruction(&Instruction::Call(target_func));
+    f.instruction(&Instruction::LocalSet(ctx.data_local(result)));
+    f.instruction(&Instruction::LocalSet(ctx.tag_local(result)));
     Ok(())
 }
 
