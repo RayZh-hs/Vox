@@ -990,6 +990,7 @@ moved.x + moved.y
         for xopt in [
             OptimizationLevel::NOpt,
             OptimizationLevel::IOpt,
+            OptimizationLevel::SOpt,
         ] {
             assert_runtime_int(
                 runtime
