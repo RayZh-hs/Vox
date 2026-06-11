@@ -132,7 +132,7 @@ pub fn try_wasm_execute(
 
     let mut scratch: u32 = 0;
     for arg in arguments {
-        let (tag, val) = to_wasm(arg);
+        let (tag, val) = to_wasm(runtime, arg)?;
         mem.write(&mut store, scratch as usize + 4, &tag.to_le_bytes())
             .map_err(|e| e.to_string())?;
         mem.write(&mut store, scratch as usize + 8, &val.to_le_bytes())
@@ -146,7 +146,7 @@ pub fn try_wasm_execute(
 
     let (result_tag, result_data) = entry.call(&mut store, 0i32).map_err(|e| e.to_string())?;
 
-    from_wasm(result_tag, result_data)
+    from_wasm(runtime, result_tag, result_data)
 }
 
 fn clear_result_slot(
@@ -240,7 +240,7 @@ fn handle_host_call(
         let ptr = args_ptr + i * 16;
         let tag = mem_read_i32(data, ptr)?;
         let val = mem_read_i64(data, ptr + 8)?;
-        arg_values.push(from_wasm(tag, val)?);
+        arg_values.push(from_wasm(runtime, tag, val)?);
     }
 
     let host_args: Vec<HostCallArgument> = arg_values
@@ -255,7 +255,7 @@ fn handle_host_call(
     if let Some((package, function)) = callee.rsplit_once('.') {
         let pkg = ModulePath::parse(package).map_err(|e| format!("bad package: {}", e.message))?;
         let result = runtime.invoke_host_function(&pkg, function, &host_args)?;
-        return Ok(to_wasm(&result));
+        return to_wasm(runtime, &result);
     }
 
     Err(format!("host call target not found: {callee}"))
@@ -560,27 +560,28 @@ fn builtin_safe_project(
     builtin_project(runtime, args, extra)
 }
 
-fn to_wasm(value: &RuntimeValue) -> (i32, i64) {
+fn to_wasm(runtime: &mut Runtime, value: &RuntimeValue) -> Result<(i32, i64), String> {
     match value {
-        RuntimeValue::Inline(iv) => inline_to_wasm(iv),
-        RuntimeValue::Handle(h) => (TAG_HANDLE, h.0 as i64),
+        RuntimeValue::Inline(iv) => inline_result_to_wasm(runtime, iv.clone()),
+        RuntimeValue::Handle(handle) => Ok(handle_to_wasm(runtime, *handle)),
     }
 }
 
-fn inline_to_wasm(value: &InlineValue) -> (i32, i64) {
-    match value {
-        InlineValue::Int(v) => (TAG_INT, *v),
-        InlineValue::Float(v) => (TAG_FLOAT, v.to_bits() as i64),
-        InlineValue::Bool(v) => (TAG_BOOL, *v as i64),
-        InlineValue::String(_) => (TAG_STRING, 0),
-        InlineValue::Tuple(_) => (TAG_TUPLE, 0),
-        InlineValue::Record(_) => (TAG_RECORD, 0),
-        InlineValue::Handle(h) => (TAG_HANDLE, h.0 as i64),
-        InlineValue::Null => (TAG_NULL, 0),
-    }
+fn handle_to_wasm(runtime: &Runtime, handle: HandleId) -> (i32, i64) {
+    let tag = match runtime
+        .describe_handle(handle)
+        .map(|summary| summary.type_name)
+    {
+        Some(type_name) if type_name == "String" || type_name.ends_with(".String") => TAG_STRING,
+        Some(type_name) if type_name == "Tuple" || type_name.ends_with(".Tuple") => TAG_TUPLE,
+        Some(type_name) if type_name == "Record" || type_name.ends_with(".Record") => TAG_RECORD,
+        Some(type_name) if type_name == "List" || type_name.ends_with(".List") => TAG_LIST,
+        _ => TAG_HANDLE,
+    };
+    (tag, handle.0 as i64)
 }
 
-fn from_wasm(tag: i32, val: i64) -> Result<RuntimeValue, String> {
+fn from_wasm(runtime: &Runtime, tag: i32, val: i64) -> Result<RuntimeValue, String> {
     match tag {
         TAG_INT => Ok(RuntimeValue::Inline(InlineValue::Int(val))),
         TAG_FLOAT => Ok(RuntimeValue::Inline(InlineValue::Float(f64::from_bits(
@@ -588,9 +589,14 @@ fn from_wasm(tag: i32, val: i64) -> Result<RuntimeValue, String> {
         )))),
         TAG_BOOL => Ok(RuntimeValue::Inline(InlineValue::Bool(val != 0))),
         TAG_NULL => Ok(RuntimeValue::Inline(InlineValue::Null)),
-        TAG_HANDLE | TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST => {
-            Ok(RuntimeValue::Handle(HandleId(val as u64)))
+        TAG_STRING | TAG_TUPLE | TAG_RECORD => {
+            let handle = HandleId(val as u64);
+            match runtime.get_handle_data(handle) {
+                Ok(data) => handle_data_to_inline(data).map(RuntimeValue::Inline),
+                Err(_) => Ok(RuntimeValue::Handle(handle)),
+            }
         }
+        TAG_HANDLE | TAG_LIST => Ok(RuntimeValue::Handle(HandleId(val as u64))),
         _ => Err(format!("unknown wasm result tag {tag}")),
     }
 }
