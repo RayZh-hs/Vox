@@ -20,6 +20,11 @@ const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
 const TAG_INVALID: i32 = -1;
+const STRDATA_OFF: i64 = 32768;
+const WASM_PAGE_SIZE: u32 = 65536;
+const HEAP_GUARD_BYTES: u32 = 4096;
+const HEAP_LIMIT: u32 = WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
+const MAX_MEMORY_VALUE_DEPTH: usize = 64;
 
 #[derive(Debug)]
 struct State {
@@ -145,24 +150,30 @@ pub fn try_wasm_execute(
     let mem = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| "memory export not found".to_owned())?;
+    let heap_top = instance
+        .get_global(&mut store, "__vox_heap_top")
+        .ok_or_else(|| "__vox_heap_top export not found".to_owned())?;
 
-    let mut scratch: u32 = 0;
+    let mut entry_args = Vec::with_capacity(arguments.len() * 2);
     for arg in arguments {
-        let (tag, val) = to_wasm(runtime, arg)?;
-        mem.write(&mut store, scratch as usize + 4, &tag.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        mem.write(&mut store, scratch as usize + 8, &val.to_le_bytes())
-            .map_err(|e| e.to_string())?;
-        scratch += 16;
+        let (tag, val) = to_wasm_entry(runtime, &mem, &heap_top, &mut store, arg)?;
+        entry_args.push(Val::I32(tag));
+        entry_args.push(Val::I64(val));
     }
 
     let entry = instance
-        .get_typed_func::<i32, (i32, i64)>(&mut store, "script_entry")
+        .get_func(&mut store, "script_entry")
+        .ok_or_else(|| "script_entry export not found".to_owned())?;
+    let mut results = [Val::I32(TAG_INVALID), Val::I64(0)];
+    entry
+        .call(&mut store, &entry_args, &mut results)
         .map_err(|e| e.to_string())?;
 
-    let (result_tag, result_data) = entry.call(&mut store, 0i32).map_err(|e| e.to_string())?;
+    let result_tag = results[0].unwrap_i32();
+    let result_data = results[1].unwrap_i64();
 
-    from_wasm(runtime, result_tag, result_data)
+    let data = mem.data(&store);
+    from_wasm(runtime, Some(data), result_tag, result_data)
 }
 
 fn clear_result_slot(
@@ -216,24 +227,25 @@ fn handle_builtin_op(
     }
 
     match op_id {
-        0 => builtin_tuple_new(runtime, &args),
-        1 => builtin_record_new(runtime, &args, &extra),
-        2 => builtin_list_new(runtime, &args),
+        0 => builtin_tuple_new(runtime, data, &args),
+        1 => builtin_record_new(runtime, data, &args, &extra),
+        2 => builtin_list_new(runtime, data, &args),
         3 => builtin_string_new(runtime, &extra),
-        4 => builtin_string_interpolate(runtime, &args, &extra),
-        5 => builtin_project(runtime, &args, &extra),
-        6 => builtin_index(runtime, &args),
-        7 => builtin_updated(runtime, &args, &extra),
-        8 => builtin_type_test(runtime, &args, &extra),
-        9 => builtin_iterator(runtime, iterators, &args),
-        10 => builtin_iterator_next(runtime, iterators, &args),
+        4 => builtin_string_interpolate(runtime, data, &args, &extra),
+        5 => builtin_project(runtime, data, &args, &extra),
+        6 => builtin_index(runtime, data, &args),
+        7 => builtin_updated(runtime, data, &args, &extra),
+        8 => builtin_type_test(runtime, data, &args, &extra),
+        9 => builtin_iterator(runtime, iterators, data, &args),
+        10 => builtin_iterator_next(runtime, iterators, data, &args),
         11 => builtin_lambda_new(runtime, &extra),
-        12 => builtin_econ_new(runtime, &args),
+        12 => builtin_econ_new(runtime, data, &args),
         13 => builtin_non_null(&args),
-        14 => builtin_safe_project(runtime, &args, &extra),
-        15 => builtin_string_binary(runtime, &args, &extra),
-        16 => builtin_numeric_checked(runtime, &args, &extra),
-        17 => builtin_range_new(runtime, &args, &extra),
+        14 => builtin_safe_project(runtime, data, &args, &extra),
+        15 => builtin_string_binary(runtime, data, &args, &extra),
+        16 => builtin_numeric_checked(runtime, data, &args, &extra),
+        17 => builtin_range_new(runtime, data, &args, &extra),
+        18 => Err("wasm heap exhausted before stack guard region".to_owned()),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -258,7 +270,7 @@ fn handle_host_call(
         let ptr = args_ptr + i * 16;
         let tag = mem_read_i32(data, ptr)?;
         let val = mem_read_i64(data, ptr + 8)?;
-        arg_values.push(from_wasm(runtime, tag, val)?);
+        arg_values.push(from_wasm(runtime, Some(data), tag, val)?);
     }
 
     let host_args: Vec<HostCallArgument> = arg_values
@@ -279,16 +291,21 @@ fn handle_host_call(
     Err(format!("host call target not found: {callee}"))
 }
 
-fn builtin_tuple_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+fn builtin_tuple_new(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, Some(memory), *t, *v))
         .collect::<Result<_, _>>()?;
     inline_result_to_wasm(runtime, InlineValue::Tuple(items))
 }
 
 fn builtin_record_new(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     names: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -301,7 +318,7 @@ fn builtin_record_new(
     }
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, Some(memory), *t, *v))
         .collect::<Result<_, _>>()?;
     let fields = names
         .iter()
@@ -313,10 +330,14 @@ fn builtin_record_new(
     inline_result_to_wasm(runtime, InlineValue::Record(fields))
 }
 
-fn builtin_list_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+fn builtin_list_new(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, Some(memory), *t, *v))
         .collect::<Result<_, _>>()?;
     let data = HandleData::List(
         items
@@ -356,6 +377,7 @@ fn builtin_string_new(runtime: &mut Runtime, extra: &[Vec<u8>]) -> Result<(i32, 
 
 fn builtin_string_interpolate(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     segments: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -368,7 +390,7 @@ fn builtin_string_interpolate(
         if i < text.len() {
             out.push_str(&text[i]);
         }
-        let v = wasm_to_inline(runtime, *tag, *val)?;
+        let v = wasm_to_inline(runtime, Some(memory), *tag, *val)?;
         out.push_str(&render_inline(&v));
     }
     if text.len() > args.len() {
@@ -385,6 +407,7 @@ fn builtin_string_interpolate(
 
 fn builtin_string_binary(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -393,8 +416,8 @@ fn builtin_string_binary(
     }
     let op = std::str::from_utf8(&extra[0])
         .map_err(|error| format!("invalid StringBinary op name: {error}"))?;
-    let left = wasm_to_data(runtime, args[0].0, args[0].1)?;
-    let right = wasm_to_data(runtime, args[1].0, args[1].1)?;
+    let left = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
+    let right = wasm_to_data(runtime, Some(memory), args[1].0, args[1].1)?;
     let (HandleData::String(left), HandleData::String(right)) = (left, right) else {
         return Err("StringBinary operands must be String".to_owned());
     };
@@ -413,6 +436,7 @@ fn builtin_string_binary(
 
 fn builtin_numeric_checked(
     runtime: &Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -421,8 +445,8 @@ fn builtin_numeric_checked(
     }
     let op = std::str::from_utf8(&extra[0])
         .map_err(|error| format!("invalid NumericChecked op name: {error}"))?;
-    let left = wasm_to_inline(runtime, args[0].0, args[0].1)?;
-    let right = wasm_to_inline(runtime, args[1].0, args[1].1)?;
+    let left = wasm_to_inline(runtime, Some(memory), args[0].0, args[0].1)?;
+    let right = wasm_to_inline(runtime, Some(memory), args[1].0, args[1].1)?;
     match (op, left, right) {
         ("divide", InlineValue::Int(_), InlineValue::Int(0)) => {
             Err("integer division by zero".to_owned())
@@ -462,42 +486,49 @@ fn builtin_numeric_checked(
 
 fn builtin_project(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
     if args.is_empty() || extra.is_empty() {
         return Err("Project missing args".to_owned());
     }
-    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let target = wasm_to_inline(runtime, Some(memory), args[0].0, args[0].1)?;
     let projection = parse_projection(&extra[0])?;
     inline_result_to_wasm(runtime, project_inline(target, &projection)?)
 }
 
-fn builtin_index(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+fn builtin_index(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
     if args.len() != 2 {
         return Err("Index expects target and index args".to_owned());
     }
-    let index = wasm_to_inline(runtime, args[1].0, args[1].1)?;
-    let target = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    let index = wasm_to_inline(runtime, Some(memory), args[1].0, args[1].1)?;
+    let target = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
     handle_data_result_to_wasm(runtime, index_data(target, index)?)
 }
 
 fn builtin_updated(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
     if args.len() != 2 || extra.is_empty() {
         return Err("Updated expects target, replacement, and path data".to_owned());
     }
-    let target = wasm_to_data(runtime, args[0].0, args[0].1)?;
-    let replacement = wasm_to_data(runtime, args[1].0, args[1].1)?;
+    let target = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
+    let replacement = wasm_to_data(runtime, Some(memory), args[1].0, args[1].1)?;
     let path = parse_update_path(&extra[0])?;
     handle_data_result_to_wasm(runtime, update_data(target, &path, replacement)?)
 }
 
 fn builtin_type_test(
     runtime: &Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -505,7 +536,7 @@ fn builtin_type_test(
         return Err("TypeTest missing data".to_owned());
     }
     let ty = String::from_utf8(extra[0].clone()).unwrap_or_default();
-    let result = if wasm_matches_type(runtime, args[0].0, args[0].1, &ty) {
+    let result = if wasm_matches_type(runtime, Some(memory), args[0].0, args[0].1, &ty) {
         1i64
     } else {
         0i64
@@ -516,12 +547,13 @@ fn builtin_type_test(
 fn builtin_iterator(
     runtime: &mut Runtime,
     iterators: &mut BTreeMap<u64, WasmIteratorState>,
+    memory: &[u8],
     args: &[(i32, i64)],
 ) -> Result<(i32, i64), String> {
     if args.is_empty() {
         return Err("Iterator missing argument".to_owned());
     }
-    let iterable = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    let iterable = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
     let items = expand_wasm_iterable(&iterable)?;
     let iterator_id = runtime
         .allocate_serializable_handle(
@@ -533,25 +565,20 @@ fn builtin_iterator(
             HandleData::Null,
         )
         .0;
-    iterators.insert(
-        iterator_id,
-        WasmIteratorState {
-            items,
-            position: 0,
-        },
-    );
+    iterators.insert(iterator_id, WasmIteratorState { items, position: 0 });
     Ok((TAG_HANDLE, iterator_id as i64))
 }
 
 fn builtin_iterator_next(
     runtime: &mut Runtime,
     iterators: &mut BTreeMap<u64, WasmIteratorState>,
+    memory: &[u8],
     args: &[(i32, i64)],
 ) -> Result<(i32, i64), String> {
     if args.is_empty() {
         return Err("IteratorNext missing argument".to_owned());
     }
-    let iterator_id = match wasm_to_inline(runtime, args[0].0, args[0].1)? {
+    let iterator_id = match wasm_to_inline(runtime, Some(memory), args[0].0, args[0].1)? {
         InlineValue::Handle(handle) => handle.0,
         _ => return Err("IteratorNext expects an iterator handle".to_owned()),
     };
@@ -569,6 +596,7 @@ fn builtin_iterator_next(
 
 fn builtin_range_new(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -581,9 +609,9 @@ fn builtin_range_new(
     if args.is_empty() {
         return Err("range requires at least one bound".to_owned());
     }
-    let start = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let start = wasm_to_inline(runtime, Some(memory), args[0].0, args[0].1)?;
     let end = if args.len() >= 2 {
-        Some(wasm_to_inline(runtime, args[1].0, args[1].1)?)
+        Some(wasm_to_inline(runtime, Some(memory), args[1].0, args[1].1)?)
     } else {
         None
     };
@@ -625,11 +653,8 @@ fn expand_wasm_iterable(data: &HandleData) -> Result<Vec<HandleData>, String> {
     match data {
         HandleData::List(items) => Ok(items.clone()),
         HandleData::Tuple(items) if items.len() == 3 => {
-            if let (
-                HandleData::Int(start),
-                HandleData::Int(end),
-                HandleData::Bool(inclusive),
-            ) = (&items[0], &items[1], &items[2])
+            if let (HandleData::Int(start), HandleData::Int(end), HandleData::Bool(inclusive)) =
+                (&items[0], &items[1], &items[2])
             {
                 let end_bound = if *inclusive { *end + 1 } else { *end };
                 let count = (end_bound - *start).max(0) as usize;
@@ -666,11 +691,15 @@ fn builtin_lambda_new(runtime: &mut Runtime, extra: &[Vec<u8>]) -> Result<(i32, 
     Ok((TAG_HANDLE, handle.0 as i64))
 }
 
-fn builtin_econ_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+fn builtin_econ_new(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
     if args.is_empty() {
         return Err("Econ missing arg".to_owned());
     }
-    let v = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let v = wasm_to_inline(runtime, Some(memory), args[0].0, args[0].1)?;
     let summary = HandleSummary {
         type_name: "Econ".to_owned(),
         summary: format!("econ({})", render_inline(&v)),
@@ -692,6 +721,7 @@ fn builtin_non_null(args: &[(i32, i64)]) -> Result<(i32, i64), String> {
 
 fn builtin_safe_project(
     runtime: &mut Runtime,
+    memory: &[u8],
     args: &[(i32, i64)],
     extra: &[Vec<u8>],
 ) -> Result<(i32, i64), String> {
@@ -701,7 +731,30 @@ fn builtin_safe_project(
     if args[0].0 == TAG_NULL {
         return Ok((TAG_NULL, 0));
     }
-    builtin_project(runtime, args, extra)
+    builtin_project(runtime, memory, args, extra)
+}
+
+fn to_wasm_entry(
+    runtime: &Runtime,
+    memory: &Memory,
+    heap_top: &Global,
+    store: &mut Store<State>,
+    value: &RuntimeValue,
+) -> Result<(i32, i64), String> {
+    match value {
+        RuntimeValue::Inline(InlineValue::Int(value)) => Ok((TAG_INT, *value)),
+        RuntimeValue::Inline(InlineValue::Float(value)) => Ok((TAG_FLOAT, value.to_bits() as i64)),
+        RuntimeValue::Inline(InlineValue::Bool(value)) => Ok((TAG_BOOL, *value as i64)),
+        RuntimeValue::Inline(InlineValue::Null) => Ok((TAG_NULL, 0)),
+        RuntimeValue::Inline(value) => {
+            let data = handle_data_from_inline(value)?;
+            write_handle_data_to_memory(memory, heap_top, store, &data)
+        }
+        RuntimeValue::Handle(handle) => match runtime.get_handle_data(*handle) {
+            Ok(data) => write_handle_data_to_memory(memory, heap_top, store, &data),
+            Err(_) => Ok(handle_to_wasm(runtime, *handle)),
+        },
+    }
 }
 
 fn to_wasm(runtime: &mut Runtime, value: &RuntimeValue) -> Result<(i32, i64), String> {
@@ -709,6 +762,171 @@ fn to_wasm(runtime: &mut Runtime, value: &RuntimeValue) -> Result<(i32, i64), St
         RuntimeValue::Inline(iv) => inline_result_to_wasm(runtime, iv.clone()),
         RuntimeValue::Handle(handle) => Ok(handle_to_wasm(runtime, *handle)),
     }
+}
+
+fn write_handle_data_to_memory(
+    memory: &Memory,
+    heap_top: &Global,
+    store: &mut Store<State>,
+    data: &HandleData,
+) -> Result<(i32, i64), String> {
+    match data {
+        HandleData::Null => Ok((TAG_NULL, 0)),
+        HandleData::Bool(value) => Ok((TAG_BOOL, *value as i64)),
+        HandleData::Int(value) => Ok((TAG_INT, *value)),
+        HandleData::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
+        HandleData::String(value) => {
+            let bytes = value.as_bytes();
+            let offset = alloc_memory(memory, heap_top, store, 4 + bytes.len() as u32)?;
+            memory
+                .write(
+                    &mut *store,
+                    offset as usize,
+                    &(bytes.len() as u32).to_le_bytes(),
+                )
+                .map_err(|error| format!("string length write failed: {error}"))?;
+            memory
+                .write(&mut *store, offset as usize + 4, bytes)
+                .map_err(|error| format!("string bytes write failed: {error}"))?;
+            Ok((TAG_STRING, offset as i64))
+        }
+        HandleData::Tuple(values) => {
+            let items = values
+                .iter()
+                .map(|value| write_handle_data_to_memory(memory, heap_top, store, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            write_sequence_to_memory(memory, heap_top, store, TAG_TUPLE, &items)
+        }
+        HandleData::List(values) => {
+            let items = values
+                .iter()
+                .map(|value| write_handle_data_to_memory(memory, heap_top, store, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            write_sequence_to_memory(memory, heap_top, store, TAG_LIST, &items)
+        }
+        HandleData::Record(fields) => {
+            let items = fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.as_bytes().to_vec(),
+                        write_handle_data_to_memory(memory, heap_top, store, value)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let mut size = 4u32;
+            for (name, _) in &items {
+                size = size
+                    .checked_add(4)
+                    .and_then(|v| v.checked_add(name.len() as u32))
+                    .and_then(|v| v.checked_add(12))
+                    .ok_or_else(|| "record allocation size overflow".to_owned())?;
+            }
+            let offset = alloc_memory(memory, heap_top, store, size)?;
+            memory
+                .write(
+                    &mut *store,
+                    offset as usize,
+                    &(items.len() as u32).to_le_bytes(),
+                )
+                .map_err(|error| format!("record field count write failed: {error}"))?;
+            let mut pos = offset + 4;
+            for (name, (tag, val)) in items {
+                memory
+                    .write(
+                        &mut *store,
+                        pos as usize,
+                        &(name.len() as u32).to_le_bytes(),
+                    )
+                    .map_err(|error| format!("record field name length write failed: {error}"))?;
+                pos += 4;
+                memory
+                    .write(&mut *store, pos as usize, &name)
+                    .map_err(|error| format!("record field name write failed: {error}"))?;
+                pos += name.len() as u32;
+                memory
+                    .write(&mut *store, pos as usize, &tag.to_le_bytes())
+                    .map_err(|error| format!("record field tag write failed: {error}"))?;
+                pos += 4;
+                memory
+                    .write(&mut *store, pos as usize, &val.to_le_bytes())
+                    .map_err(|error| format!("record field data write failed: {error}"))?;
+                pos += 8;
+            }
+            Ok((TAG_RECORD, offset as i64))
+        }
+    }
+}
+
+fn write_sequence_to_memory(
+    memory: &Memory,
+    heap_top: &Global,
+    store: &mut Store<State>,
+    tag: i32,
+    items: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
+    let size = 4u32
+        .checked_add(
+            (items.len() as u32)
+                .checked_mul(16)
+                .ok_or_else(|| "sequence allocation size overflow".to_owned())?,
+        )
+        .ok_or_else(|| "sequence allocation size overflow".to_owned())?;
+    let offset = alloc_memory(memory, heap_top, store, size)?;
+    memory
+        .write(
+            &mut *store,
+            offset as usize,
+            &(items.len() as u32).to_le_bytes(),
+        )
+        .map_err(|error| format!("sequence count write failed: {error}"))?;
+    for (i, (item_tag, item_val)) in items.iter().enumerate() {
+        let base = offset as usize + 4 + i * 16;
+        memory
+            .write(&mut *store, base, &item_tag.to_le_bytes())
+            .map_err(|error| format!("sequence tag write failed: {error}"))?;
+        memory
+            .write(&mut *store, base + 8, &item_val.to_le_bytes())
+            .map_err(|error| format!("sequence data write failed: {error}"))?;
+    }
+    Ok((tag, offset as i64))
+}
+
+fn alloc_memory(
+    memory: &Memory,
+    heap_top: &Global,
+    store: &mut Store<State>,
+    size: u32,
+) -> Result<u32, String> {
+    let size = align_to(size, 8);
+    let current: u32 = heap_top
+        .get(&mut *store)
+        .unwrap_i32()
+        .try_into()
+        .map_err(|_| "heap_top is negative".to_owned())?;
+    let next = current
+        .checked_add(size)
+        .ok_or_else(|| "wasm heap allocation overflow".to_owned())?;
+    if next > HEAP_LIMIT {
+        return Err(format!(
+            "wasm heap exhausted: requested {size} bytes with heap_top {current}"
+        ));
+    }
+    let memory_len = memory.data_size(&mut *store) as u32;
+    if next > memory_len {
+        return Err(format!(
+            "wasm heap allocation exceeds memory size: requested end {next}, memory size {memory_len}"
+        ));
+    }
+    heap_top
+        .set(&mut *store, Val::I32(next as i32))
+        .map_err(|error| format!("heap_top update failed: {error}"))?;
+    Ok(current)
+}
+
+fn align_to(value: u32, align: u32) -> u32 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
 }
 
 fn handle_to_wasm(runtime: &Runtime, handle: HandleId) -> (i32, i64) {
@@ -725,7 +943,148 @@ fn handle_to_wasm(runtime: &Runtime, handle: HandleId) -> (i32, i64) {
     (tag, handle.0 as i64)
 }
 
-fn from_wasm(runtime: &Runtime, tag: i32, val: i64) -> Result<RuntimeValue, String> {
+fn memory_backed_offset(val: i64) -> bool {
+    val >= STRDATA_OFF
+}
+
+fn memory_value_to_handle_data(data: &[u8], tag: i32, val: i64) -> Result<HandleData, String> {
+    memory_value_to_handle_data_depth(data, tag, val, 0)
+}
+
+fn memory_value_to_handle_data_depth(
+    data: &[u8],
+    tag: i32,
+    val: i64,
+    depth: usize,
+) -> Result<HandleData, String> {
+    if depth > MAX_MEMORY_VALUE_DEPTH {
+        return Err("wasm memory value nesting is too deep".to_owned());
+    }
+    let offset =
+        u32::try_from(val).map_err(|_| format!("wasm memory offset {val} is not a valid u32"))?;
+    match tag {
+        TAG_STRING => {
+            let len = mem_read_i32(data, offset)? as u32;
+            let start = offset
+                .checked_add(4)
+                .ok_or_else(|| "string offset overflow".to_owned())?;
+            let end = start
+                .checked_add(len)
+                .ok_or_else(|| "string length overflow".to_owned())?;
+            let bytes = data
+                .get(start as usize..end as usize)
+                .ok_or_else(|| "string data out of bounds".to_owned())?;
+            let text = String::from_utf8(bytes.to_vec())
+                .map_err(|error| format!("invalid utf8: {error}"))?;
+            Ok(HandleData::String(text))
+        }
+        TAG_TUPLE | TAG_LIST => {
+            let count = mem_read_i32(data, offset)? as u32;
+            let mut values = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let base = offset
+                    .checked_add(4)
+                    .and_then(|v| v.checked_add(i.checked_mul(16)?))
+                    .ok_or_else(|| "sequence offset overflow".to_owned())?;
+                let item_tag = mem_read_i32(data, base)?;
+                let item_data = mem_read_i64(data, base + 8)?;
+                values.push(memory_or_inline_to_handle_data(
+                    data,
+                    item_tag,
+                    item_data,
+                    depth + 1,
+                )?);
+            }
+            if tag == TAG_TUPLE {
+                Ok(HandleData::Tuple(values))
+            } else {
+                Ok(HandleData::List(values))
+            }
+        }
+        TAG_RECORD => {
+            let count = mem_read_i32(data, offset)? as u32;
+            let mut fields = BTreeMap::new();
+            let mut pos = offset
+                .checked_add(4)
+                .ok_or_else(|| "record offset overflow".to_owned())?;
+            for _ in 0..count {
+                let name_len = mem_read_i32(data, pos)? as u32;
+                pos = pos
+                    .checked_add(4)
+                    .ok_or_else(|| "record name offset overflow".to_owned())?;
+                let name_end = pos
+                    .checked_add(name_len)
+                    .ok_or_else(|| "record name length overflow".to_owned())?;
+                let name_bytes = data
+                    .get(pos as usize..name_end as usize)
+                    .ok_or_else(|| "record field name out of bounds".to_owned())?;
+                let name = String::from_utf8(name_bytes.to_vec())
+                    .map_err(|error| format!("invalid record field name: {error}"))?;
+                pos = name_end;
+                let field_tag = mem_read_i32(data, pos)?;
+                pos = pos
+                    .checked_add(4)
+                    .ok_or_else(|| "record field tag offset overflow".to_owned())?;
+                let field_data = mem_read_i64(data, pos)?;
+                pos = pos
+                    .checked_add(8)
+                    .ok_or_else(|| "record field data offset overflow".to_owned())?;
+                fields.insert(
+                    name,
+                    memory_or_inline_to_handle_data(data, field_tag, field_data, depth + 1)?,
+                );
+            }
+            Ok(HandleData::Record(fields))
+        }
+        _ => Err(format!("tag {tag} is not a memory-backed complex value")),
+    }
+}
+
+fn memory_or_inline_to_handle_data(
+    data: &[u8],
+    tag: i32,
+    val: i64,
+    depth: usize,
+) -> Result<HandleData, String> {
+    match tag {
+        TAG_INT => Ok(HandleData::Int(val)),
+        TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
+        TAG_BOOL => Ok(HandleData::Bool(val != 0)),
+        TAG_NULL => Ok(HandleData::Null),
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST if memory_backed_offset(val) => {
+            memory_value_to_handle_data_depth(data, tag, val, depth)
+        }
+        other => Err(format!(
+            "memory-backed value contains unsupported nested tag {other}"
+        )),
+    }
+}
+
+fn handle_data_to_runtime_handle(
+    runtime: &mut Runtime,
+    data: HandleData,
+) -> Result<RuntimeValue, String> {
+    let (tag, val) = handle_data_result_to_wasm(runtime, data)?;
+    match tag {
+        TAG_STRING | TAG_TUPLE | TAG_RECORD => {
+            let handle = HandleId(val as u64);
+            match runtime.get_handle_data(handle) {
+                Ok(data) => handle_data_to_inline(data).map(RuntimeValue::Inline),
+                Err(_) => Ok(RuntimeValue::Handle(handle)),
+            }
+        }
+        TAG_LIST | TAG_HANDLE => Ok(RuntimeValue::Handle(HandleId(val as u64))),
+        TAG_INT | TAG_FLOAT | TAG_BOOL | TAG_NULL => from_wasm(runtime, None, tag, val),
+        _ => Err(format!("unknown wasm result tag {tag}")),
+    }
+}
+
+fn from_wasm(
+    runtime: &mut Runtime,
+    memory: Option<&[u8]>,
+    tag: i32,
+    val: i64,
+) -> Result<RuntimeValue, String> {
     match tag {
         TAG_INT => Ok(RuntimeValue::Inline(InlineValue::Int(val))),
         TAG_FLOAT => Ok(RuntimeValue::Inline(InlineValue::Float(f64::from_bits(
@@ -733,6 +1092,18 @@ fn from_wasm(runtime: &Runtime, tag: i32, val: i64) -> Result<RuntimeValue, Stri
         )))),
         TAG_BOOL => Ok(RuntimeValue::Inline(InlineValue::Bool(val != 0))),
         TAG_NULL => Ok(RuntimeValue::Inline(InlineValue::Null)),
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST
+            if memory_backed_offset(val)
+                && memory
+                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .unwrap_or(false) =>
+        {
+            let data = memory_value_to_handle_data(memory.expect("checked above"), tag, val)?;
+            match data {
+                HandleData::List(_) => handle_data_to_runtime_handle(runtime, data),
+                other => handle_data_to_inline(other).map(RuntimeValue::Inline),
+            }
+        }
         TAG_STRING | TAG_TUPLE | TAG_RECORD => {
             let handle = HandleId(val as u64);
             match runtime.get_handle_data(handle) {
@@ -745,12 +1116,26 @@ fn from_wasm(runtime: &Runtime, tag: i32, val: i64) -> Result<RuntimeValue, Stri
     }
 }
 
-fn wasm_to_inline(runtime: &Runtime, tag: i32, val: i64) -> Result<InlineValue, String> {
+fn wasm_to_inline(
+    runtime: &Runtime,
+    memory: Option<&[u8]>,
+    tag: i32,
+    val: i64,
+) -> Result<InlineValue, String> {
     match tag {
         TAG_INT => Ok(InlineValue::Int(val)),
         TAG_FLOAT => Ok(InlineValue::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(InlineValue::Bool(val != 0)),
         TAG_NULL => Ok(InlineValue::Null),
+        TAG_STRING | TAG_TUPLE | TAG_RECORD
+            if memory_backed_offset(val)
+                && memory
+                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .unwrap_or(false) =>
+        {
+            memory_value_to_handle_data(memory.expect("checked above"), tag, val)
+                .and_then(handle_data_to_inline)
+        }
         TAG_STRING | TAG_TUPLE | TAG_RECORD => {
             let handle = HandleId(val as u64);
             match runtime.get_handle_data(handle) {
@@ -812,12 +1197,25 @@ fn inline_result_to_wasm(runtime: &mut Runtime, value: InlineValue) -> Result<(i
     }
 }
 
-fn wasm_to_data(runtime: &Runtime, tag: i32, val: i64) -> Result<HandleData, String> {
+fn wasm_to_data(
+    runtime: &Runtime,
+    memory: Option<&[u8]>,
+    tag: i32,
+    val: i64,
+) -> Result<HandleData, String> {
     match tag {
         TAG_INT => Ok(HandleData::Int(val)),
         TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(HandleData::Bool(val != 0)),
         TAG_NULL => Ok(HandleData::Null),
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST
+            if memory_backed_offset(val)
+                && memory
+                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .unwrap_or(false) =>
+        {
+            memory_value_to_handle_data(memory.expect("checked above"), tag, val)
+        }
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST | TAG_HANDLE => {
             runtime.get_handle_data(HandleId(val as u64))
         }
@@ -921,7 +1319,13 @@ fn handle_data_from_inline(value: &InlineValue) -> Result<HandleData, String> {
     }
 }
 
-fn wasm_matches_type(runtime: &Runtime, tag: i32, val: i64, ty: &str) -> bool {
+fn wasm_matches_type(
+    runtime: &Runtime,
+    memory: Option<&[u8]>,
+    tag: i32,
+    val: i64,
+    ty: &str,
+) -> bool {
     match (ty, tag) {
         ("Int", TAG_INT)
         | ("Float", TAG_FLOAT)
@@ -932,6 +1336,12 @@ fn wasm_matches_type(runtime: &Runtime, tag: i32, val: i64, ty: &str) -> bool {
         | ("Record", TAG_RECORD)
         | ("List", TAG_LIST) => return true,
         ("Unit", TAG_TUPLE) => {
+            if let Some(data) = memory.filter(|_| memory_backed_offset(val)) {
+                return matches!(
+                    memory_value_to_handle_data(data, tag, val),
+                    Ok(HandleData::Tuple(items)) if items.is_empty()
+                );
+            }
             return matches!(
                 runtime.get_handle_data(HandleId(val as u64)),
                 Ok(HandleData::Tuple(items)) if items.is_empty()

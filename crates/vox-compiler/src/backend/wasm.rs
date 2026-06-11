@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, DataSegment, DataSegmentMode, EntityType,
-    ExportKind, ExportSection, Function, FunctionSection, ImportSection, Instruction, MemArg,
-    MemoryType, Module, ValType,
+    ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    Instruction, MemArg, MemoryType, Module, ValType,
 };
 
 use vox_core::{
@@ -29,20 +29,29 @@ const TAG_INT: i32 = 0;
 const TAG_FLOAT: i32 = 1;
 const TAG_BOOL: i32 = 2;
 const TAG_STRING: i32 = 3;
+const TAG_TUPLE: i32 = 4;
+const TAG_RECORD: i32 = 5;
+const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
 
 const SCRATCH_OFF: u32 = 0;
 const RESULT_OFF: u32 = 16384;
 const STRDATA_OFF: u32 = 32768;
+const WASM_PAGE_SIZE: u32 = 65536;
+const HEAP_GUARD_BYTES: u32 = 4096;
+const HEAP_LIMIT: u32 = WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
+const HEAP_TOP_GLOBAL: u32 = 0;
+
+// Linear-memory complex value layouts:
+// String: [u32 byte_len][u8 bytes...]
+// Tuple:  [u32 count][(tag i32, padding i32, data i64)...]
+// List:   [u32 count][(tag i32, padding i32, data i64)...]
+// Record: [u32 field_count][(u32 name_len, u8 name..., tag i32, data i64)...]
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 enum BuiltinOp {
-    TupleNew = 0,
-    RecordNew = 1,
-    ListNew = 2,
-    StringNew = 3,
     StringInterpolate = 4,
     Project = 5,
     Index = 6,
@@ -57,9 +66,11 @@ enum BuiltinOp {
     StringBinary = 15,
     NumericChecked = 16,
     RangeNew = 17,
+    HeapExhausted = 18,
 }
 
 struct Ctx {
+    parameter_index: BTreeMap<MirValueId, u32>,
     value_index: BTreeMap<MirValueId, u32>,
     block_index: BTreeMap<MirBlockId, u32>,
     string_data: Vec<u8>,
@@ -71,6 +82,7 @@ struct Ctx {
 impl Ctx {
     fn new(body: &MirBody, _module: &MirModule) -> Self {
         let mut ctx = Self {
+            parameter_index: BTreeMap::new(),
             value_index: BTreeMap::new(),
             block_index: BTreeMap::new(),
             string_data: Vec::new(),
@@ -83,19 +95,22 @@ impl Ctx {
     }
 
     fn init_for_body(&mut self, body: &MirBody) {
+        self.parameter_index.clear();
         self.value_index.clear();
         self.block_index.clear();
         self.temp_count = 0;
+
+        for (i, p) in body.parameters.iter().enumerate() {
+            self.parameter_index.insert(*p, i as u32);
+        }
+
         let mut idx = 0u32;
         for v in &body.values {
+            if self.parameter_index.contains_key(&v.id) {
+                continue;
+            }
             if !self.value_index.contains_key(&v.id) {
                 self.value_index.insert(v.id, idx);
-                idx += 1;
-            }
-        }
-        for p in &body.parameters {
-            if !self.value_index.contains_key(p) {
-                self.value_index.insert(*p, idx);
                 idx += 1;
             }
         }
@@ -117,15 +132,27 @@ impl Ctx {
     }
 
     fn tag_local(&self, vid: MirValueId) -> u32 {
-        self.value_index.get(&vid).copied().unwrap_or(0) * 2 + 1
+        if let Some(idx) = self.parameter_index.get(&vid).copied() {
+            idx * 2
+        } else {
+            self.parameter_local_count() + self.value_index.get(&vid).copied().unwrap_or(0) * 2
+        }
     }
 
     fn data_local(&self, vid: MirValueId) -> u32 {
-        self.value_index.get(&vid).copied().unwrap_or(0) * 2 + 2
+        if let Some(idx) = self.parameter_index.get(&vid).copied() {
+            idx * 2 + 1
+        } else {
+            self.parameter_local_count() + self.value_index.get(&vid).copied().unwrap_or(0) * 2 + 1
+        }
     }
 
     fn num_value_locals(&self) -> u32 {
         self.value_index.len() as u32 * 2
+    }
+
+    fn parameter_local_count(&self) -> u32 {
+        self.parameter_index.len() as u32 * 2
     }
 
     fn total_locals(&self) -> u32 {
@@ -133,15 +160,15 @@ impl Ctx {
     }
 
     fn block_id_local(&self) -> u32 {
-        self.num_value_locals() + self.temp_count * 2 + 1
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2
     }
 
     fn result_tag_local(&self) -> u32 {
-        self.num_value_locals() + self.temp_count * 2 + 2
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + 1
     }
 
     fn result_data_local(&self) -> u32 {
-        self.num_value_locals() + self.temp_count * 2 + 3
+        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + 2
     }
 
     fn block_idx(&self, id: MirBlockId) -> usize {
@@ -179,12 +206,12 @@ impl WasmBackend {
 }
 
 fn local_type_at(ctx: &Ctx, idx: u32) -> ValType {
-    let local = idx + 1;
+    let local = ctx.parameter_local_count() + idx;
     if local == ctx.block_id_local() || local == ctx.result_tag_local() {
         ValType::I32
     } else if local == ctx.result_data_local() {
         ValType::I64
-    } else if local % 2 == 1 {
+    } else if (local - ctx.parameter_local_count()) % 2 == 0 {
         ValType::I32
     } else {
         ValType::I64
@@ -192,15 +219,32 @@ fn local_type_at(ctx: &Ctx, idx: u32) -> ValType {
 }
 
 fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
-    let mut wasm = Module::new();
+    let bodies: Vec<&MirBody> = module
+        .bodies
+        .iter()
+        .filter(|b| !b.blocks.is_empty())
+        .collect();
 
     let mut types = wasm_encoder::TypeSection::new();
     types.ty().function([ValType::I32; 6], []);
     types.ty().function([ValType::I32; 5], []);
-    types
-        .ty()
-        .function([ValType::I32], [ValType::I32, ValType::I64]);
-    wasm.section(&types);
+
+    let mut body_type_indices: BTreeMap<usize, u32> = BTreeMap::new();
+    let mut next_type_idx = 2u32;
+    for body in &bodies {
+        let arity = body.parameters.len();
+        if body_type_indices.contains_key(&arity) {
+            continue;
+        }
+        let mut params = Vec::with_capacity(arity * 2);
+        for _ in 0..arity {
+            params.push(ValType::I32);
+            params.push(ValType::I64);
+        }
+        types.ty().function(params, [ValType::I32, ValType::I64]);
+        body_type_indices.insert(arity, next_type_idx);
+        next_type_idx += 1;
+    }
 
     let mut imports = ImportSection::new();
     imports.import(
@@ -216,29 +260,31 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     );
     imports.import("vox", "__vox_op", EntityType::Function(0));
     imports.import("vox", "__vox_host", EntityType::Function(1));
-    wasm.section(&imports);
 
     let mut funcs = FunctionSection::new();
 
-    let bodies: Vec<&MirBody> = module
-        .bodies
-        .iter()
-        .filter(|b| !b.blocks.is_empty())
-        .collect();
-
     let mut func_map: BTreeMap<String, u32> = BTreeMap::new();
-    let mut func_index = 3u32;
+    let mut func_index = 2u32;
+    let mut entry_func_index = None;
     for body in &bodies {
         func_map.insert(body.name.clone(), func_index);
-        funcs.function(2);
+        if matches!(body.kind, MirBodyKind::ScriptEntry) {
+            entry_func_index = Some(func_index);
+        }
+        let type_idx = *body_type_indices
+            .get(&body.parameters.len())
+            .ok_or_else(|| format!("missing wasm type for {} parameters", body.parameters.len()))?;
+        funcs.function(type_idx);
         func_index += 1;
     }
-    wasm.section(&funcs);
+
+    let entry_func_index = entry_func_index
+        .ok_or_else(|| "module must have a ScriptEntry body for wasm".to_owned())?;
 
     let mut exports = ExportSection::new();
-    exports.export("script_entry", ExportKind::Func, 3);
+    exports.export("script_entry", ExportKind::Func, entry_func_index);
     exports.export("memory", ExportKind::Memory, 0);
-    wasm.section(&exports);
+    exports.export("__vox_heap_top", ExportKind::Global, HEAP_TOP_GLOBAL);
 
     let mut ctx = Ctx::new(bodies[0], module);
     ctx.func_map = func_map;
@@ -251,6 +297,30 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         let func = emit_body(body, &mut ctx)?;
         codes.function(&func);
     }
+
+    let heap_start = align_to(STRDATA_OFF + ctx.string_data.len() as u32, 8);
+    if heap_start >= HEAP_LIMIT {
+        return Err(format!(
+            "static wasm data ends at {heap_start}, leaving no heap space before guard"
+        ));
+    }
+
+    let mut globals = GlobalSection::new();
+    globals.global(
+        GlobalType {
+            val_type: ValType::I32,
+            mutable: true,
+            shared: false,
+        },
+        &ConstExpr::i32_const(heap_start as i32),
+    );
+
+    let mut wasm = Module::new();
+    wasm.section(&types);
+    wasm.section(&imports);
+    wasm.section(&funcs);
+    wasm.section(&globals);
+    wasm.section(&exports);
     wasm.section(&codes);
 
     if !ctx.string_data.is_empty() {
@@ -703,29 +773,6 @@ fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
 
     let mut f = Function::new(locals);
 
-    for (i, param) in body.parameters.iter().enumerate() {
-        let tag_loc = ctx.tag_local(*param);
-        let data_loc = ctx.data_local(*param);
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Const((4 + i as u32 * 16) as i32));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I32Load(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
-        f.instruction(&Instruction::LocalSet(tag_loc));
-        f.instruction(&Instruction::LocalGet(0));
-        f.instruction(&Instruction::I32Const((8 + i as u32 * 16) as i32));
-        f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I64Load(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
-        f.instruction(&Instruction::LocalSet(data_loc));
-    }
-
     let entry_id = ctx.block_idx(body.blocks.first().map(|b| b.id).unwrap_or(MirBlockId(0)));
     f.instruction(&Instruction::I32Const(entry_id as i32));
     f.instruction(&Instruction::LocalSet(ctx.block_id_local()));
@@ -845,7 +892,7 @@ fn emit_op(
         MirOpKind::Literal(val) => emit_literal(val, result, ctx, f)?,
         MirOpKind::Unit => {
             if let Some(rid) = result {
-                builtin_op_call(BuiltinOp::TupleNew, &[], &[], rid, ctx, f)?;
+                emit_tuple_new(&[], rid, ctx, f)?;
             }
         }
         MirOpKind::Use(_) | MirOpKind::TypeRefine(_) => {
@@ -903,18 +950,18 @@ fn emit_op(
         }
         MirOpKind::Tuple { .. } => {
             if let Some(rid) = result {
-                builtin_op_call(BuiltinOp::TupleNew, args, &[], rid, ctx, f)?;
+                emit_tuple_new(args, rid, ctx, f)?;
             }
         }
         MirOpKind::Record { fields } => {
             if let Some(rid) = result {
                 let names: Vec<Vec<u8>> = fields.iter().map(|n| n.as_bytes().to_vec()).collect();
-                builtin_op_call(BuiltinOp::RecordNew, args, &names, rid, ctx, f)?;
+                emit_record_new(args, &names, rid, ctx, f)?;
             }
         }
         MirOpKind::List => {
             if let Some(rid) = result {
-                builtin_op_call(BuiltinOp::ListNew, args, &[], rid, ctx, f)?;
+                emit_list_new(args, rid, ctx, f)?;
             }
         }
         MirOpKind::StringInterpolate { text } => {
@@ -1034,18 +1081,7 @@ fn emit_literal(
         }
         InlineValue::String(s) => {
             let b = s.as_bytes().to_vec();
-            let off = ctx.intern_string(&b);
-            i32(f, BuiltinOp::StringNew as i32);
-            i32(f, SCRATCH_OFF as i32);
-            i32(f, 0);
-            i32(f, off as i32 + 4);
-            i32(f, b.len() as i32);
-            i32(f, RESULT_OFF as i32);
-            f.instruction(&Instruction::Call(0));
-            i32_load(f, RESULT_OFF);
-            local_set(f, ctx.tag_local(rid));
-            i64_load(f, RESULT_OFF + 8);
-            local_set(f, ctx.data_local(rid));
+            emit_string_new(&b, rid, ctx, f)?;
         }
         InlineValue::Tuple(items) => {
             let mut temp_ids = Vec::new();
@@ -1054,7 +1090,7 @@ fn emit_literal(
                 emit_literal(item, Some(tid), ctx, f)?;
                 temp_ids.push(tid);
             }
-            builtin_op_call(BuiltinOp::TupleNew, &temp_ids, &[], rid, ctx, f)?;
+            emit_tuple_new(&temp_ids, rid, ctx, f)?;
         }
         InlineValue::Null => {
             i32(f, TAG_NULL);
@@ -1077,7 +1113,7 @@ fn emit_literal(
                 emit_literal(value, Some(tid), ctx, f)?;
                 temp_ids.push(tid);
             }
-            builtin_op_call(BuiltinOp::RecordNew, &temp_ids, &names, rid, ctx, f)?;
+            emit_record_new(&temp_ids, &names, rid, ctx, f)?;
         }
     }
     Ok(())
@@ -1360,6 +1396,201 @@ fn tag_for_scalar(ty: WasmScalar) -> Result<i32, String> {
     }
 }
 
+fn emit_string_new(
+    bytes: &[u8],
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let size = 4u32
+        .checked_add(bytes.len() as u32)
+        .ok_or_else(|| "string allocation size overflow".to_owned())?;
+    emit_heap_alloc_const(size, result, ctx, f);
+    i32(f, TAG_STRING);
+    local_set(f, ctx.tag_local(result));
+    emit_i32_store_at_heap_value(f, ctx, result, 0, bytes.len() as i32);
+    for (i, byte) in bytes.iter().enumerate() {
+        emit_addr_at_heap_value(f, ctx, result, 4 + i as u32);
+        i32(f, *byte as i32);
+        f.instruction(&Instruction::I32Store8(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+    }
+    Ok(())
+}
+
+fn emit_tuple_new(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    emit_value_sequence_new(TAG_TUPLE, args, result, ctx, f)
+}
+
+fn emit_list_new(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    emit_value_sequence_new(TAG_LIST, args, result, ctx, f)
+}
+
+fn emit_value_sequence_new(
+    tag: i32,
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let size = 4u32
+        .checked_add(
+            (args.len() as u32)
+                .checked_mul(16)
+                .ok_or_else(|| "sequence allocation size overflow".to_owned())?,
+        )
+        .ok_or_else(|| "sequence allocation size overflow".to_owned())?;
+    emit_heap_alloc_const(size, result, ctx, f);
+    i32(f, tag);
+    local_set(f, ctx.tag_local(result));
+    emit_i32_store_at_heap_value(f, ctx, result, 0, args.len() as i32);
+    for (i, arg) in args.iter().enumerate() {
+        let base = 4 + i as u32 * 16;
+        emit_addr_at_heap_value(f, ctx, result, base);
+        local_get(f, ctx.tag_local(*arg));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+        emit_addr_at_heap_value(f, ctx, result, base + 8);
+        local_get(f, ctx.data_local(*arg));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+    }
+    Ok(())
+}
+
+fn emit_record_new(
+    args: &[MirValueId],
+    names: &[Vec<u8>],
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    if args.len() != names.len() {
+        return Err(format!(
+            "record constructor expected {} names, received {}",
+            args.len(),
+            names.len()
+        ));
+    }
+
+    let mut size = 4u32;
+    for name in names {
+        size = size
+            .checked_add(4)
+            .and_then(|v| v.checked_add(name.len() as u32))
+            .and_then(|v| v.checked_add(12))
+            .ok_or_else(|| "record allocation size overflow".to_owned())?;
+    }
+
+    emit_heap_alloc_const(size, result, ctx, f);
+    i32(f, TAG_RECORD);
+    local_set(f, ctx.tag_local(result));
+    emit_i32_store_at_heap_value(f, ctx, result, 0, args.len() as i32);
+
+    let mut pos = 4u32;
+    for (arg, name) in args.iter().zip(names) {
+        emit_i32_store_at_heap_value(f, ctx, result, pos, name.len() as i32);
+        pos += 4;
+        for byte in name {
+            emit_addr_at_heap_value(f, ctx, result, pos);
+            i32(f, *byte as i32);
+            f.instruction(&Instruction::I32Store8(MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: 0,
+            }));
+            pos += 1;
+        }
+        emit_addr_at_heap_value(f, ctx, result, pos);
+        local_get(f, ctx.tag_local(*arg));
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+        pos += 4;
+        emit_addr_at_heap_value(f, ctx, result, pos);
+        local_get(f, ctx.data_local(*arg));
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 0,
+            align: 0,
+            memory_index: 0,
+        }));
+        pos += 8;
+    }
+    Ok(())
+}
+
+fn emit_heap_alloc_const(size: u32, result: MirValueId, ctx: &Ctx, f: &mut Function) {
+    let size = align_to(size, 8);
+    f.instruction(&Instruction::GlobalGet(HEAP_TOP_GLOBAL));
+    f.instruction(&Instruction::I64ExtendI32U);
+    local_set(f, ctx.data_local(result));
+
+    f.instruction(&Instruction::GlobalGet(HEAP_TOP_GLOBAL));
+    i32(f, size as i32);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(ctx.result_tag_local()));
+    i32(f, HEAP_LIMIT as i32);
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    i32(f, BuiltinOp::HeapExhausted as i32);
+    i32(f, SCRATCH_OFF as i32);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, RESULT_OFF as i32);
+    f.instruction(&Instruction::Call(0));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+    local_get(f, ctx.result_tag_local());
+    f.instruction(&Instruction::GlobalSet(HEAP_TOP_GLOBAL));
+}
+
+fn emit_i32_store_at_heap_value(
+    f: &mut Function,
+    ctx: &Ctx,
+    value: MirValueId,
+    offset: u32,
+    stored: i32,
+) {
+    emit_addr_at_heap_value(f, ctx, value, offset);
+    i32(f, stored);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 0,
+        memory_index: 0,
+    }));
+}
+
+fn emit_addr_at_heap_value(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
+    local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I32WrapI64);
+    if offset > 0 {
+        i32(f, offset as i32);
+        f.instruction(&Instruction::I32Add);
+    }
+}
+
 fn builtin_op_call(
     op: BuiltinOp,
     args: &[MirValueId],
@@ -1459,23 +1690,10 @@ fn emit_vox_call(
     ctx: &Ctx,
     f: &mut Function,
 ) -> Result<(), String> {
-    for (i, arg) in args.iter().enumerate() {
-        i32(f, (SCRATCH_OFF + 4 + i as u32 * 16) as i32);
+    for arg in args {
         local_get(f, ctx.tag_local(*arg));
-        f.instruction(&Instruction::I32Store(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
-        i32(f, (SCRATCH_OFF + 8 + i as u32 * 16) as i32);
         local_get(f, ctx.data_local(*arg));
-        f.instruction(&Instruction::I64Store(MemArg {
-            offset: 0,
-            align: 0,
-            memory_index: 0,
-        }));
     }
-    i32(f, SCRATCH_OFF as i32);
     f.instruction(&Instruction::Call(target_func));
     f.instruction(&Instruction::LocalSet(ctx.data_local(result)));
     f.instruction(&Instruction::LocalSet(ctx.tag_local(result)));
@@ -1549,24 +1767,11 @@ fn local_set(f: &mut Function, idx: u32) {
     f.instruction(&Instruction::LocalSet(idx));
 }
 
-fn i32_load(f: &mut Function, offset: u32) {
-    i32(f, offset as i32);
-    f.instruction(&Instruction::I32Load(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-}
-
-fn i64_load(f: &mut Function, offset: u32) {
-    i32(f, offset as i32);
-    f.instruction(&Instruction::I64Load(MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    }));
-}
-
 fn i64_extend(f: &mut Function) {
     f.instruction(&Instruction::I64ExtendI32S);
+}
+
+fn align_to(value: u32, align: u32) -> u32 {
+    debug_assert!(align.is_power_of_two());
+    (value + align - 1) & !(align - 1)
 }
