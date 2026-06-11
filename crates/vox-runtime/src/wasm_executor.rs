@@ -17,6 +17,12 @@ const TAG_RECORD: i32 = 5;
 const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
+const TAG_INVALID: i32 = -1;
+
+#[derive(Debug)]
+struct State {
+    runtime: *mut Runtime,
+}
 
 pub fn try_wasm_execute(
     runtime: &mut Runtime,
@@ -28,14 +34,12 @@ pub fn try_wasm_execute(
 
     let runtime_ptr = runtime as *mut Runtime;
 
-    #[derive(Debug)]
-    struct State {
-        runtime: *mut Runtime,
-    }
-
-    let mut store = Store::new(&engine, State {
-        runtime: runtime_ptr,
-    });
+    let mut store = Store::new(
+        &engine,
+        State {
+            runtime: runtime_ptr,
+        },
+    );
 
     let memory_ty = MemoryType::new(1, None);
     let memory = Memory::new(&mut store, memory_ty).map_err(|e| e.to_string())?;
@@ -55,14 +59,28 @@ pub fn try_wasm_execute(
             let state = caller.data();
             let runtime = unsafe { &mut *state.runtime };
 
-            if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                return Err(wasmtime::Error::msg(
+                    "wasm import __vox_op: memory export not found",
+                ));
+            };
+            clear_result_slot(&mem, &mut caller, result_ptr)?;
+            let result = {
                 let data = mem.data(&caller);
-                let result = handle_builtin_op(runtime, op_id, args_ptr, arg_count, extra_ptr, extra_count, data);
-                if let Ok((tag, val)) = result {
-                    let _ = mem.write(&mut caller, result_ptr as usize, &tag.to_le_bytes());
-                    let _ = mem.write(&mut caller, result_ptr as usize + 8, &val.to_le_bytes());
-                }
-            }
+                handle_builtin_op(
+                    runtime,
+                    op_id,
+                    args_ptr,
+                    arg_count,
+                    extra_ptr,
+                    extra_count,
+                    data,
+                )
+            };
+            let (tag, val) = result.map_err(|message| {
+                wasmtime::Error::msg(format!("wasm import __vox_op failed: {message}"))
+            })?;
+            write_result_slot(&mem, &mut caller, result_ptr, tag, val)?;
             Ok(())
         },
     );
@@ -81,14 +99,20 @@ pub fn try_wasm_execute(
             let state = caller.data();
             let runtime = unsafe { &mut *state.runtime };
 
-            if let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+                return Err(wasmtime::Error::msg(
+                    "wasm import __vox_host: memory export not found",
+                ));
+            };
+            clear_result_slot(&mem, &mut caller, result_ptr)?;
+            let result = {
                 let data = mem.data(&caller);
-                let result = handle_host_call(runtime, callee_ptr, callee_len, args_ptr, arg_count, data);
-                if let Ok((tag, val)) = result {
-                    let _ = mem.write(&mut caller, result_ptr as usize, &tag.to_le_bytes());
-                    let _ = mem.write(&mut caller, result_ptr as usize + 8, &val.to_le_bytes());
-                }
-            }
+                handle_host_call(runtime, callee_ptr, callee_len, args_ptr, arg_count, data)
+            };
+            let (tag, val) = result.map_err(|message| {
+                wasmtime::Error::msg(format!("wasm import __vox_host failed: {message}"))
+            })?;
+            write_result_slot(&mem, &mut caller, result_ptr, tag, val)?;
             Ok(())
         },
     );
@@ -118,11 +142,31 @@ pub fn try_wasm_execute(
         .get_typed_func::<i32, (i32, i64)>(&mut store, "script_entry")
         .map_err(|e| e.to_string())?;
 
-    let (result_tag, result_data) = entry
-        .call(&mut store, 0i32)
-        .map_err(|e| e.to_string())?;
+    let (result_tag, result_data) = entry.call(&mut store, 0i32).map_err(|e| e.to_string())?;
 
     from_wasm(result_tag, result_data)
+}
+
+fn clear_result_slot(
+    mem: &Memory,
+    caller: &mut Caller<'_, State>,
+    result_ptr: u32,
+) -> wasmtime::Result<()> {
+    write_result_slot(mem, caller, result_ptr, TAG_INVALID, 0)
+}
+
+fn write_result_slot(
+    mem: &Memory,
+    caller: &mut Caller<'_, State>,
+    result_ptr: u32,
+    tag: i32,
+    val: i64,
+) -> wasmtime::Result<()> {
+    mem.write(&mut *caller, result_ptr as usize, &tag.to_le_bytes())
+        .map_err(|error| wasmtime::Error::msg(format!("wasm result tag write failed: {error}")))?;
+    mem.write(&mut *caller, result_ptr as usize + 8, &val.to_le_bytes())
+        .map_err(|error| wasmtime::Error::msg(format!("wasm result data write failed: {error}")))?;
+    Ok(())
 }
 
 fn handle_builtin_op(
@@ -192,7 +236,7 @@ fn handle_host_call(
         let ptr = args_ptr + i * 16;
         let tag = mem_read_i32(data, ptr)?;
         let val = mem_read_i64(data, ptr + 8)?;
-        arg_values.push(from_wasm(tag, val).unwrap_or(RuntimeValue::Inline(InlineValue::Null)));
+        arg_values.push(from_wasm(tag, val)?);
     }
 
     let host_args: Vec<HostCallArgument> = arg_values
@@ -214,7 +258,10 @@ fn handle_host_call(
 }
 
 fn builtin_tuple_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
-    let items: Vec<InlineValue> = args.iter().map(|(t, v)| wasm_to_inline(*t, *v)).collect();
+    let items: Vec<InlineValue> = args
+        .iter()
+        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .collect::<Result<_, _>>()?;
     let summary = HandleSummary {
         type_name: "Tuple".to_owned(),
         summary: format_args("Tuple", &items),
@@ -225,7 +272,10 @@ fn builtin_tuple_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32,
 }
 
 fn builtin_record_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
-    let items: Vec<InlineValue> = args.iter().map(|(t, v)| wasm_to_inline(*t, *v)).collect();
+    let items: Vec<InlineValue> = args
+        .iter()
+        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .collect::<Result<_, _>>()?;
     let summary = HandleSummary {
         type_name: "Record".to_owned(),
         summary: format_args("Record", &items),
@@ -236,7 +286,10 @@ fn builtin_record_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32
 }
 
 fn builtin_list_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
-    let items: Vec<InlineValue> = args.iter().map(|(t, v)| wasm_to_inline(*t, *v)).collect();
+    let items: Vec<InlineValue> = args
+        .iter()
+        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .collect::<Result<_, _>>()?;
     let summary = HandleSummary {
         type_name: "List".to_owned(),
         summary: format_args("List", &items),
@@ -274,7 +327,7 @@ fn builtin_string_interpolate(
         if i < text.len() {
             out.push_str(&text[i]);
         }
-        let v = wasm_to_inline(*tag, *val);
+        let v = wasm_to_inline(*tag, *val)?;
         out.push_str(&render_inline(&v));
     }
     if text.len() > args.len() {
@@ -325,8 +378,15 @@ fn builtin_iterator_next(_runtime: &mut Runtime) -> Result<(i32, i64), String> {
 }
 
 fn builtin_lambda_new(runtime: &mut Runtime, extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
-    let params: Vec<String> = extra.iter().map(|s| String::from_utf8_lossy(s).to_string()).collect();
-    let sig = if params.is_empty() { "()".to_owned() } else { params.join(", ") };
+    let params: Vec<String> = extra
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    let sig = if params.is_empty() {
+        "()".to_owned()
+    } else {
+        params.join(", ")
+    };
     let summary = HandleSummary {
         type_name: "Function".to_owned(),
         summary: format!("<function <lambda> ({sig})>"),
@@ -340,7 +400,7 @@ fn builtin_econ_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, 
     if args.is_empty() {
         return Err("Econ missing arg".to_owned());
     }
-    let v = wasm_to_inline(args[0].0, args[0].1);
+    let v = wasm_to_inline(args[0].0, args[0].1)?;
     let summary = HandleSummary {
         type_name: "Econ".to_owned(),
         summary: format!("econ({})", render_inline(&v)),
@@ -393,23 +453,28 @@ fn inline_to_wasm(value: &InlineValue) -> (i32, i64) {
 fn from_wasm(tag: i32, val: i64) -> Result<RuntimeValue, String> {
     match tag {
         TAG_INT => Ok(RuntimeValue::Inline(InlineValue::Int(val))),
-        TAG_FLOAT => Ok(RuntimeValue::Inline(InlineValue::Float(f64::from_bits(val as u64)))),
+        TAG_FLOAT => Ok(RuntimeValue::Inline(InlineValue::Float(f64::from_bits(
+            val as u64,
+        )))),
         TAG_BOOL => Ok(RuntimeValue::Inline(InlineValue::Bool(val != 0))),
         TAG_NULL => Ok(RuntimeValue::Inline(InlineValue::Null)),
         TAG_HANDLE | TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST => {
             Ok(RuntimeValue::Handle(HandleId(val as u64)))
         }
-        _ => Ok(RuntimeValue::Inline(InlineValue::Null)),
+        _ => Err(format!("unknown wasm result tag {tag}")),
     }
 }
 
-fn wasm_to_inline(tag: i32, val: i64) -> InlineValue {
+fn wasm_to_inline(tag: i32, val: i64) -> Result<InlineValue, String> {
     match tag {
-        TAG_INT => InlineValue::Int(val),
-        TAG_FLOAT => InlineValue::Float(f64::from_bits(val as u64)),
-        TAG_BOOL => InlineValue::Bool(val != 0),
-        TAG_NULL => InlineValue::Null,
-        _ => InlineValue::Handle(HandleId(val as u64)),
+        TAG_INT => Ok(InlineValue::Int(val)),
+        TAG_FLOAT => Ok(InlineValue::Float(f64::from_bits(val as u64))),
+        TAG_BOOL => Ok(InlineValue::Bool(val != 0)),
+        TAG_NULL => Ok(InlineValue::Null),
+        TAG_HANDLE | TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST => {
+            Ok(InlineValue::Handle(HandleId(val as u64)))
+        }
+        _ => Err(format!("unknown wasm value tag {tag}")),
     }
 }
 
@@ -421,8 +486,22 @@ fn render_inline(value: &InlineValue) -> String {
         InlineValue::Float(v) => v.to_string(),
         InlineValue::String(v) => v.clone(),
         InlineValue::Handle(h) => format!("<handle {}>", h.0),
-        InlineValue::Tuple(items) => format!("({})", items.iter().map(|v| render_inline(v)).collect::<Vec<_>>().join(", ")),
-        InlineValue::Record(fields) => format!("{{{}}}", fields.iter().map(|(k, v)| format!("{k}: {}", render_inline(v))).collect::<Vec<_>>().join(", ")),
+        InlineValue::Tuple(items) => format!(
+            "({})",
+            items
+                .iter()
+                .map(|v| render_inline(v))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        InlineValue::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(k, v)| format!("{k}: {}", render_inline(v)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -443,11 +522,17 @@ fn name_to_tag(name: &str) -> i32 {
 }
 
 fn mem_read_i32(data: &[u8], offset: u32) -> Result<i32, String> {
-    let bytes = data.get(offset as usize..offset as usize + 4).ok_or("read out of bounds")?;
+    let bytes = data
+        .get(offset as usize..offset as usize + 4)
+        .ok_or("read out of bounds")?;
     Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 fn mem_read_i64(data: &[u8], offset: u32) -> Result<i64, String> {
-    let bytes = data.get(offset as usize..offset as usize + 8).ok_or("read out of bounds")?;
-    Ok(i64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]))
+    let bytes = data
+        .get(offset as usize..offset as usize + 8)
+        .ok_or("read out of bounds")?;
+    Ok(i64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
 }

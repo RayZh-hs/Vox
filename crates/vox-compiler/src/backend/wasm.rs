@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSegment, DataSegmentMode, DataSection, EntityType,
+    BlockType, CodeSection, ConstExpr, DataSection, DataSegment, DataSegmentMode, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, ImportSection, Instruction, MemArg,
     MemoryType, Module, ValType,
 };
@@ -12,6 +12,7 @@ use vox_core::{
         MirProjection, MirTerminator, MirValueId,
     },
     plan::WasmArtifact,
+    types::VoxType,
     value::InlineValue,
 };
 
@@ -154,6 +155,10 @@ impl WasmBackend {
             return WasmLowering::Unsupported("missing script entry body".to_owned());
         };
 
+        if let Err(reason) = validate_wasm_supported(module, body) {
+            return WasmLowering::Unsupported(reason);
+        }
+
         match lower_module(module, body) {
             Ok(bytes) => WasmLowering::Lowered(WasmArtifact {
                 bytes,
@@ -166,12 +171,12 @@ impl WasmBackend {
 }
 
 fn local_type_at(ctx: &Ctx, idx: u32) -> ValType {
-    let total = ctx.total_locals();
-    if idx >= total - 2 && idx < total - 1 {
+    let local = idx + 1;
+    if local == ctx.block_id_local() || local == ctx.result_tag_local() {
         ValType::I32
-    } else if idx == total - 1 {
+    } else if local == ctx.result_data_local() {
         ValType::I64
-    } else if idx % 2 == 0 {
+    } else if local % 2 == 1 {
         ValType::I32
     } else {
         ValType::I64
@@ -186,7 +191,9 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
     let mut types = wasm_encoder::TypeSection::new();
     types.ty().function([ValType::I32; 6], []);
     types.ty().function([ValType::I32; 5], []);
-    types.ty().function([ValType::I32], [ValType::I32, ValType::I64]);
+    types
+        .ty()
+        .function([ValType::I32], [ValType::I32, ValType::I64]);
     module.section(&types);
 
     let mut imports = ImportSection::new();
@@ -214,6 +221,12 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
     exports.export("memory", ExportKind::Memory, 0);
     module.section(&exports);
 
+    let body = emit_body(entry_body, &mut ctx)?;
+
+    let mut codes = CodeSection::new();
+    codes.function(&body);
+    module.section(&codes);
+
     if !ctx.string_data.is_empty() {
         let mut data = DataSection::new();
         let seg = DataSegment {
@@ -224,15 +237,230 @@ fn lower_module(module: &MirModule, entry_body: &MirBody) -> Result<Vec<u8>, Str
             data: ctx.string_data.clone(),
         };
         data.segment(seg);
+        module.section(&data);
     }
 
-    let body = emit_body(entry_body, &mut ctx)?;
-
-    let mut codes = CodeSection::new();
-    codes.function(&body);
-    module.section(&codes);
-
     Ok(module.finish())
+}
+
+fn validate_wasm_supported(module: &MirModule, body: &MirBody) -> Result<(), String> {
+    if module.bodies.iter().any(|candidate| {
+        !matches!(candidate.kind, MirBodyKind::ScriptEntry) && !candidate.blocks.is_empty()
+    }) {
+        return Err("non-script MIR bodies are not emitted as wasm yet".to_owned());
+    }
+
+    for value in &body.values {
+        if !is_supported_wasm_value_type(value.ty.as_ref()) {
+            return Err(format!(
+                "value %{} has unsupported wasm type {}",
+                value.id.0,
+                render_mir_type(value.ty.as_ref())
+            ));
+        }
+    }
+
+    for block in &body.blocks {
+        for op in &block.ops {
+            validate_wasm_op(body, &op.kind, &op.args)?;
+        }
+        validate_wasm_terminator(body, &block.terminator)?;
+    }
+
+    Ok(())
+}
+
+fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Result<(), String> {
+    match kind {
+        MirOpKind::Literal(value) => validate_wasm_literal(value),
+        MirOpKind::Use(_) | MirOpKind::TypeRefine(_) | MirOpKind::Bind(_) | MirOpKind::Drop => {
+            Ok(())
+        }
+        MirOpKind::CacheGet(_) | MirOpKind::CachePut(_) => Ok(()),
+        MirOpKind::NonNull => Ok(()),
+        MirOpKind::Unit => Err("Unit lowering still uses an Int(0) sentinel".to_owned()),
+        MirOpKind::Unary(name) => match name.as_str() {
+            "not" => require_args(body, args, &[WasmScalar::Bool], "not"),
+            "negate" => require_args(body, args, &[WasmScalar::Int], "negate"),
+            other => Err(format!("unsupported unary op `{other}` in wasm")),
+        },
+        MirOpKind::Binary(name) => match name.as_str() {
+            "add" | "subtract" | "multiply" | "divide" | "remainder" | "less" | "greater"
+            | "less_equal" | "greater_equal" => {
+                require_args(body, args, &[WasmScalar::Int, WasmScalar::Int], name)
+            }
+            "equal" | "not_equal" => {
+                if args.len() != 2 {
+                    return Err(format!("binary op `{name}` expected 2 args"));
+                }
+                let left = wasm_scalar_type(body, args[0])
+                    .ok_or_else(|| format!("binary op `{name}` has unsupported left operand"))?;
+                let right = wasm_scalar_type(body, args[1])
+                    .ok_or_else(|| format!("binary op `{name}` has unsupported right operand"))?;
+                if left == right && matches!(left, WasmScalar::Int | WasmScalar::Bool) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "binary op `{name}` is not supported for {} and {} in wasm",
+                        left.as_str(),
+                        right.as_str()
+                    ))
+                }
+            }
+            other => Err(format!("unsupported binary op `{other}` in wasm")),
+        },
+        MirOpKind::TypeTest(_) => Ok(()),
+        MirOpKind::SafeProject(_)
+        | MirOpKind::Tuple { .. }
+        | MirOpKind::Record { .. }
+        | MirOpKind::List
+        | MirOpKind::StringInterpolate { .. }
+        | MirOpKind::Project(_)
+        | MirOpKind::Index
+        | MirOpKind::Updated { .. }
+        | MirOpKind::Call { .. }
+        | MirOpKind::Lambda { .. }
+        | MirOpKind::Econ { .. }
+        | MirOpKind::Iterator
+        | MirOpKind::IteratorNext => Err(format!(
+            "MIR op `{}` is not implemented by the wasm backend yet",
+            mir_op_name(kind)
+        )),
+        MirOpKind::Unknown(_) => Err("unknown MIR op".to_owned()),
+    }
+}
+
+fn validate_wasm_terminator(body: &MirBody, terminator: &MirTerminator) -> Result<(), String> {
+    match terminator {
+        MirTerminator::Jump { .. } | MirTerminator::Return(_) => Ok(()),
+        MirTerminator::Branch { condition, .. } => {
+            if wasm_scalar_type(body, *condition) == Some(WasmScalar::Bool) {
+                Ok(())
+            } else {
+                Err("wasm branch conditions must be Bool".to_owned())
+            }
+        }
+        MirTerminator::Panic(_) => Err("panic terminators are not surfaced by wasm yet".to_owned()),
+        MirTerminator::Unreachable => Ok(()),
+    }
+}
+
+fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
+    match value {
+        InlineValue::Int(_) | InlineValue::Bool(_) | InlineValue::Null => Ok(()),
+        InlineValue::Float(_) => {
+            Err("Float literals are not type-safe in wasm locals yet".to_owned())
+        }
+        InlineValue::String(_) => Err("String literals require handle-backed wasm data".to_owned()),
+        InlineValue::Tuple(_) => Err("Tuple literals require handle-backed wasm data".to_owned()),
+        InlineValue::Record(_) => Err("Record literals require handle-backed wasm data".to_owned()),
+        InlineValue::Handle(_) => {
+            Err("Handle literals cannot be materialized by wasm yet".to_owned())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WasmScalar {
+    Int,
+    Bool,
+    Null,
+}
+
+impl WasmScalar {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Int => "Int",
+            Self::Bool => "Bool",
+            Self::Null => "Null",
+        }
+    }
+}
+
+fn require_args(
+    body: &MirBody,
+    args: &[MirValueId],
+    expected: &[WasmScalar],
+    op: &str,
+) -> Result<(), String> {
+    if args.len() != expected.len() {
+        return Err(format!("op `{op}` expected {} args", expected.len()));
+    }
+    for (arg, expected) in args.iter().zip(expected) {
+        let Some(actual) = wasm_scalar_type(body, *arg) else {
+            return Err(format!(
+                "op `{op}` argument %{} has unsupported wasm type {}",
+                arg.0,
+                render_mir_type(value_type(body, *arg))
+            ));
+        };
+        if actual != *expected {
+            return Err(format!(
+                "op `{op}` expected {}, found {}",
+                expected.as_str(),
+                actual.as_str()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
+    matches!(ty, None | Some(VoxType::Int | VoxType::Bool))
+}
+
+fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
+    match value_type(body, value) {
+        Some(VoxType::Int) => Some(WasmScalar::Int),
+        Some(VoxType::Bool) => Some(WasmScalar::Bool),
+        None => Some(WasmScalar::Null),
+        _ => None,
+    }
+}
+
+fn value_type(body: &MirBody, value: MirValueId) -> Option<&VoxType> {
+    body.values
+        .iter()
+        .find(|candidate| candidate.id == value)
+        .and_then(|candidate| candidate.ty.as_ref())
+}
+
+fn render_mir_type(ty: Option<&VoxType>) -> String {
+    match ty {
+        Some(ty) => format!("{ty:?}"),
+        None => "unknown".to_owned(),
+    }
+}
+
+fn mir_op_name(kind: &MirOpKind) -> &'static str {
+    match kind {
+        MirOpKind::Literal(_) => "Literal",
+        MirOpKind::Unit => "Unit",
+        MirOpKind::Use(_) => "Use",
+        MirOpKind::Bind(_) => "Bind",
+        MirOpKind::TypeRefine(_) => "TypeRefine",
+        MirOpKind::CacheGet(_) => "CacheGet",
+        MirOpKind::CachePut(_) => "CachePut",
+        MirOpKind::Drop => "Drop",
+        MirOpKind::NonNull => "NonNull",
+        MirOpKind::SafeProject(_) => "SafeProject",
+        MirOpKind::TypeTest(_) => "TypeTest",
+        MirOpKind::Unary(_) => "Unary",
+        MirOpKind::Binary(_) => "Binary",
+        MirOpKind::Tuple { .. } => "Tuple",
+        MirOpKind::Record { .. } => "Record",
+        MirOpKind::List => "List",
+        MirOpKind::StringInterpolate { .. } => "StringInterpolate",
+        MirOpKind::Project(_) => "Project",
+        MirOpKind::Index => "Index",
+        MirOpKind::Updated { .. } => "Updated",
+        MirOpKind::Call { .. } => "Call",
+        MirOpKind::Lambda { .. } => "Lambda",
+        MirOpKind::Econ { .. } => "Econ",
+        MirOpKind::Iterator => "Iterator",
+        MirOpKind::IteratorNext => "IteratorNext",
+        MirOpKind::Unknown(_) => "Unknown",
+    }
 }
 
 fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
@@ -316,7 +544,13 @@ fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
                 let e_i = ctx.block_idx(*else_target);
                 f.instruction(&Instruction::LocalGet(ctx.tag_local(*condition)));
                 f.instruction(&Instruction::I32Const(TAG_BOOL));
-                f.instruction(&Instruction::I32Eq);
+                f.instruction(&Instruction::I32Ne);
+                f.instruction(&Instruction::If(BlockType::Empty));
+                f.instruction(&Instruction::Unreachable);
+                f.instruction(&Instruction::End);
+                f.instruction(&Instruction::LocalGet(ctx.data_local(*condition)));
+                f.instruction(&Instruction::I64Const(0));
+                f.instruction(&Instruction::I64Ne);
                 f.instruction(&Instruction::If(BlockType::Empty));
                 bind_block_args(body, *then_target, then_args, ctx, &mut f)?;
                 f.instruction(&Instruction::I32Const(t_i as i32));
@@ -625,22 +859,16 @@ fn emit_unary(
     } else if name == "negate" {
         local_get(f, ctx.tag_local(arg));
         i32(f, TAG_INT);
-        f.instruction(&Instruction::I32Eq);
+        f.instruction(&Instruction::I32Ne);
         f.instruction(&Instruction::If(BlockType::Empty));
+        f.instruction(&Instruction::Unreachable);
+        f.instruction(&Instruction::End);
         i32(f, TAG_INT);
         local_set(f, ctx.tag_local(result));
         i64(f, 0);
         local_get(f, ctx.data_local(arg));
         f.instruction(&Instruction::I64Sub);
         local_set(f, ctx.data_local(result));
-        f.instruction(&Instruction::Br(1));
-        f.instruction(&Instruction::Else);
-        i32(f, TAG_FLOAT);
-        local_set(f, ctx.tag_local(result));
-        local_get(f, ctx.data_local(arg));
-        f.instruction(&Instruction::F64Neg);
-        local_set(f, ctx.data_local(result));
-        f.instruction(&Instruction::End);
     }
     Ok(())
 }
@@ -654,7 +882,12 @@ fn emit_binary(
     f: &mut Function,
 ) -> Result<(), String> {
     let cmp = [
-        "equal", "not_equal", "less", "greater", "less_equal", "greater_equal",
+        "equal",
+        "not_equal",
+        "less",
+        "greater",
+        "less_equal",
+        "greater_equal",
     ];
     if cmp.contains(&name) {
         i32(f, TAG_BOOL);
@@ -673,7 +906,8 @@ fn emit_binary(
                 "subtract" => f.instruction(&Instruction::I64Sub),
                 "multiply" => f.instruction(&Instruction::I64Mul),
                 "divide" => f.instruction(&Instruction::I64DivS),
-                _ => f.instruction(&Instruction::I64Add),
+                "remainder" => f.instruction(&Instruction::I64RemS),
+                _ => f.instruction(&Instruction::Unreachable),
             };
             local_set(f, ctx.data_local(result));
         }
@@ -699,18 +933,9 @@ fn eq_cmp(
     local_get(f, ctx.tag_local(right));
     f.instruction(&Instruction::I32Eq);
     f.instruction(&Instruction::If(BlockType::Empty));
-    local_get(f, ctx.tag_local(left));
-    i32(f, TAG_INT);
-    f.instruction(&Instruction::I32Eq);
-    f.instruction(&Instruction::If(BlockType::Empty));
     local_get(f, ctx.data_local(left));
     local_get(f, ctx.data_local(right));
     f.instruction(&Instruction::I64Eq);
-    f.instruction(&Instruction::Else);
-    local_get(f, ctx.data_local(left));
-    local_get(f, ctx.data_local(right));
-    f.instruction(&Instruction::F64Eq);
-    f.instruction(&Instruction::End);
     f.instruction(&Instruction::Else);
     i64(f, 0);
     f.instruction(&Instruction::End);
@@ -802,7 +1027,14 @@ fn builtin_op_call(
     i32(f, op as i32);
     i32(f, SCRATCH_OFF as i32);
     i32(f, args.len() as i32);
-    i32(f, if extra.is_empty() { 0 } else { extra_scratch as i32 });
+    i32(
+        f,
+        if extra.is_empty() {
+            0
+        } else {
+            extra_scratch as i32
+        },
+    );
     i32(f, extra.len() as i32);
     i32(f, RESULT_OFF as i32);
     f.instruction(&Instruction::Call(0));
