@@ -414,7 +414,7 @@ fn validate_index_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String> 
         return Err("Index requires an Int index in wasm".to_owned());
     }
     match value_type(body, args[0]) {
-        Some(VoxType::Tuple(_)) => Ok(()),
+        Some(VoxType::Tuple(_)) | Some(VoxType::List(_)) => Ok(()),
         ty => Err(format!(
             "Index is not supported for {} in wasm",
             render_mir_type(ty)
@@ -427,7 +427,7 @@ fn validate_updated_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String
         return Err("Updated expected target and replacement arguments".to_owned());
     }
     match value_type(body, args[0]) {
-        Some(VoxType::Record(_)) | Some(VoxType::Tuple(_)) => Ok(()),
+        Some(VoxType::Record(_)) | Some(VoxType::Tuple(_)) | Some(VoxType::List(_)) => Ok(()),
         ty => Err(format!(
             "Updated is not supported for {} in wasm",
             render_mir_type(ty)

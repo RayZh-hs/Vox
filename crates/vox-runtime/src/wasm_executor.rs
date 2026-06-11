@@ -207,7 +207,7 @@ fn handle_builtin_op(
         5 => builtin_project(runtime, &args, &extra),
         6 => builtin_index(runtime, &args),
         7 => builtin_updated(runtime, &args, &extra),
-        8 => builtin_type_test(&args, &extra),
+        8 => builtin_type_test(runtime, &args, &extra),
         9 => builtin_iterator(runtime),
         10 => builtin_iterator_next(runtime),
         11 => builtin_lambda_new(runtime, &extra),
@@ -380,9 +380,9 @@ fn builtin_index(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64
     if args.len() != 2 {
         return Err("Index expects target and index args".to_owned());
     }
-    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
     let index = wasm_to_inline(runtime, args[1].0, args[1].1)?;
-    inline_result_to_wasm(runtime, index_inline(target, index)?)
+    let target = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    handle_data_result_to_wasm(runtime, index_data(target, index)?)
 }
 
 fn builtin_updated(
@@ -393,19 +393,26 @@ fn builtin_updated(
     if args.len() != 2 || extra.is_empty() {
         return Err("Updated expects target, replacement, and path data".to_owned());
     }
-    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
-    let replacement = wasm_to_inline(runtime, args[1].0, args[1].1)?;
+    let target = wasm_to_data(runtime, args[0].0, args[0].1)?;
+    let replacement = wasm_to_data(runtime, args[1].0, args[1].1)?;
     let path = parse_update_path(&extra[0])?;
-    inline_result_to_wasm(runtime, update_inline(target, &path, replacement)?)
+    handle_data_result_to_wasm(runtime, update_data(target, &path, replacement)?)
 }
 
-fn builtin_type_test(args: &[(i32, i64)], extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
+fn builtin_type_test(
+    runtime: &Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
     if extra.is_empty() || args.is_empty() {
         return Err("TypeTest missing data".to_owned());
     }
     let ty = String::from_utf8(extra[0].clone()).unwrap_or_default();
-    let expected = name_to_tag(&ty);
-    let result = if args[0].0 == expected { 1i64 } else { 0i64 };
+    let result = if wasm_matches_type(runtime, args[0].0, args[0].1, &ty) {
+        1i64
+    } else {
+        0i64
+    };
     Ok((TAG_BOOL, result))
 }
 
@@ -576,6 +583,70 @@ fn inline_result_to_wasm(runtime: &mut Runtime, value: InlineValue) -> Result<(i
     }
 }
 
+fn wasm_to_data(runtime: &Runtime, tag: i32, val: i64) -> Result<HandleData, String> {
+    match tag {
+        TAG_INT => Ok(HandleData::Int(val)),
+        TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
+        TAG_BOOL => Ok(HandleData::Bool(val != 0)),
+        TAG_NULL => Ok(HandleData::Null),
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST | TAG_HANDLE => {
+            runtime.get_handle_data(HandleId(val as u64))
+        }
+        _ => Err(format!("unknown wasm value tag {tag}")),
+    }
+}
+
+fn handle_data_result_to_wasm(
+    runtime: &mut Runtime,
+    data: HandleData,
+) -> Result<(i32, i64), String> {
+    match data {
+        HandleData::Null => Ok((TAG_NULL, 0)),
+        HandleData::Bool(value) => Ok((TAG_BOOL, value as i64)),
+        HandleData::Int(value) => Ok((TAG_INT, value)),
+        HandleData::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
+        HandleData::String(value) => {
+            let summary = HandleSummary {
+                type_name: "String".to_owned(),
+                summary: value.clone(),
+                bytes: Some(value.len() as u64),
+            };
+            let handle = runtime.allocate_serializable_handle(summary, HandleData::String(value));
+            Ok((TAG_STRING, handle.0 as i64))
+        }
+        HandleData::Tuple(values) => {
+            let data = HandleData::Tuple(values);
+            let summary = HandleSummary {
+                type_name: "Tuple".to_owned(),
+                summary: render_handle_data(&data),
+                bytes: None,
+            };
+            let handle = runtime.allocate_serializable_handle(summary, data);
+            Ok((TAG_TUPLE, handle.0 as i64))
+        }
+        HandleData::Record(fields) => {
+            let data = HandleData::Record(fields);
+            let summary = HandleSummary {
+                type_name: "Record".to_owned(),
+                summary: render_handle_data(&data),
+                bytes: None,
+            };
+            let handle = runtime.allocate_serializable_handle(summary, data);
+            Ok((TAG_RECORD, handle.0 as i64))
+        }
+        HandleData::List(values) => {
+            let data = HandleData::List(values);
+            let summary = HandleSummary {
+                type_name: "List".to_owned(),
+                summary: render_handle_data(&data),
+                bytes: None,
+            };
+            let handle = runtime.allocate_serializable_handle(summary, data);
+            Ok((TAG_LIST, handle.0 as i64))
+        }
+    }
+}
+
 fn handle_data_to_inline(data: HandleData) -> Result<InlineValue, String> {
     match data {
         HandleData::Null => Ok(InlineValue::Null),
@@ -619,6 +690,77 @@ fn handle_data_from_inline(value: &InlineValue) -> Result<HandleData, String> {
             handle.0
         )),
     }
+}
+
+fn wasm_matches_type(runtime: &Runtime, tag: i32, val: i64, ty: &str) -> bool {
+    match (ty, tag) {
+        ("Int", TAG_INT)
+        | ("Float", TAG_FLOAT)
+        | ("Bool", TAG_BOOL)
+        | ("String", TAG_STRING)
+        | ("Null", TAG_NULL)
+        | ("Tuple", TAG_TUPLE)
+        | ("Record", TAG_RECORD)
+        | ("List", TAG_LIST) => return true,
+        ("Unit", TAG_TUPLE) => {
+            return matches!(
+                runtime.get_handle_data(HandleId(val as u64)),
+                Ok(HandleData::Tuple(items)) if items.is_empty()
+            );
+        }
+        _ => {}
+    }
+
+    if let Some(expected_tag) = primitive_type_tag(ty) {
+        return tag == expected_tag;
+    }
+
+    let handle = match tag {
+        TAG_HANDLE | TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST => HandleId(val as u64),
+        _ => return false,
+    };
+
+    let Some(summary) = runtime.describe_handle(handle) else {
+        return false;
+    };
+    let handle_type = summary.type_name;
+
+    if type_name_matches(&handle_type, ty) {
+        return true;
+    }
+
+    runtime.host.packages().any(|manifest| {
+        manifest.trait_impls.iter().any(|(trait_qt, impl_types)| {
+            let full_trait_name = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
+            if !type_name_matches(&full_trait_name, ty) && trait_qt.name != ty {
+                return false;
+            }
+            impl_types.iter().any(|impl_qt| {
+                let full_impl_name = format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                type_name_matches(&handle_type, &full_impl_name) || handle_type == impl_qt.name
+            })
+        })
+    })
+}
+
+fn primitive_type_tag(ty: &str) -> Option<i32> {
+    match ty {
+        "Int" => Some(TAG_INT),
+        "Float" => Some(TAG_FLOAT),
+        "Bool" => Some(TAG_BOOL),
+        "String" => Some(TAG_STRING),
+        "Null" => Some(TAG_NULL),
+        "Tuple" => Some(TAG_TUPLE),
+        "Record" => Some(TAG_RECORD),
+        "List" => Some(TAG_LIST),
+        _ => None,
+    }
+}
+
+fn type_name_matches(actual: &str, expected: &str) -> bool {
+    actual == expected
+        || actual.ends_with(&format!(".{expected}"))
+        || expected.ends_with(&format!(".{actual}"))
 }
 
 #[derive(Debug, Clone)]
@@ -712,34 +854,38 @@ fn project_inline(
     }
 }
 
-fn index_inline(target: InlineValue, index: InlineValue) -> Result<InlineValue, String> {
+fn index_data(target: HandleData, index: InlineValue) -> Result<HandleData, String> {
     let InlineValue::Int(index) = index else {
         return Err("index expressions require an Int index".to_owned());
     };
     let index = usize::try_from(index)
         .map_err(|_| "index expressions require a non-negative index".to_owned())?;
     match target {
-        InlineValue::Tuple(items) => items
+        HandleData::Tuple(items) => items
             .get(index)
             .cloned()
             .ok_or_else(|| format!("tuple index {index} is out of bounds")),
+        HandleData::List(items) => items
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("list index {index} is out of bounds")),
         other => Err(format!(
             "indexing is not supported for {}",
-            inline_type_name(&other)
+            handle_data_type_name(&other)
         )),
     }
 }
 
-fn update_inline(
-    target: InlineValue,
+fn update_data(
+    target: HandleData,
     path: &[RuntimePathSegment],
-    replacement: InlineValue,
-) -> Result<InlineValue, String> {
+    replacement: HandleData,
+) -> Result<HandleData, String> {
     let Some((segment, rest)) = path.split_first() else {
         return Err("updated path cannot be empty".to_owned());
     };
     match (target, segment) {
-        (InlineValue::Record(mut fields), RuntimePathSegment::Field(name)) => {
+        (HandleData::Record(mut fields), RuntimePathSegment::Field(name)) => {
             let current = fields
                 .get(name)
                 .cloned()
@@ -747,25 +893,36 @@ fn update_inline(
             let next = if rest.is_empty() {
                 replacement
             } else {
-                update_inline(current, rest, replacement)?
+                update_data(current, rest, replacement)?
             };
             fields.insert(name.clone(), next);
-            Ok(InlineValue::Record(fields))
+            Ok(HandleData::Record(fields))
         }
-        (InlineValue::Tuple(mut items), RuntimePathSegment::Index(index)) => {
+        (HandleData::Tuple(mut items), RuntimePathSegment::Index(index)) => {
             let slot = items
                 .get_mut(*index)
                 .ok_or_else(|| format!("tuple index {index} is out of bounds"))?;
             *slot = if rest.is_empty() {
                 replacement
             } else {
-                update_inline(slot.clone(), rest, replacement)?
+                update_data(slot.clone(), rest, replacement)?
             };
-            Ok(InlineValue::Tuple(items))
+            Ok(HandleData::Tuple(items))
+        }
+        (HandleData::List(mut items), RuntimePathSegment::Index(index)) => {
+            let slot = items
+                .get_mut(*index)
+                .ok_or_else(|| format!("list index {index} is out of bounds"))?;
+            *slot = if rest.is_empty() {
+                replacement
+            } else {
+                update_data(slot.clone(), rest, replacement)?
+            };
+            Ok(HandleData::List(items))
         }
         (other, _) => Err(format!(
             "updated is not supported for {}",
-            inline_type_name(&other)
+            handle_data_type_name(&other)
         )),
     }
 }
@@ -787,6 +944,53 @@ fn inline_type_name(value: &InlineValue) -> &'static str {
         InlineValue::Tuple(_) => "Tuple",
         InlineValue::Record(_) => "Record",
         InlineValue::Handle(_) => "Handle",
+    }
+}
+
+fn handle_data_type_name(value: &HandleData) -> &'static str {
+    match value {
+        HandleData::Null => "Null",
+        HandleData::Bool(_) => "Bool",
+        HandleData::Int(_) => "Int",
+        HandleData::Float(_) => "Float",
+        HandleData::String(_) => "String",
+        HandleData::Tuple(_) => "Tuple",
+        HandleData::Record(_) => "Record",
+        HandleData::List(_) => "List",
+    }
+}
+
+fn render_handle_data(value: &HandleData) -> String {
+    match value {
+        HandleData::Null => "null".to_owned(),
+        HandleData::Bool(value) => value.to_string(),
+        HandleData::Int(value) => value.to_string(),
+        HandleData::Float(value) => value.to_string(),
+        HandleData::String(value) => value.clone(),
+        HandleData::Tuple(values) => format!(
+            "({})",
+            values
+                .iter()
+                .map(render_handle_data)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HandleData::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", render_handle_data(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HandleData::List(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(render_handle_data)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -814,17 +1018,6 @@ fn render_inline(value: &InlineValue) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-    }
-}
-
-fn name_to_tag(name: &str) -> i32 {
-    match name {
-        "Int" => TAG_INT,
-        "Float" => TAG_FLOAT,
-        "Bool" => TAG_BOOL,
-        "String" => TAG_STRING,
-        "Null" => TAG_NULL,
-        _ => -1,
     }
 }
 
