@@ -281,13 +281,26 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
         MirOpKind::Unit => Err("Unit lowering still uses an Int(0) sentinel".to_owned()),
         MirOpKind::Unary(name) => match name.as_str() {
             "not" => require_args(body, args, &[WasmScalar::Bool], "not"),
-            "negate" => require_args(body, args, &[WasmScalar::Int], "negate"),
+            "negate" => require_numeric_args(body, args, 1, "negate", true).map(|_| ()),
             other => Err(format!("unsupported unary op `{other}` in wasm")),
         },
         MirOpKind::Binary(name) => match name.as_str() {
-            "add" | "subtract" | "multiply" | "divide" | "remainder" | "less" | "greater"
-            | "less_equal" | "greater_equal" => {
-                require_args(body, args, &[WasmScalar::Int, WasmScalar::Int], name)
+            "add" | "subtract" | "multiply" | "divide" => {
+                require_numeric_args(body, args, 2, name, true).map(|_| ())
+            }
+            "remainder" => {
+                let scalars = require_numeric_args(body, args, 2, name, true)?;
+                if scalars.iter().all(|scalar| *scalar == WasmScalar::Int) {
+                    Ok(())
+                } else {
+                    Err(
+                        "float remainder needs runtime support because wasm has no f64.rem opcode"
+                            .to_owned(),
+                    )
+                }
+            }
+            "less" | "greater" | "less_equal" | "greater_equal" => {
+                require_numeric_args(body, args, 2, name, true).map(|_| ())
             }
             "equal" | "not_equal" => {
                 if args.len() != 2 {
@@ -297,7 +310,9 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
                     .ok_or_else(|| format!("binary op `{name}` has unsupported left operand"))?;
                 let right = wasm_scalar_type(body, args[1])
                     .ok_or_else(|| format!("binary op `{name}` has unsupported right operand"))?;
-                if left == right && matches!(left, WasmScalar::Int | WasmScalar::Bool) {
+                if left == right
+                    && matches!(left, WasmScalar::Int | WasmScalar::Float | WasmScalar::Bool)
+                {
                     Ok(())
                 } else {
                     Err(format!(
@@ -363,6 +378,7 @@ fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WasmScalar {
     Int,
+    Float,
     Bool,
     Null,
 }
@@ -371,6 +387,7 @@ impl WasmScalar {
     fn as_str(self) -> &'static str {
         match self {
             Self::Int => "Int",
+            Self::Float => "Float",
             Self::Bool => "Bool",
             Self::Null => "Null",
         }
@@ -405,13 +422,50 @@ fn require_args(
     Ok(())
 }
 
+fn require_numeric_args(
+    body: &MirBody,
+    args: &[MirValueId],
+    count: usize,
+    op: &str,
+    allow_mixed: bool,
+) -> Result<Vec<WasmScalar>, String> {
+    if args.len() != count {
+        return Err(format!("op `{op}` expected {count} args"));
+    }
+    let mut scalars = Vec::new();
+    for arg in args {
+        let Some(actual) = wasm_scalar_type(body, *arg) else {
+            return Err(format!(
+                "op `{op}` argument %{} has unsupported wasm type {}",
+                arg.0,
+                render_mir_type(value_type(body, *arg))
+            ));
+        };
+        if !matches!(actual, WasmScalar::Int | WasmScalar::Float) {
+            return Err(format!(
+                "op `{op}` expected numeric operand, found {}",
+                actual.as_str()
+            ));
+        }
+        scalars.push(actual);
+    }
+    if !allow_mixed && scalars.windows(2).any(|pair| pair[0] != pair[1]) {
+        return Err(format!("op `{op}` does not support mixed numeric operands"));
+    }
+    Ok(scalars)
+}
+
 fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
-    matches!(ty, None | Some(VoxType::Int | VoxType::Bool))
+    matches!(
+        ty,
+        None | Some(VoxType::Int | VoxType::Float | VoxType::Bool)
+    )
 }
 
 fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
     match value_type(body, value) {
         Some(VoxType::Int) => Some(WasmScalar::Int),
+        Some(VoxType::Float) => Some(WasmScalar::Float),
         Some(VoxType::Bool) => Some(WasmScalar::Bool),
         None => Some(WasmScalar::Null),
         _ => None,
@@ -616,7 +670,7 @@ fn emit_op(
     result: Option<MirValueId>,
     ctx: &mut Ctx,
     f: &mut Function,
-    _body: &MirBody,
+    body: &MirBody,
 ) -> Result<(), String> {
     match kind {
         MirOpKind::Literal(val) => emit_literal(val, result, ctx, f)?,
@@ -656,13 +710,13 @@ fn emit_op(
         }
         MirOpKind::Unary(name) => {
             if let (Some(rid), Some(&arg)) = (result, args.first()) {
-                emit_unary(name, arg, rid, ctx, f)?;
+                emit_unary(name, arg, rid, ctx, f, body)?;
             }
         }
         MirOpKind::Binary(name) => {
             let s: &[MirValueId] = args;
             if let (Some(rid), [left, right]) = (result, s) {
-                emit_binary(name, *left, *right, rid, ctx, f)?;
+                emit_binary(name, *left, *right, rid, ctx, f, body)?;
             }
         }
         MirOpKind::Tuple { .. } => {
@@ -783,6 +837,7 @@ fn emit_literal(
             i32(f, TAG_FLOAT);
             local_set(f, ctx.tag_local(rid));
             f.instruction(&Instruction::F64Const(*v));
+            f.instruction(&Instruction::I64ReinterpretF64);
             f.instruction(&Instruction::LocalSet(ctx.data_local(rid)));
         }
         InlineValue::Bool(v) => {
@@ -848,6 +903,7 @@ fn emit_unary(
     result: MirValueId,
     ctx: &Ctx,
     f: &mut Function,
+    body: &MirBody,
 ) -> Result<(), String> {
     if name == "not" {
         i32(f, TAG_BOOL);
@@ -857,18 +913,27 @@ fn emit_unary(
         f.instruction(&Instruction::I64Eq);
         local_set(f, ctx.data_local(result));
     } else if name == "negate" {
-        local_get(f, ctx.tag_local(arg));
-        i32(f, TAG_INT);
-        f.instruction(&Instruction::I32Ne);
-        f.instruction(&Instruction::If(BlockType::Empty));
-        f.instruction(&Instruction::Unreachable);
-        f.instruction(&Instruction::End);
-        i32(f, TAG_INT);
-        local_set(f, ctx.tag_local(result));
-        i64(f, 0);
-        local_get(f, ctx.data_local(arg));
-        f.instruction(&Instruction::I64Sub);
-        local_set(f, ctx.data_local(result));
+        match wasm_scalar_type(body, arg) {
+            Some(WasmScalar::Int) => {
+                emit_tag_check(f, ctx, arg, TAG_INT);
+                i32(f, TAG_INT);
+                local_set(f, ctx.tag_local(result));
+                i64(f, 0);
+                local_get(f, ctx.data_local(arg));
+                f.instruction(&Instruction::I64Sub);
+                local_set(f, ctx.data_local(result));
+            }
+            Some(WasmScalar::Float) => {
+                emit_tag_check(f, ctx, arg, TAG_FLOAT);
+                i32(f, TAG_FLOAT);
+                local_set(f, ctx.tag_local(result));
+                emit_value_as_f64(f, ctx, arg, WasmScalar::Float);
+                f.instruction(&Instruction::F64Neg);
+                f.instruction(&Instruction::I64ReinterpretF64);
+                local_set(f, ctx.data_local(result));
+            }
+            _ => return Err("negate expects Int or Float".to_owned()),
+        }
     }
     Ok(())
 }
@@ -880,6 +945,7 @@ fn emit_binary(
     result: MirValueId,
     ctx: &Ctx,
     f: &mut Function,
+    body: &MirBody,
 ) -> Result<(), String> {
     let cmp = [
         "equal",
@@ -899,22 +965,12 @@ fn emit_binary(
 
     match name {
         "add" | "subtract" | "multiply" | "divide" | "remainder" => {
-            local_get(f, ctx.data_local(left));
-            local_get(f, ctx.data_local(right));
-            match name {
-                "add" => f.instruction(&Instruction::I64Add),
-                "subtract" => f.instruction(&Instruction::I64Sub),
-                "multiply" => f.instruction(&Instruction::I64Mul),
-                "divide" => f.instruction(&Instruction::I64DivS),
-                "remainder" => f.instruction(&Instruction::I64RemS),
-                _ => f.instruction(&Instruction::Unreachable),
-            };
-            local_set(f, ctx.data_local(result));
+            emit_numeric_binary(name, left, right, result, ctx, f, body)?;
         }
-        "equal" => eq_cmp(left, right, result, false, ctx, f)?,
-        "not_equal" => eq_cmp(left, right, result, true, ctx, f)?,
+        "equal" => eq_cmp(left, right, result, false, ctx, f, body)?,
+        "not_equal" => eq_cmp(left, right, result, true, ctx, f, body)?,
         "less" | "greater" | "less_equal" | "greater_equal" => {
-            cmp_op(left, right, result, name, ctx, f)?;
+            cmp_op(left, right, result, name, ctx, f, body)?;
         }
         _ => {}
     }
@@ -928,17 +984,25 @@ fn eq_cmp(
     negate: bool,
     ctx: &Ctx,
     f: &mut Function,
+    body: &MirBody,
 ) -> Result<(), String> {
-    local_get(f, ctx.tag_local(left));
-    local_get(f, ctx.tag_local(right));
-    f.instruction(&Instruction::I32Eq);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    local_get(f, ctx.data_local(left));
-    local_get(f, ctx.data_local(right));
-    f.instruction(&Instruction::I64Eq);
-    f.instruction(&Instruction::Else);
-    i64(f, 0);
-    f.instruction(&Instruction::End);
+    let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
+    let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
+    if left_ty != right_ty {
+        i32(f, 0);
+    } else if left_ty == WasmScalar::Float {
+        emit_tag_check(f, ctx, left, TAG_FLOAT);
+        emit_tag_check(f, ctx, right, TAG_FLOAT);
+        emit_value_as_f64(f, ctx, left, left_ty);
+        emit_value_as_f64(f, ctx, right, right_ty);
+        f.instruction(&Instruction::F64Eq);
+    } else {
+        emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
+        emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
+        local_get(f, ctx.data_local(left));
+        local_get(f, ctx.data_local(right));
+        f.instruction(&Instruction::I64Eq);
+    }
     if negate {
         f.instruction(&Instruction::I32Eqz);
     }
@@ -954,28 +1018,121 @@ fn cmp_op(
     op: &str,
     ctx: &Ctx,
     f: &mut Function,
+    body: &MirBody,
 ) -> Result<(), String> {
-    local_get(f, ctx.tag_local(left));
-    i32(f, TAG_INT);
-    f.instruction(&Instruction::I32Eq);
-    f.instruction(&Instruction::If(BlockType::Empty));
-    local_get(f, ctx.data_local(left));
-    local_get(f, ctx.data_local(right));
-    match op {
-        "less" => f.instruction(&Instruction::I64LtS),
-        "greater" => f.instruction(&Instruction::I64GtS),
-        "less_equal" => f.instruction(&Instruction::I64LeS),
-        "greater_equal" => f.instruction(&Instruction::I64GeS),
-        _ => f.instruction(&Instruction::I64Add),
-    };
+    let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
+    let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
+    if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
+        emit_tag_check(f, ctx, left, TAG_INT);
+        emit_tag_check(f, ctx, right, TAG_INT);
+        local_get(f, ctx.data_local(left));
+        local_get(f, ctx.data_local(right));
+        match op {
+            "less" => f.instruction(&Instruction::I64LtS),
+            "greater" => f.instruction(&Instruction::I64GtS),
+            "less_equal" => f.instruction(&Instruction::I64LeS),
+            "greater_equal" => f.instruction(&Instruction::I64GeS),
+            _ => f.instruction(&Instruction::Unreachable),
+        };
+    } else {
+        emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
+        emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
+        emit_value_as_f64(f, ctx, left, left_ty);
+        emit_value_as_f64(f, ctx, right, right_ty);
+        match op {
+            "less" => f.instruction(&Instruction::F64Lt),
+            "greater" => f.instruction(&Instruction::F64Gt),
+            "less_equal" => f.instruction(&Instruction::F64Le),
+            "greater_equal" => f.instruction(&Instruction::F64Ge),
+            _ => f.instruction(&Instruction::Unreachable),
+        };
+    }
     i64_extend(f);
     local_set(f, ctx.data_local(result));
-    f.instruction(&Instruction::Br(1));
-    f.instruction(&Instruction::Else);
-    i64(f, 0);
-    local_set(f, ctx.data_local(result));
-    f.instruction(&Instruction::End);
     Ok(())
+}
+
+fn emit_numeric_binary(
+    name: &str,
+    left: MirValueId,
+    right: MirValueId,
+    result: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
+    let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
+    if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
+        emit_tag_check(f, ctx, left, TAG_INT);
+        emit_tag_check(f, ctx, right, TAG_INT);
+        i32(f, TAG_INT);
+        local_set(f, ctx.tag_local(result));
+        local_get(f, ctx.data_local(left));
+        local_get(f, ctx.data_local(right));
+        match name {
+            "add" => f.instruction(&Instruction::I64Add),
+            "subtract" => f.instruction(&Instruction::I64Sub),
+            "multiply" => f.instruction(&Instruction::I64Mul),
+            "divide" => f.instruction(&Instruction::I64DivS),
+            "remainder" => f.instruction(&Instruction::I64RemS),
+            _ => f.instruction(&Instruction::Unreachable),
+        };
+        local_set(f, ctx.data_local(result));
+    } else {
+        if name == "remainder" {
+            return Err("float remainder cannot be lowered to core wasm".to_owned());
+        }
+        emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
+        emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
+        i32(f, TAG_FLOAT);
+        local_set(f, ctx.tag_local(result));
+        emit_value_as_f64(f, ctx, left, left_ty);
+        emit_value_as_f64(f, ctx, right, right_ty);
+        match name {
+            "add" => f.instruction(&Instruction::F64Add),
+            "subtract" => f.instruction(&Instruction::F64Sub),
+            "multiply" => f.instruction(&Instruction::F64Mul),
+            "divide" => f.instruction(&Instruction::F64Div),
+            _ => f.instruction(&Instruction::Unreachable),
+        };
+        f.instruction(&Instruction::I64ReinterpretF64);
+        local_set(f, ctx.data_local(result));
+    }
+    Ok(())
+}
+
+fn emit_value_as_f64(f: &mut Function, ctx: &Ctx, value: MirValueId, ty: WasmScalar) {
+    local_get(f, ctx.data_local(value));
+    match ty {
+        WasmScalar::Int => {
+            f.instruction(&Instruction::F64ConvertI64S);
+        }
+        WasmScalar::Float => {
+            f.instruction(&Instruction::F64ReinterpretI64);
+        }
+        WasmScalar::Bool | WasmScalar::Null => {
+            f.instruction(&Instruction::Unreachable);
+        }
+    }
+}
+
+fn emit_tag_check(f: &mut Function, ctx: &Ctx, value: MirValueId, expected: i32) {
+    local_get(f, ctx.tag_local(value));
+    i32(f, expected);
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+}
+
+fn tag_for_scalar(ty: WasmScalar) -> Result<i32, String> {
+    match ty {
+        WasmScalar::Int => Ok(TAG_INT),
+        WasmScalar::Float => Ok(TAG_FLOAT),
+        WasmScalar::Bool => Ok(TAG_BOOL),
+        WasmScalar::Null => Ok(TAG_NULL),
+    }
 }
 
 fn builtin_op_call(
