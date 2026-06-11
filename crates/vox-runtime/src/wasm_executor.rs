@@ -215,6 +215,7 @@ fn handle_builtin_op(
         13 => builtin_non_null(&args),
         14 => builtin_safe_project(runtime, &args, &extra),
         15 => builtin_string_binary(runtime, &args, &extra),
+        16 => builtin_numeric_checked(runtime, &args, &extra),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -389,6 +390,55 @@ fn builtin_string_binary(
         "less_equal" => Ok((TAG_BOOL, (left <= right) as i64)),
         "greater_equal" => Ok((TAG_BOOL, (left >= right) as i64)),
         other => Err(format!("unsupported StringBinary op `{other}`")),
+    }
+}
+
+fn builtin_numeric_checked(
+    runtime: &Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if args.len() != 2 || extra.is_empty() {
+        return Err("NumericChecked expects two args and an op name".to_owned());
+    }
+    let op = std::str::from_utf8(&extra[0])
+        .map_err(|error| format!("invalid NumericChecked op name: {error}"))?;
+    let left = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let right = wasm_to_inline(runtime, args[1].0, args[1].1)?;
+    match (op, left, right) {
+        ("divide", InlineValue::Int(_), InlineValue::Int(0)) => {
+            Err("integer division by zero".to_owned())
+        }
+        ("remainder", InlineValue::Int(_), InlineValue::Int(0)) => {
+            Err("integer remainder by zero".to_owned())
+        }
+        ("divide", InlineValue::Int(left), InlineValue::Int(right)) => Ok((TAG_INT, left / right)),
+        ("remainder", InlineValue::Int(left), InlineValue::Int(right)) => {
+            Ok((TAG_INT, left % right))
+        }
+        ("divide", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Ok((TAG_FLOAT, (left / right).to_bits() as i64))
+        }
+        ("remainder", InlineValue::Float(left), InlineValue::Float(right)) => {
+            Ok((TAG_FLOAT, (left % right).to_bits() as i64))
+        }
+        ("divide", InlineValue::Int(left), InlineValue::Float(right)) => {
+            Ok((TAG_FLOAT, ((left as f64) / right).to_bits() as i64))
+        }
+        ("remainder", InlineValue::Int(left), InlineValue::Float(right)) => {
+            Ok((TAG_FLOAT, ((left as f64) % right).to_bits() as i64))
+        }
+        ("divide", InlineValue::Float(left), InlineValue::Int(right)) => {
+            Ok((TAG_FLOAT, (left / right as f64).to_bits() as i64))
+        }
+        ("remainder", InlineValue::Float(left), InlineValue::Int(right)) => {
+            Ok((TAG_FLOAT, (left % right as f64).to_bits() as i64))
+        }
+        (other, left, right) => Err(format!(
+            "numeric `{other}` is not defined for {} and {}",
+            inline_type_name(&left),
+            inline_type_name(&right)
+        )),
     }
 }
 

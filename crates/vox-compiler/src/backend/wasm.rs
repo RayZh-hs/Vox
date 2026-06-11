@@ -55,6 +55,7 @@ enum BuiltinOp {
     NonNull = 13,
     SafeProject = 14,
     StringBinary = 15,
+    NumericChecked = 16,
 }
 
 struct Ctx {
@@ -291,17 +292,7 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
             "subtract" | "multiply" | "divide" => {
                 require_numeric_args(body, args, 2, name, true).map(|_| ())
             }
-            "remainder" => {
-                let scalars = require_numeric_args(body, args, 2, name, true)?;
-                if scalars.iter().all(|scalar| *scalar == WasmScalar::Int) {
-                    Ok(())
-                } else {
-                    Err(
-                        "float remainder needs runtime support because wasm has no f64.rem opcode"
-                            .to_owned(),
-                    )
-                }
-            }
+            "remainder" => require_numeric_args(body, args, 2, name, true).map(|_| ()),
             "less" | "greater" | "less_equal" | "greater_equal" => {
                 validate_order_op(body, args, name)
             }
@@ -1214,12 +1205,22 @@ fn emit_numeric_binary(
     left: MirValueId,
     right: MirValueId,
     result: MirValueId,
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     f: &mut Function,
     body: &MirBody,
 ) -> Result<(), String> {
     let left_ty = wasm_scalar_type(body, left).ok_or_else(|| "missing left type".to_owned())?;
     let right_ty = wasm_scalar_type(body, right).ok_or_else(|| "missing right type".to_owned())?;
+    if matches!(name, "divide" | "remainder") {
+        return builtin_op_call(
+            BuiltinOp::NumericChecked,
+            &[left, right],
+            &[name.as_bytes().to_vec()],
+            result,
+            ctx,
+            f,
+        );
+    }
     if left_ty == WasmScalar::Int && right_ty == WasmScalar::Int {
         emit_tag_check(f, ctx, left, TAG_INT);
         emit_tag_check(f, ctx, right, TAG_INT);
@@ -1231,15 +1232,10 @@ fn emit_numeric_binary(
             "add" => f.instruction(&Instruction::I64Add),
             "subtract" => f.instruction(&Instruction::I64Sub),
             "multiply" => f.instruction(&Instruction::I64Mul),
-            "divide" => f.instruction(&Instruction::I64DivS),
-            "remainder" => f.instruction(&Instruction::I64RemS),
             _ => f.instruction(&Instruction::Unreachable),
         };
         local_set(f, ctx.data_local(result));
     } else {
-        if name == "remainder" {
-            return Err("float remainder cannot be lowered to core wasm".to_owned());
-        }
         emit_tag_check(f, ctx, left, tag_for_scalar(left_ty)?);
         emit_tag_check(f, ctx, right, tag_for_scalar(right_ty)?);
         i32(f, TAG_FLOAT);
@@ -1250,7 +1246,6 @@ fn emit_numeric_binary(
             "add" => f.instruction(&Instruction::F64Add),
             "subtract" => f.instruction(&Instruction::F64Sub),
             "multiply" => f.instruction(&Instruction::F64Mul),
-            "divide" => f.instruction(&Instruction::F64Div),
             _ => f.instruction(&Instruction::Unreachable),
         };
         f.instruction(&Instruction::I64ReinterpretF64);
