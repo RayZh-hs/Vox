@@ -324,16 +324,16 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
             }
             other => Err(format!("unsupported binary op `{other}` in wasm")),
         },
-        MirOpKind::TypeTest(_) => Ok(()),
-        MirOpKind::SafeProject(_)
+        MirOpKind::TypeTest(_)
         | MirOpKind::Tuple { .. }
         | MirOpKind::Record { .. }
-        | MirOpKind::List
-        | MirOpKind::StringInterpolate { .. }
-        | MirOpKind::Project(_)
-        | MirOpKind::Index
-        | MirOpKind::Updated { .. }
-        | MirOpKind::Call { .. }
+        | MirOpKind::List => Ok(()),
+        MirOpKind::StringInterpolate { .. } => validate_string_interpolate_op(body, args),
+        MirOpKind::Project(projection) => validate_projection_op(body, args, projection),
+        MirOpKind::SafeProject(_) => validate_record_like_arg(body, args, "SafeProject"),
+        MirOpKind::Index => validate_index_op(body, args),
+        MirOpKind::Updated { .. } => validate_updated_op(body, args),
+        MirOpKind::Call { .. }
         | MirOpKind::Lambda { .. }
         | MirOpKind::Econ { .. }
         | MirOpKind::Iterator
@@ -362,17 +362,103 @@ fn validate_wasm_terminator(body: &MirBody, terminator: &MirTerminator) -> Resul
 
 fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
     match value {
-        InlineValue::Int(_) | InlineValue::Bool(_) | InlineValue::Null => Ok(()),
-        InlineValue::Float(_) => {
-            Err("Float literals are not type-safe in wasm locals yet".to_owned())
-        }
-        InlineValue::String(_) => Err("String literals require handle-backed wasm data".to_owned()),
+        InlineValue::Int(_)
+        | InlineValue::Float(_)
+        | InlineValue::Bool(_)
+        | InlineValue::String(_)
+        | InlineValue::Null => Ok(()),
         InlineValue::Tuple(_) => Err("Tuple literals require handle-backed wasm data".to_owned()),
         InlineValue::Record(_) => Err("Record literals require handle-backed wasm data".to_owned()),
         InlineValue::Handle(_) => {
             Err("Handle literals cannot be materialized by wasm yet".to_owned())
         }
     }
+}
+
+fn validate_projection_op(
+    body: &MirBody,
+    args: &[MirValueId],
+    projection: &MirProjection,
+) -> Result<(), String> {
+    if args.len() != 1 {
+        return Err("Project expected 1 argument".to_owned());
+    }
+    match (value_type(body, args[0]), projection) {
+        (Some(VoxType::Record(_)), MirProjection::Field(_)) => Ok(()),
+        (Some(VoxType::Tuple(_)), MirProjection::Slot(_)) => Ok(()),
+        (ty, _) => Err(format!(
+            "Project is not supported for {} in wasm",
+            render_mir_type(ty)
+        )),
+    }
+}
+
+fn validate_record_like_arg(body: &MirBody, args: &[MirValueId], op: &str) -> Result<(), String> {
+    if args.len() != 1 {
+        return Err(format!("{op} expected 1 argument"));
+    }
+    match value_type(body, args[0]) {
+        Some(VoxType::Record(_)) => Ok(()),
+        ty => Err(format!(
+            "{op} is not supported for {} in wasm",
+            render_mir_type(ty)
+        )),
+    }
+}
+
+fn validate_index_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("Index expected target and index arguments".to_owned());
+    }
+    if wasm_scalar_type(body, args[1]) != Some(WasmScalar::Int) {
+        return Err("Index requires an Int index in wasm".to_owned());
+    }
+    match value_type(body, args[0]) {
+        Some(VoxType::Tuple(_)) => Ok(()),
+        ty => Err(format!(
+            "Index is not supported for {} in wasm",
+            render_mir_type(ty)
+        )),
+    }
+}
+
+fn validate_updated_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("Updated expected target and replacement arguments".to_owned());
+    }
+    match value_type(body, args[0]) {
+        Some(VoxType::Record(_)) | Some(VoxType::Tuple(_)) => Ok(()),
+        ty => Err(format!(
+            "Updated is not supported for {} in wasm",
+            render_mir_type(ty)
+        )),
+    }
+}
+
+fn validate_string_interpolate_op(body: &MirBody, args: &[MirValueId]) -> Result<(), String> {
+    for arg in args {
+        match value_type(body, *arg) {
+            Some(VoxType::List(_)) => {
+                return Err("StringInterpolate cannot render List handles in wasm yet".to_owned());
+            }
+            Some(
+                VoxType::Int
+                | VoxType::Float
+                | VoxType::Bool
+                | VoxType::String
+                | VoxType::Tuple(_)
+                | VoxType::Record(_),
+            )
+            | None => {}
+            ty => {
+                return Err(format!(
+                    "StringInterpolate is not supported for {} in wasm",
+                    render_mir_type(ty)
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,7 +544,8 @@ fn require_numeric_args(
 fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
     matches!(
         ty,
-        None | Some(VoxType::Int | VoxType::Float | VoxType::Bool)
+        None | Some(VoxType::Int | VoxType::Float | VoxType::Bool | VoxType::String)
+            | Some(VoxType::Tuple(_) | VoxType::Record(_) | VoxType::List(_))
     )
 }
 

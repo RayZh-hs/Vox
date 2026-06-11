@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use wasmtime::*;
 
 use vox_core::{
     ids::HandleId,
     source::ModulePath,
-    value::{HandleSummary, InlineValue, RuntimeValue},
+    value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
 use crate::{HostCallArgument, Runtime};
@@ -198,20 +200,20 @@ fn handle_builtin_op(
 
     match op_id {
         0 => builtin_tuple_new(runtime, &args),
-        1 => builtin_record_new(runtime, &args),
+        1 => builtin_record_new(runtime, &args, &extra),
         2 => builtin_list_new(runtime, &args),
         3 => builtin_string_new(runtime, &extra),
         4 => builtin_string_interpolate(runtime, &args, &extra),
-        5 => builtin_project(&args, &extra),
-        6 => builtin_index(&args),
-        7 => builtin_updated(&args, &extra),
+        5 => builtin_project(runtime, &args, &extra),
+        6 => builtin_index(runtime, &args),
+        7 => builtin_updated(runtime, &args, &extra),
         8 => builtin_type_test(&args, &extra),
         9 => builtin_iterator(runtime),
         10 => builtin_iterator_next(runtime),
         11 => builtin_lambda_new(runtime, &extra),
         12 => builtin_econ_new(runtime, &args),
         13 => builtin_non_null(&args),
-        14 => builtin_safe_project(&args, &extra),
+        14 => builtin_safe_project(runtime, &args, &extra),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -260,42 +262,61 @@ fn handle_host_call(
 fn builtin_tuple_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
         .collect::<Result<_, _>>()?;
-    let summary = HandleSummary {
-        type_name: "Tuple".to_owned(),
-        summary: format_args("Tuple", &items),
-        bytes: None,
-    };
-    let handle = runtime.allocate_handle(summary);
-    Ok((TAG_TUPLE, handle.0 as i64))
+    inline_result_to_wasm(runtime, InlineValue::Tuple(items))
 }
 
-fn builtin_record_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+fn builtin_record_new(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    names: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if args.len() != names.len() {
+        return Err(format!(
+            "RecordNew expected {} field names, received {}",
+            args.len(),
+            names.len()
+        ));
+    }
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
         .collect::<Result<_, _>>()?;
-    let summary = HandleSummary {
-        type_name: "Record".to_owned(),
-        summary: format_args("Record", &items),
-        bytes: None,
-    };
-    let handle = runtime.allocate_handle(summary);
-    Ok((TAG_RECORD, handle.0 as i64))
+    let fields = names
+        .iter()
+        .cloned()
+        .map(|name| String::from_utf8(name).map_err(|error| format!("invalid field name: {error}")))
+        .zip(items)
+        .map(|(name, value)| Ok((name?, value)))
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    inline_result_to_wasm(runtime, InlineValue::Record(fields))
 }
 
 fn builtin_list_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
     let items: Vec<InlineValue> = args
         .iter()
-        .map(|(t, v)| wasm_to_inline(*t, *v))
+        .map(|(t, v)| wasm_to_inline(runtime, *t, *v))
         .collect::<Result<_, _>>()?;
+    let data = HandleData::List(
+        items
+            .iter()
+            .map(handle_data_from_inline)
+            .collect::<Result<_, _>>()?,
+    );
     let summary = HandleSummary {
         type_name: "List".to_owned(),
-        summary: format_args("List", &items),
+        summary: format!(
+            "[{}]",
+            items
+                .iter()
+                .map(render_inline)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         bytes: None,
     };
-    let handle = runtime.allocate_handle(summary);
+    let handle = runtime.allocate_serializable_handle(summary, data);
     Ok((TAG_LIST, handle.0 as i64))
 }
 
@@ -309,7 +330,7 @@ fn builtin_string_new(runtime: &mut Runtime, extra: &[Vec<u8>]) -> Result<(i32, 
         summary: s.clone(),
         bytes: Some(s.len() as u64),
     };
-    let handle = runtime.allocate_handle(summary);
+    let handle = runtime.allocate_serializable_handle(summary, HandleData::String(s));
     Ok((TAG_STRING, handle.0 as i64))
 }
 
@@ -327,7 +348,7 @@ fn builtin_string_interpolate(
         if i < text.len() {
             out.push_str(&text[i]);
         }
-        let v = wasm_to_inline(*tag, *val)?;
+        let v = wasm_to_inline(runtime, *tag, *val)?;
         out.push_str(&render_inline(&v));
     }
     if text.len() > args.len() {
@@ -338,25 +359,44 @@ fn builtin_string_interpolate(
         summary: out.clone(),
         bytes: Some(out.len() as u64),
     };
-    let handle = runtime.allocate_handle(summary);
+    let handle = runtime.allocate_serializable_handle(summary, HandleData::String(out));
     Ok((TAG_STRING, handle.0 as i64))
 }
 
-fn builtin_project(args: &[(i32, i64)], extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
+fn builtin_project(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
     if args.is_empty() || extra.is_empty() {
         return Err("Project missing args".to_owned());
     }
-    let proj_data = &extra[0];
-    let _kind = *proj_data.first().unwrap_or(&0);
-    Ok((TAG_NULL, 0))
+    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let projection = parse_projection(&extra[0])?;
+    inline_result_to_wasm(runtime, project_inline(target, &projection)?)
 }
 
-fn builtin_index(_args: &[(i32, i64)]) -> Result<(i32, i64), String> {
-    Ok((TAG_NULL, 0))
+fn builtin_index(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, i64), String> {
+    if args.len() != 2 {
+        return Err("Index expects target and index args".to_owned());
+    }
+    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let index = wasm_to_inline(runtime, args[1].0, args[1].1)?;
+    inline_result_to_wasm(runtime, index_inline(target, index)?)
 }
 
-fn builtin_updated(_args: &[(i32, i64)], _extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
-    Err("updated not implemented".to_owned())
+fn builtin_updated(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if args.len() != 2 || extra.is_empty() {
+        return Err("Updated expects target, replacement, and path data".to_owned());
+    }
+    let target = wasm_to_inline(runtime, args[0].0, args[0].1)?;
+    let replacement = wasm_to_inline(runtime, args[1].0, args[1].1)?;
+    let path = parse_update_path(&extra[0])?;
+    inline_result_to_wasm(runtime, update_inline(target, &path, replacement)?)
 }
 
 fn builtin_type_test(args: &[(i32, i64)], extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
@@ -400,7 +440,7 @@ fn builtin_econ_new(runtime: &mut Runtime, args: &[(i32, i64)]) -> Result<(i32, 
     if args.is_empty() {
         return Err("Econ missing arg".to_owned());
     }
-    let v = wasm_to_inline(args[0].0, args[0].1)?;
+    let v = wasm_to_inline(runtime, args[0].0, args[0].1)?;
     let summary = HandleSummary {
         type_name: "Econ".to_owned(),
         summary: format!("econ({})", render_inline(&v)),
@@ -420,14 +460,18 @@ fn builtin_non_null(args: &[(i32, i64)]) -> Result<(i32, i64), String> {
     Ok(args[0])
 }
 
-fn builtin_safe_project(args: &[(i32, i64)], extra: &[Vec<u8>]) -> Result<(i32, i64), String> {
+fn builtin_safe_project(
+    runtime: &mut Runtime,
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
     if args.is_empty() {
         return Err("SafeProject missing arg".to_owned());
     }
     if args[0].0 == TAG_NULL {
         return Ok((TAG_NULL, 0));
     }
-    builtin_project(args, extra)
+    builtin_project(runtime, args, extra)
 }
 
 fn to_wasm(value: &RuntimeValue) -> (i32, i64) {
@@ -465,16 +509,284 @@ fn from_wasm(tag: i32, val: i64) -> Result<RuntimeValue, String> {
     }
 }
 
-fn wasm_to_inline(tag: i32, val: i64) -> Result<InlineValue, String> {
+fn wasm_to_inline(runtime: &Runtime, tag: i32, val: i64) -> Result<InlineValue, String> {
     match tag {
         TAG_INT => Ok(InlineValue::Int(val)),
         TAG_FLOAT => Ok(InlineValue::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(InlineValue::Bool(val != 0)),
         TAG_NULL => Ok(InlineValue::Null),
-        TAG_HANDLE | TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST => {
-            Ok(InlineValue::Handle(HandleId(val as u64)))
+        TAG_STRING | TAG_TUPLE | TAG_RECORD => {
+            let handle = HandleId(val as u64);
+            match runtime.get_handle_data(handle) {
+                Ok(data) => handle_data_to_inline(data),
+                Err(_) => Ok(InlineValue::Handle(handle)),
+            }
         }
+        TAG_HANDLE | TAG_LIST => Ok(InlineValue::Handle(HandleId(val as u64))),
         _ => Err(format!("unknown wasm value tag {tag}")),
+    }
+}
+
+fn inline_result_to_wasm(runtime: &mut Runtime, value: InlineValue) -> Result<(i32, i64), String> {
+    match value {
+        InlineValue::Int(value) => Ok((TAG_INT, value)),
+        InlineValue::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
+        InlineValue::Bool(value) => Ok((TAG_BOOL, value as i64)),
+        InlineValue::Null => Ok((TAG_NULL, 0)),
+        InlineValue::Handle(handle) => Ok((TAG_HANDLE, handle.0 as i64)),
+        InlineValue::String(value) => {
+            let summary = HandleSummary {
+                type_name: "String".to_owned(),
+                summary: value.clone(),
+                bytes: Some(value.len() as u64),
+            };
+            let handle = runtime.allocate_serializable_handle(summary, HandleData::String(value));
+            Ok((TAG_STRING, handle.0 as i64))
+        }
+        InlineValue::Tuple(items) => {
+            let summary = HandleSummary {
+                type_name: "Tuple".to_owned(),
+                summary: render_inline(&InlineValue::Tuple(items.clone())),
+                bytes: None,
+            };
+            let data = HandleData::Tuple(
+                items
+                    .iter()
+                    .map(handle_data_from_inline)
+                    .collect::<Result<_, _>>()?,
+            );
+            let handle = runtime.allocate_serializable_handle(summary, data);
+            Ok((TAG_TUPLE, handle.0 as i64))
+        }
+        InlineValue::Record(fields) => {
+            let summary = HandleSummary {
+                type_name: "Record".to_owned(),
+                summary: render_inline(&InlineValue::Record(fields.clone())),
+                bytes: None,
+            };
+            let data = HandleData::Record(
+                fields
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), handle_data_from_inline(value)?)))
+                    .collect::<Result<_, String>>()?,
+            );
+            let handle = runtime.allocate_serializable_handle(summary, data);
+            Ok((TAG_RECORD, handle.0 as i64))
+        }
+    }
+}
+
+fn handle_data_to_inline(data: HandleData) -> Result<InlineValue, String> {
+    match data {
+        HandleData::Null => Ok(InlineValue::Null),
+        HandleData::Bool(value) => Ok(InlineValue::Bool(value)),
+        HandleData::Int(value) => Ok(InlineValue::Int(value)),
+        HandleData::Float(value) => Ok(InlineValue::Float(value)),
+        HandleData::String(value) => Ok(InlineValue::String(value)),
+        HandleData::Tuple(values) => values
+            .into_iter()
+            .map(handle_data_to_inline)
+            .collect::<Result<Vec<_>, _>>()
+            .map(InlineValue::Tuple),
+        HandleData::Record(fields) => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, handle_data_to_inline(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(InlineValue::Record),
+        HandleData::List(_) => Err("list handle data has no inline Vox value".to_owned()),
+    }
+}
+
+fn handle_data_from_inline(value: &InlineValue) -> Result<HandleData, String> {
+    match value {
+        InlineValue::Null => Ok(HandleData::Null),
+        InlineValue::Bool(value) => Ok(HandleData::Bool(*value)),
+        InlineValue::Int(value) => Ok(HandleData::Int(*value)),
+        InlineValue::Float(value) => Ok(HandleData::Float(*value)),
+        InlineValue::String(value) => Ok(HandleData::String(value.clone())),
+        InlineValue::Tuple(values) => values
+            .iter()
+            .map(handle_data_from_inline)
+            .collect::<Result<Vec<_>, _>>()
+            .map(HandleData::Tuple),
+        InlineValue::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), handle_data_from_inline(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(HandleData::Record),
+        InlineValue::Handle(handle) => Err(format!(
+            "handle {} does not expose inline data in wasm result",
+            handle.0
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RuntimeProjection {
+    Field(String),
+    Slot(usize),
+}
+
+#[derive(Debug, Clone)]
+enum RuntimePathSegment {
+    Field(String),
+    Index(usize),
+}
+
+fn parse_projection(data: &[u8]) -> Result<RuntimeProjection, String> {
+    let Some((&kind, rest)) = data.split_first() else {
+        return Err("projection data is empty".to_owned());
+    };
+    match kind {
+        0 => {
+            let len = read_u32_from(rest, 0)? as usize;
+            let start = 4usize;
+            let end = start + len;
+            let bytes = rest
+                .get(start..end)
+                .ok_or_else(|| "projection field data out of bounds".to_owned())?;
+            let field = String::from_utf8(bytes.to_vec())
+                .map_err(|error| format!("invalid projection field: {error}"))?;
+            Ok(RuntimeProjection::Field(field))
+        }
+        1 => Ok(RuntimeProjection::Slot(read_u32_from(rest, 0)? as usize)),
+        _ => Err(format!("unknown projection kind {kind}")),
+    }
+}
+
+fn parse_update_path(data: &[u8]) -> Result<Vec<RuntimePathSegment>, String> {
+    let count = read_u32_from(data, 0)? as usize;
+    let mut offset = 4usize;
+    let mut path = Vec::new();
+    for _ in 0..count {
+        let kind = *data
+            .get(offset)
+            .ok_or_else(|| "updated path segment out of bounds".to_owned())?;
+        offset += 1;
+        match kind {
+            0 => {
+                let len = read_u32_from(data, offset)? as usize;
+                offset += 4;
+                let end = offset + len;
+                let bytes = data
+                    .get(offset..end)
+                    .ok_or_else(|| "updated field data out of bounds".to_owned())?;
+                offset = end;
+                path.push(RuntimePathSegment::Field(
+                    String::from_utf8(bytes.to_vec())
+                        .map_err(|error| format!("invalid updated field: {error}"))?,
+                ));
+            }
+            1 => {
+                let index = read_u32_from(data, offset)? as usize;
+                offset += 4;
+                path.push(RuntimePathSegment::Index(index));
+            }
+            _ => return Err(format!("unknown updated path segment kind {kind}")),
+        }
+    }
+    Ok(path)
+}
+
+fn project_inline(
+    target: InlineValue,
+    projection: &RuntimeProjection,
+) -> Result<InlineValue, String> {
+    match (target, projection) {
+        (InlineValue::Record(fields), RuntimeProjection::Field(field)) => fields
+            .get(field)
+            .cloned()
+            .ok_or_else(|| format!("record does not contain field `{field}`")),
+        (InlineValue::Tuple(items), RuntimeProjection::Slot(slot)) => items
+            .get(*slot)
+            .cloned()
+            .ok_or_else(|| format!("tuple index {slot} is out of bounds")),
+        (other, RuntimeProjection::Field(field)) => Err(format!(
+            "field `{field}` is not supported for {}",
+            inline_type_name(&other)
+        )),
+        (other, RuntimeProjection::Slot(slot)) => Err(format!(
+            "slot `{slot}` is not supported for {}",
+            inline_type_name(&other)
+        )),
+    }
+}
+
+fn index_inline(target: InlineValue, index: InlineValue) -> Result<InlineValue, String> {
+    let InlineValue::Int(index) = index else {
+        return Err("index expressions require an Int index".to_owned());
+    };
+    let index = usize::try_from(index)
+        .map_err(|_| "index expressions require a non-negative index".to_owned())?;
+    match target {
+        InlineValue::Tuple(items) => items
+            .get(index)
+            .cloned()
+            .ok_or_else(|| format!("tuple index {index} is out of bounds")),
+        other => Err(format!(
+            "indexing is not supported for {}",
+            inline_type_name(&other)
+        )),
+    }
+}
+
+fn update_inline(
+    target: InlineValue,
+    path: &[RuntimePathSegment],
+    replacement: InlineValue,
+) -> Result<InlineValue, String> {
+    let Some((segment, rest)) = path.split_first() else {
+        return Err("updated path cannot be empty".to_owned());
+    };
+    match (target, segment) {
+        (InlineValue::Record(mut fields), RuntimePathSegment::Field(name)) => {
+            let current = fields
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("record does not contain field `{name}`"))?;
+            let next = if rest.is_empty() {
+                replacement
+            } else {
+                update_inline(current, rest, replacement)?
+            };
+            fields.insert(name.clone(), next);
+            Ok(InlineValue::Record(fields))
+        }
+        (InlineValue::Tuple(mut items), RuntimePathSegment::Index(index)) => {
+            let slot = items
+                .get_mut(*index)
+                .ok_or_else(|| format!("tuple index {index} is out of bounds"))?;
+            *slot = if rest.is_empty() {
+                replacement
+            } else {
+                update_inline(slot.clone(), rest, replacement)?
+            };
+            Ok(InlineValue::Tuple(items))
+        }
+        (other, _) => Err(format!(
+            "updated is not supported for {}",
+            inline_type_name(&other)
+        )),
+    }
+}
+
+fn read_u32_from(data: &[u8], offset: usize) -> Result<u32, String> {
+    let bytes = data
+        .get(offset..offset + 4)
+        .ok_or_else(|| "metadata read out of bounds".to_owned())?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn inline_type_name(value: &InlineValue) -> &'static str {
+    match value {
+        InlineValue::Null => "Null",
+        InlineValue::Bool(_) => "Bool",
+        InlineValue::Int(_) => "Int",
+        InlineValue::Float(_) => "Float",
+        InlineValue::String(_) => "String",
+        InlineValue::Tuple(_) => "Tuple",
+        InlineValue::Record(_) => "Record",
+        InlineValue::Handle(_) => "Handle",
     }
 }
 
@@ -503,11 +815,6 @@ fn render_inline(value: &InlineValue) -> String {
                 .join(", ")
         ),
     }
-}
-
-fn format_args(ty: &str, items: &[InlineValue]) -> String {
-    let rendered: Vec<String> = items.iter().map(render_inline).collect();
-    format!("({ty} {})", rendered.join(", "))
 }
 
 fn name_to_tag(name: &str) -> i32 {
