@@ -278,7 +278,7 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
         }
         MirOpKind::CacheGet(_) | MirOpKind::CachePut(_) => Ok(()),
         MirOpKind::NonNull => Ok(()),
-        MirOpKind::Unit => Err("Unit lowering still uses an Int(0) sentinel".to_owned()),
+        MirOpKind::Unit => Ok(()),
         MirOpKind::Unary(name) => match name.as_str() {
             "not" => require_args(body, args, &[WasmScalar::Bool], "not"),
             "negate" => require_numeric_args(body, args, 1, "negate", true).map(|_| ()),
@@ -763,10 +763,7 @@ fn emit_op(
         MirOpKind::Literal(val) => emit_literal(val, result, ctx, f)?,
         MirOpKind::Unit => {
             if let Some(rid) = result {
-                i32(f, TAG_INT);
-                local_set(f, ctx.tag_local(rid));
-                i64(f, 0);
-                local_set(f, ctx.data_local(rid));
+                builtin_op_call(BuiltinOp::TupleNew, &[], &[], rid, ctx, f)?;
             }
         }
         MirOpKind::Use(_) | MirOpKind::TypeRefine(_) => {
