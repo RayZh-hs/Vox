@@ -392,6 +392,7 @@ fn complete_command_line(
             Ok((start, snapshot.complete_snapshots(&prefix[start..])))
         }
         ":run" => FilenameCompleter::new().complete(line, pos, ctx),
+        ":mount" => FilenameCompleter::new().complete(line, pos, ctx),
         ":opt" => complete_opt_line(snapshot, prefix, argument_start),
         ":show" => {
             let start = command_token_start(prefix, argument_start);

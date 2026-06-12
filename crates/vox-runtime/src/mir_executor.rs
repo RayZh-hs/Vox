@@ -4,7 +4,7 @@ use vox_core::{
     host::ParameterSpec,
     ids::ArtifactId,
     mir::{
-        MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOp, MirOpKind, MirPathSegment,
+        MirBlockId, MirBody, MirBodyKind, MirModule, MirOp, MirOpKind, MirPathSegment,
         MirProjection, MirTerminator, MirValueDefinition, MirValueId, MirVersionId,
     },
     plan::CompiledArtifact,

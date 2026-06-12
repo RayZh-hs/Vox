@@ -112,6 +112,7 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 ":snapshot".to_owned(),
                 ":restore".to_owned(),
                 ":run".to_owned(),
+                ":mount".to_owned(),
                 ":show".to_owned(),
                 ":type".to_owned(),
                 ":handles".to_owned(),
@@ -171,6 +172,7 @@ impl<R: RuntimeRunner> ReplSession<R> {
                 Err(error) => ReplOutput::error(error.to_string()),
             },
             ReplCommand::Run(path) => self.run_file(&path),
+            ReplCommand::Mount(paths) => self.mount_libraries(&paths),
             ReplCommand::Handles => self.list_handles(),
             ReplCommand::Show(handle) => self.show_handle(&handle),
             ReplCommand::Drop(name) => match self.runtime.drop_item(&name) {
@@ -316,6 +318,32 @@ impl<R: RuntimeRunner> ReplSession<R> {
             Ok(value) => ReplOutput::message(self.render_runtime_value(&value)),
             Err(error) => ReplOutput::error(error.to_string()),
         }
+    }
+
+    fn mount_libraries(&mut self, paths: &[String]) -> ReplOutput {
+        if paths.is_empty() {
+            return ReplOutput::error("`:mount` requires at least one path".to_owned());
+        }
+
+        let mut messages = Vec::new();
+        for path in paths {
+            let p = Path::new(path);
+            match mount_at_path(&self.runner, p) {
+                Ok(ids) => {
+                    let count = ids.len();
+                    messages.push(format!(
+                        "mounted {} ({} librar{})",
+                        path,
+                        count,
+                        if count == 1 { "y" } else { "ies" }
+                    ));
+                }
+                Err(error) => {
+                    messages.push(format!("failed to mount {}: {error}", path));
+                }
+            }
+        }
+        ReplOutput::message(messages.join("\n"))
     }
 
     fn edit_submission(&mut self, symbols: Vec<String>) -> ReplOutput {
@@ -528,6 +556,32 @@ impl<R: RuntimeRunner> ReplSession<R> {
     }
 }
 
+fn mount_at_path<R: RuntimeRunner>(
+    runner: &R,
+    path: &Path,
+) -> Result<Vec<vox_core::ids::LibraryId>, String> {
+    if path.is_dir() {
+        runner
+            .mount_dir(path)
+            .map_err(|error| error.to_string())
+    } else {
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("vox") => runner
+                .mount_vox_file(path)
+                .map(|id| vec![id])
+                .map_err(|error| error.to_string()),
+            Some("voxlib") => runner
+                .mount_voxlib_file(path)
+                .map(|id| vec![id])
+                .map_err(|error| error.to_string()),
+            other => Err(format!(
+                "unsupported file extension for mounting: {:?}",
+                other
+            )),
+        }
+    }
+}
+
 fn render_help() -> String {
     [
         ":help                      - show a brief description of each REPL command",
@@ -540,6 +594,7 @@ fn render_help() -> String {
         ":snapshot [name]           - save the current state as a named snapshot",
         ":restore [name]            - restore a previously saved snapshot",
         ":run [file]                - run a script file in the current state",
+        ":mount [path ...]          - mount libraries from folders, .vox, or .voxlib files",
         ":show [handle]             - show lightweight metadata for a handle",
         ":type [expr]               - show the inferred type of an expression",
         ":handles                   - list live handles visible to this session",

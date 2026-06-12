@@ -13,6 +13,7 @@ pub enum ReplCommand {
     Restore(String),
     TypeOf(String),
     Run(String),
+    Mount(Vec<String>),
     Handles,
     Show(String),
     Drop(String),
@@ -63,6 +64,10 @@ impl FromStr for ReplCommand {
             ":handles" => Ok(Self::Handles),
             ":type" => Ok(Self::TypeOf(parts.collect::<Vec<_>>().join(" "))),
             ":run" => Ok(Self::Run(parts.collect::<Vec<_>>().join(" "))),
+            ":mount" => {
+                let rest = line[":mount".len()..].trim();
+                Ok(Self::Mount(collect_quoted_tokens(rest)))
+            }
             ":show" => Ok(Self::Show(parts.collect::<Vec<_>>().join(" "))),
             ":drop" => Ok(Self::Drop(parts.collect::<Vec<_>>().join(" "))),
             ":opt" => parse_opt_command(parts.collect::<Vec<_>>()),
@@ -167,6 +172,40 @@ fn parse_session_transfer_command(parts: &[&str]) -> Result<ReplCommand, String>
     }))
 }
 
+fn collect_quoted_tokens(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut token = String::new();
+        if ch == '"' {
+            chars.next();
+            while let Some(ch) = chars.next() {
+                if ch == '"' {
+                    break;
+                }
+                token.push(ch);
+            }
+        } else {
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                token.push(ch);
+                chars.next();
+            }
+        }
+        if !token.is_empty() {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::ReplCommand;
@@ -177,5 +216,46 @@ mod tests {
         let command = ReplCommand::from_str(":type input.(image.blur)(radius = 1.0)")
             .expect("command should parse");
         assert!(matches!(command, ReplCommand::TypeOf(expr) if expr.contains("image.blur")));
+    }
+
+    #[test]
+    fn parses_mount_unquoted_paths() {
+        let command = ReplCommand::from_str(":mount /tmp/foo /tmp/bar")
+            .expect("command should parse");
+        assert_eq!(
+            command,
+            ReplCommand::Mount(vec!["/tmp/foo".to_owned(), "/tmp/bar".to_owned()])
+        );
+    }
+
+    #[test]
+    fn parses_mount_quoted_path() {
+        let command = ReplCommand::from_str(":mount \"/path/with spaces/lib.voxlib\"")
+            .expect("command should parse");
+        assert_eq!(
+            command,
+            ReplCommand::Mount(vec!["/path/with spaces/lib.voxlib".to_owned()])
+        );
+    }
+
+    #[test]
+    fn parses_mount_mixed() {
+        let command = ReplCommand::from_str(":mount /simple \"/quoted path\" /another")
+            .expect("command should parse");
+        assert_eq!(
+            command,
+            ReplCommand::Mount(vec![
+                "/simple".to_owned(),
+                "/quoted path".to_owned(),
+                "/another".to_owned(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_mount_empty() {
+        let command = ReplCommand::from_str(":mount")
+            .expect("command should parse");
+        assert_eq!(command, ReplCommand::Mount(vec![]));
     }
 }

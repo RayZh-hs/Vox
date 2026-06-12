@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -132,6 +133,12 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
     }
 
     fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError>;
+
+    fn mount_dir(&self, dir: &Path) -> Result<Vec<LibraryId>, RunnerError>;
+
+    fn mount_vox_file(&self, path: &Path) -> Result<LibraryId, RunnerError>;
+
+    fn mount_voxlib_file(&self, path: &Path) -> Result<LibraryId, RunnerError>;
 
     fn load_script(
         &self,
@@ -580,6 +587,30 @@ impl RuntimeRunner for EmbeddedRunner {
 
     fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError> {
         self.with_runtime(|runtime| Ok(runtime.unmount_library(library)))
+    }
+
+    fn mount_dir(&self, dir: &Path) -> Result<Vec<LibraryId>, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .mount_dir(dir)
+                .map_err(|error| RunnerError::Session(error))
+        })
+    }
+
+    fn mount_vox_file(&self, path: &Path) -> Result<LibraryId, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .mount_vox_file(path)
+                .map_err(|error| RunnerError::Session(error))
+        })
+    }
+
+    fn mount_voxlib_file(&self, path: &Path) -> Result<LibraryId, RunnerError> {
+        self.with_runtime(|runtime| {
+            runtime
+                .mount_voxlib_file(path)
+                .map_err(|error| RunnerError::Session(error))
+        })
     }
 
     fn load_script(

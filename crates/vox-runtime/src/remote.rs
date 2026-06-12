@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeSet,
+    fs,
     net::{TcpStream, ToSocketAddrs},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, Ordering},
@@ -8,6 +10,7 @@ use std::{
 };
 
 use vox_core::{
+    external_library::decode_external_library_file,
     host::PackageManifest,
     ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
@@ -565,6 +568,49 @@ impl RuntimeRunner for RemoteRunner {
                 true
             });
         Ok(removed)
+    }
+
+    fn mount_dir(&self, dir: &Path) -> Result<Vec<LibraryId>, RunnerError> {
+        let entries = fs::read_dir(dir)
+            .map_err(|error| RunnerError::Session(format!("failed to read directory {}: {error}", dir.display())))?;
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| RunnerError::Session(format!("directory read error: {error}")))?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("vox") => {
+                    return Err(RunnerError::Session(
+                        "mounting .vox files is not supported for remote runners".to_owned(),
+                    ));
+                }
+                Some("voxlib") => ids.push(self.mount_voxlib_file(&path)?),
+                _ => {}
+            }
+        }
+        Ok(ids)
+    }
+
+    fn mount_vox_file(&self, _path: &Path) -> Result<LibraryId, RunnerError> {
+        Err(RunnerError::Session(
+            "mounting .vox files is not supported for remote runners".to_owned(),
+        ))
+    }
+
+    fn mount_voxlib_file(&self, path: &Path) -> Result<LibraryId, RunnerError> {
+        let bytes = fs::read(path).map_err(|error| {
+            RunnerError::Session(format!("failed to read {}: {error}", path.display()))
+        })?;
+        let header = decode_external_library_file(&bytes).map_err(|error| {
+            RunnerError::Session(format!(
+                "invalid .voxlib file {}: {error}",
+                path.display()
+            ))
+        })?;
+        self.mount_library(header.manifest)
     }
 
     fn load_script(
