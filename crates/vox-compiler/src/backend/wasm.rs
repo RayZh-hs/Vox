@@ -40,7 +40,8 @@ const RESULT_OFF: u32 = 16384;
 const STRDATA_OFF: u32 = 32768;
 const WASM_PAGE_SIZE: u32 = 65536;
 const HEAP_GUARD_BYTES: u32 = 4096;
-const HEAP_LIMIT: u32 = WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
+const INITIAL_MEMORY_PAGES: u32 = 256;
+const HEAP_LIMIT: u32 = INITIAL_MEMORY_PAGES * WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
 const HEAP_TOP_GLOBAL: u32 = 0;
 
 // Linear-memory complex value layouts:
@@ -344,7 +345,7 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         "vox",
         "memory",
         EntityType::Memory(MemoryType {
-            minimum: 1,
+            minimum: INITIAL_MEMORY_PAGES as u64,
             maximum: None,
             memory64: false,
             shared: false,
@@ -1064,7 +1065,11 @@ fn emit_op(
         MirOpKind::Literal(val) => emit_literal(val, result, ctx, f)?,
         MirOpKind::Unit => {
             if let Some(rid) = result {
-                emit_tuple_new(&[], rid, ctx, f)?;
+                i32(f, TAG_TUPLE);
+                local_set(f, ctx.tag_local(rid));
+                i64(f, 0);
+                local_set(f, ctx.data_local(rid));
+                record_known_tag(ctx, rid, TAG_TUPLE);
             }
         }
         MirOpKind::Use(version) => {
@@ -1298,13 +1303,21 @@ fn emit_literal(
             emit_string_new(&b, rid, ctx, f)?;
         }
         InlineValue::Tuple(items) => {
-            let mut temp_ids = Vec::new();
-            for item in items.iter() {
-                let tid = ctx.alloc_temp_value();
-                emit_literal(item, Some(tid), ctx, f)?;
-                temp_ids.push(tid);
+            if items.is_empty() {
+                i32(f, TAG_TUPLE);
+                local_set(f, ctx.tag_local(rid));
+                i64(f, 0);
+                local_set(f, ctx.data_local(rid));
+                record_known_tag(ctx, rid, TAG_TUPLE);
+            } else {
+                let mut temp_ids = Vec::new();
+                for item in items.iter() {
+                    let tid = ctx.alloc_temp_value();
+                    emit_literal(item, Some(tid), ctx, f)?;
+                    temp_ids.push(tid);
+                }
+                emit_tuple_new(&temp_ids, rid, ctx, f)?;
             }
-            emit_tuple_new(&temp_ids, rid, ctx, f)?;
         }
         InlineValue::Null => {
             i32(f, TAG_NULL);

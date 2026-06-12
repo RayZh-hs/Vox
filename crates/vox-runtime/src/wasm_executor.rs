@@ -23,7 +23,8 @@ const TAG_INVALID: i32 = -1;
 const STRDATA_OFF: i64 = 32768;
 const WASM_PAGE_SIZE: u32 = 65536;
 const HEAP_GUARD_BYTES: u32 = 4096;
-const HEAP_LIMIT: u32 = WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
+const INITIAL_MEMORY_PAGES: u32 = 256;
+const HEAP_LIMIT: u32 = INITIAL_MEMORY_PAGES * WASM_PAGE_SIZE - HEAP_GUARD_BYTES;
 const MAX_MEMORY_VALUE_DEPTH: usize = 64;
 
 #[derive(Debug)]
@@ -43,7 +44,9 @@ pub fn try_wasm_execute(
     wasm_bytes: &[u8],
     arguments: &[RuntimeValue],
 ) -> Result<RuntimeValue, String> {
-    let engine = Engine::default();
+    let mut config = Config::new();
+    config.max_wasm_stack(8 * 1024 * 1024);
+    let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::new(&engine, wasm_bytes).map_err(|e| e.to_string())?;
 
     let runtime_ptr = runtime as *mut Runtime;
@@ -56,7 +59,7 @@ pub fn try_wasm_execute(
         },
     );
 
-    let memory_ty = MemoryType::new(1, None);
+    let memory_ty = MemoryType::new(INITIAL_MEMORY_PAGES, None);
     let memory = Memory::new(&mut store, memory_ty).map_err(|e| e.to_string())?;
 
     let vox_op_ty = FuncType::new(&engine, vec![ValType::I32; 6], vec![]);
@@ -1051,6 +1054,7 @@ fn memory_or_inline_to_handle_data(
         TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(HandleData::Bool(val != 0)),
         TAG_NULL => Ok(HandleData::Null),
+        TAG_TUPLE if val == 0 => Ok(HandleData::Tuple(vec![])),
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST if memory_backed_offset(val) => {
             memory_value_to_handle_data_depth(data, tag, val, depth)
         }
@@ -1092,6 +1096,7 @@ fn from_wasm(
         )))),
         TAG_BOOL => Ok(RuntimeValue::Inline(InlineValue::Bool(val != 0))),
         TAG_NULL => Ok(RuntimeValue::Inline(InlineValue::Null)),
+        TAG_TUPLE if val == 0 => Ok(RuntimeValue::Inline(InlineValue::Tuple(vec![]))),
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST
             if memory_backed_offset(val)
                 && memory
@@ -1127,6 +1132,7 @@ fn wasm_to_inline(
         TAG_FLOAT => Ok(InlineValue::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(InlineValue::Bool(val != 0)),
         TAG_NULL => Ok(InlineValue::Null),
+        TAG_TUPLE if val == 0 => Ok(InlineValue::Tuple(vec![])),
         TAG_STRING | TAG_TUPLE | TAG_RECORD
             if memory_backed_offset(val)
                 && memory
