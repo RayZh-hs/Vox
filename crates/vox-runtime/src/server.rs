@@ -1695,7 +1695,8 @@ impl WireFailure {
                 Self::recoverable(ErrorCode::UnknownScript, error.to_string())
             }
             RunnerError::Runtime(RuntimeError::ExecutionNotImplemented(_))
-            | RunnerError::Runtime(RuntimeError::ExecutionFailed(_)) => {
+            | RunnerError::Runtime(RuntimeError::ExecutionFailed(_))
+            | RunnerError::Runtime(RuntimeError::SOptUnavailable(_)) => {
                 Self::recoverable(ErrorCode::RuntimeFailed, error.to_string())
             }
             RunnerError::Unavailable(message) => Self::fatal(ErrorCode::RuntimeFailed, message),

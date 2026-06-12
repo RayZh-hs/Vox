@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vox_core::{
     host::Purity,
@@ -49,6 +49,7 @@ struct MirLowerer<'a> {
     optimization: OptimizationLevel,
     rankings: &'a [vox_core::opt::OptimizationRanking],
     import_resolution: ImportResolution,
+    function_return_types: BTreeMap<String, VoxType>,
     next_body: u32,
 }
 
@@ -59,16 +60,25 @@ impl<'a> MirLowerer<'a> {
         rankings: &'a [vox_core::opt::OptimizationRanking],
         import_resolution: ImportResolution,
     ) -> Self {
+        let function_return_types = collect_function_return_types(frontend);
         Self {
             frontend,
             optimization,
             rankings,
             import_resolution,
+            function_return_types,
             next_body: 0,
         }
     }
 
     fn lower_module(mut self) -> MirModule {
+        let mut function_bodies = VecDeque::new();
+        for item in &self.frontend.syntax.items {
+            if let TopLevelItem::Function(function) = item {
+                function_bodies.push_back(self.lower_function(function));
+            }
+        }
+
         let mut bodies = Vec::new();
         if matches!(self.frontend.header.kind, ModuleKind::Script { .. }) {
             bodies.push(self.lower_script_entry(&self.frontend.syntax));
@@ -76,7 +86,11 @@ impl<'a> MirLowerer<'a> {
 
         for item in &self.frontend.syntax.items {
             match item {
-                TopLevelItem::Function(function) => bodies.push(self.lower_function(function)),
+                TopLevelItem::Function(_) => {
+                    if let Some(body) = function_bodies.pop_front() {
+                        bodies.push(body);
+                    }
+                }
                 TopLevelItem::Value(value)
                     if matches!(self.frontend.header.kind, ModuleKind::Package) =>
                 {
@@ -107,6 +121,8 @@ impl<'a> MirLowerer<'a> {
             self.rank_for(OptimizationSubject::Module),
             Some(unit.span.clone()),
             self.import_resolution.clone(),
+            self.function_return_types.clone(),
+            None,
         );
 
         for parameter in &self.frontend.parameters {
@@ -156,6 +172,8 @@ impl<'a> MirLowerer<'a> {
             self.rank_for(OptimizationSubject::Function(function.name.clone())),
             Some(function.span.clone()),
             self.import_resolution.clone(),
+            self.function_return_types.clone(),
+            function.return_type.as_ref().map(type_syntax_to_vox),
         );
 
         for parameter in &function.parameters {
@@ -178,7 +196,16 @@ impl<'a> MirLowerer<'a> {
 
         let result = body.lower_expr(&function.body);
         body.terminate(MirTerminator::Return(result));
-        body.finish()
+        let finished = body.finish();
+        if let Some(result_type) = finished.result_type.clone() {
+            self.function_return_types
+                .insert(function.name.clone(), result_type.clone());
+            self.function_return_types.insert(
+                format!("{}.{}", self.frontend.header.module.as_str(), function.name),
+                result_type,
+            );
+        }
+        finished
     }
 
     fn lower_value_initializer(&mut self, value: &ValueDecl) -> MirBody {
@@ -190,6 +217,8 @@ impl<'a> MirLowerer<'a> {
             self.rank_for(OptimizationSubject::Module),
             Some(value.span.clone()),
             self.import_resolution.clone(),
+            self.function_return_types.clone(),
+            value.ty.as_ref().map(type_syntax_to_vox),
         );
         let result = body.lower_expr(&value.initializer);
         body.terminate(MirTerminator::Return(result));
@@ -234,6 +263,8 @@ struct BodyBuilder {
     current: MirBlockId,
     scopes: Vec<BTreeMap<String, BindingRef>>,
     import_resolution: ImportResolution,
+    function_return_types: BTreeMap<String, VoxType>,
+    result_type: Option<VoxType>,
     next_binding: u32,
     next_version: u32,
     next_value: u32,
@@ -255,6 +286,8 @@ impl BodyBuilder {
         rank: OptimizationRank,
         span: Option<vox_core::diagnostics::TextSpan>,
         import_resolution: ImportResolution,
+        function_return_types: BTreeMap<String, VoxType>,
+        result_type: Option<VoxType>,
     ) -> Self {
         let entry = MirBlockId(0);
         Self {
@@ -278,6 +311,8 @@ impl BodyBuilder {
             current: entry,
             scopes: vec![BTreeMap::new()],
             import_resolution,
+            function_return_types,
+            result_type,
             next_binding: 0,
             next_version: 0,
             next_value: 0,
@@ -300,7 +335,7 @@ impl BodyBuilder {
             versions: self.versions,
             values: self.values,
             blocks: self.blocks,
-            result_type: None,
+            result_type: self.result_type,
             analyses: MirAnalysisSummary::default(),
         }
     }
@@ -726,7 +761,11 @@ impl BodyBuilder {
     ) -> MirValueId {
         let left = self.lower_expr(left);
         let join = self.new_block("bool_join");
-        let result = self.new_value(None, MirValueDefinition::BlockParameter(join), span.clone());
+        let result = self.new_value(
+            Some(VoxType::Bool),
+            MirValueDefinition::BlockParameter(join),
+            span.clone(),
+        );
         self.block_mut(join).parameters.push(result);
 
         let eval_right = self.new_block("bool_rhs");
@@ -1141,7 +1180,11 @@ impl BodyBuilder {
         &mut self,
         span: Option<vox_core::diagnostics::TextSpan>,
     ) -> MirValueId {
-        let value = self.new_value(None, MirValueDefinition::Unit, span.clone());
+        let value = self.new_value(
+            Some(VoxType::Tuple(Vec::new())),
+            MirValueDefinition::Unit,
+            span.clone(),
+        );
         self.emit_op_with_result(Some(value), MirOpKind::Unit, Vec::new(), span);
         value
     }
@@ -1156,6 +1199,69 @@ impl BodyBuilder {
             MirOpKind::Literal(val) => Some(mir_type_from_literal(val)),
             MirOpKind::Binary(name) => Some(mir_type_from_binary_op(name, &args, self)),
             MirOpKind::Unary(name) => Some(mir_type_from_unary_op(name, &args, self)),
+            MirOpKind::Use(_) => {
+                args.first().and_then(|arg| self.value_type(*arg).cloned())
+            }
+            MirOpKind::TypeRefine(ty) => Some(VoxType::opaque_surface(ty.clone())),
+            MirOpKind::Unit => Some(VoxType::Tuple(Vec::new())),
+            MirOpKind::NonNull => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .map(mir_non_null_type),
+            MirOpKind::TypeTest(_) => Some(VoxType::Bool),
+            MirOpKind::Tuple { .. } => Some(VoxType::Tuple(
+                args.iter()
+                    .map(|arg| {
+                        self.value_type(*arg)
+                            .cloned()
+                            .unwrap_or_else(|| VoxType::opaque_surface("Unknown"))
+                    })
+                    .collect(),
+            )),
+            MirOpKind::Record { fields } => Some(VoxType::Record(
+                fields
+                    .iter()
+                    .zip(args.iter())
+                    .map(|(name, arg)| vox_core::types::RecordField {
+                        name: name.clone(),
+                        ty: self
+                            .value_type(*arg)
+                            .cloned()
+                            .unwrap_or_else(|| VoxType::opaque_surface("Unknown")),
+                    })
+                    .collect(),
+            )),
+            MirOpKind::List => Some(VoxType::List(Box::new(
+                args.first()
+                    .and_then(|arg| self.value_type(*arg).cloned())
+                    .unwrap_or_else(|| VoxType::opaque_surface("Unknown")),
+            ))),
+            MirOpKind::StringInterpolate { .. } => Some(VoxType::String),
+            MirOpKind::Project(projection) => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .and_then(|ty| mir_projected_type(ty, projection)),
+            MirOpKind::SafeProject(field) => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .and_then(|ty| mir_projected_type(ty, &MirProjection::Field(field.clone())))
+                .map(|ty| VoxType::Nullable(Box::new(ty))),
+            MirOpKind::Index => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .and_then(mir_indexed_type),
+            MirOpKind::Updated { .. } => {
+                args.first().and_then(|arg| self.value_type(*arg).cloned())
+            }
+            MirOpKind::Call { callee, .. } => self.function_return_types.get(callee).cloned(),
+            MirOpKind::Iterator => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .and_then(mir_iterator_type),
+            MirOpKind::IteratorNext => args
+                .first()
+                .and_then(|arg| self.value_type(*arg))
+                .and_then(mir_iterator_next_type),
             _ => None,
         };
         let definition = match kind {
@@ -1197,14 +1303,19 @@ impl BodyBuilder {
     fn terminate(&mut self, terminator: MirTerminator) {
         let block_id = self.current;
         match &terminator {
-            MirTerminator::Return(value) => self.add_use(
-                *value,
-                MirUse {
-                    block: block_id,
-                    op_index: None,
-                    kind: MirUseKind::Return,
-                },
-            ),
+            MirTerminator::Return(value) => {
+                if self.result_type.is_none() {
+                    self.result_type = self.value_type(*value).cloned();
+                }
+                self.add_use(
+                    *value,
+                    MirUse {
+                        block: block_id,
+                        op_index: None,
+                        kind: MirUseKind::Return,
+                    },
+                );
+            }
             MirTerminator::Branch { condition, .. } => self.add_use(
                 *condition,
                 MirUse {
@@ -1278,6 +1389,12 @@ impl BodyBuilder {
             .and_then(|v| v.ty.as_ref())
     }
 
+    fn set_value_type(&mut self, id: MirValueId, ty: VoxType) {
+        if let Some(value) = self.values.iter_mut().find(|v| v.id == id) {
+            value.ty = Some(ty);
+        }
+    }
+
     fn new_version(
         &mut self,
         binding: MirBindingId,
@@ -1321,7 +1438,29 @@ impl BodyBuilder {
             })
             .unwrap_or(false);
         if should_jump {
+            self.merge_block_parameter_types(target, &args);
             self.terminate(MirTerminator::Jump { target, args });
+        }
+    }
+
+    fn merge_block_parameter_types(&mut self, target: MirBlockId, args: &[MirValueId]) {
+        let params = self
+            .blocks
+            .iter()
+            .find(|block| block.id == target)
+            .map(|block| block.parameters.clone())
+            .unwrap_or_default();
+        for (param, arg) in params.into_iter().zip(args.iter().copied()) {
+            let Some(arg_ty) = self.value_type(arg).cloned() else {
+                continue;
+            };
+            let merged = match self.value_type(param).cloned() {
+                Some(existing) => merge_mir_types(existing, arg_ty),
+                None => Some(arg_ty),
+            };
+            if let Some(ty) = merged {
+                self.set_value_type(param, ty);
+            }
         }
     }
 
@@ -2027,6 +2166,130 @@ fn mark_slot_demand(values: &mut [MirValue], target: MirValueId, slot: usize) {
 
 fn type_syntax_to_vox(ty: &TypeSyntax) -> VoxType {
     VoxType::opaque_surface(ty.to_source_string())
+}
+
+fn collect_function_return_types(frontend: &FrontendUnit) -> BTreeMap<String, VoxType> {
+    let mut types = BTreeMap::new();
+    for item in &frontend.syntax.items {
+        let TopLevelItem::Function(function) = item else {
+            continue;
+        };
+        let Some(return_type) = function.return_type.as_ref().map(type_syntax_to_vox) else {
+            continue;
+        };
+        types.insert(function.name.clone(), return_type.clone());
+        types.insert(
+            format!("{}.{}", frontend.header.module.as_str(), function.name),
+            return_type,
+        );
+    }
+    types
+}
+
+fn mir_non_null_type(ty: &VoxType) -> VoxType {
+    match ty {
+        VoxType::Nullable(inner) => (**inner).clone(),
+        other => other.clone(),
+    }
+}
+
+fn mir_projected_type(ty: &VoxType, projection: &MirProjection) -> Option<VoxType> {
+    match (ty, projection) {
+        (VoxType::Record(fields), MirProjection::Field(name)) => fields
+            .iter()
+            .find(|field| field.name == *name)
+            .map(|field| field.ty.clone()),
+        (VoxType::Tuple(items), MirProjection::Slot(slot)) => items.get(*slot).cloned(),
+        _ => None,
+    }
+}
+
+fn mir_indexed_type(ty: &VoxType) -> Option<VoxType> {
+    match ty {
+        VoxType::List(item) => Some((**item).clone()),
+        VoxType::Tuple(items) => {
+            let first = items.first()?.clone();
+            if items.iter().all(|item| item == &first) {
+                Some(first)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn mir_iterator_type(ty: &VoxType) -> Option<VoxType> {
+    let item = match ty {
+        VoxType::List(item) => (**item).clone(),
+        VoxType::Tuple(items) if items == &[VoxType::Int, VoxType::Int, VoxType::Bool] => {
+            VoxType::Int
+        }
+        VoxType::Tuple(items) => {
+            let first = items.first()?.clone();
+            if items.iter().all(|item| item == &first) {
+                first
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    Some(VoxType::opaque_surface(format!(
+        "Iterator<{}>",
+        render_type_key(&item)
+    )))
+}
+
+fn mir_iterator_next_type(ty: &VoxType) -> Option<VoxType> {
+    let VoxType::OpaqueSurface(name) = ty else {
+        return None;
+    };
+    let inner = name
+        .strip_prefix("Iterator<")
+        .and_then(|rest| rest.strip_suffix('>'))?;
+    parse_type_key(inner).map(|ty| VoxType::Nullable(Box::new(ty)))
+}
+
+fn merge_mir_types(left: VoxType, right: VoxType) -> Option<VoxType> {
+    if left == right {
+        return Some(left);
+    }
+    match (left, right) {
+        (VoxType::OpaqueSurface(name), ty) | (ty, VoxType::OpaqueSurface(name))
+            if name == "Null" =>
+        {
+            Some(VoxType::Nullable(Box::new(ty)))
+        }
+        (VoxType::Nullable(left), right) if *left == right => Some(VoxType::Nullable(left)),
+        (left, VoxType::Nullable(right)) if left == *right => Some(VoxType::Nullable(right)),
+        (VoxType::Nullable(left), VoxType::Nullable(right)) if left == right => {
+            Some(VoxType::Nullable(left))
+        }
+        _ => None,
+    }
+}
+
+fn render_type_key(ty: &VoxType) -> String {
+    match ty {
+        VoxType::Int => "Int".to_owned(),
+        VoxType::Float => "Float".to_owned(),
+        VoxType::Bool => "Bool".to_owned(),
+        VoxType::String => "String".to_owned(),
+        VoxType::OpaqueSurface(name) => name.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn parse_type_key(raw: &str) -> Option<VoxType> {
+    match raw {
+        "Int" => Some(VoxType::Int),
+        "Float" => Some(VoxType::Float),
+        "Bool" => Some(VoxType::Bool),
+        "String" => Some(VoxType::String),
+        "Null" => Some(VoxType::opaque_surface("Null")),
+        _ => None,
+    }
 }
 
 fn mir_mutability(mutability: Mutability) -> MirMutability {

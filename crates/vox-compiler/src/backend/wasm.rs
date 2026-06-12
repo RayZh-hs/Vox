@@ -128,8 +128,7 @@ impl Ctx {
             self.block_index.insert(b.id, i as u32);
         }
 
-        let mut version_bind_blocks: BTreeMap<MirVersionId, BTreeSet<MirBlockId>> =
-            BTreeMap::new();
+        let mut version_bind_blocks: BTreeMap<MirVersionId, BTreeSet<MirBlockId>> = BTreeMap::new();
         for block in &body.blocks {
             for op in &block.ops {
                 if let MirOpKind::Bind(version) = op.kind {
@@ -159,7 +158,12 @@ impl Ctx {
 
         // Seed known tags from parameter types
         for p in &body.parameters {
-            if let Some(ty) = body.values.iter().find(|v| v.id == *p).and_then(|v| v.ty.as_ref()) {
+            if let Some(ty) = body
+                .values
+                .iter()
+                .find(|v| v.id == *p)
+                .and_then(|v| v.ty.as_ref())
+            {
                 if let Some(tag) = primitive_tag_for_type(ty) {
                     self.known_tags.insert(*p, tag);
                 }
@@ -179,7 +183,8 @@ impl Ctx {
                 if let Some(bv) = body.versions.iter().find(|v| v.id == *first_version) {
                     let identity_value = bv.value;
                     for &version_id in &binding.versions {
-                        self.version_to_binding_value.insert(version_id, identity_value);
+                        self.version_to_binding_value
+                            .insert(version_id, identity_value);
                     }
                 }
             }
@@ -237,15 +242,26 @@ impl Ctx {
     }
 
     fn block_id_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2
+        self.parameter_local_count()
+            + self.num_value_locals()
+            + self.temp_count * 2
+            + self.version_count * 2
     }
 
     fn result_tag_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 1
+        self.parameter_local_count()
+            + self.num_value_locals()
+            + self.temp_count * 2
+            + self.version_count * 2
+            + 1
     }
 
     fn result_data_local(&self) -> u32 {
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 2
+        self.parameter_local_count()
+            + self.num_value_locals()
+            + self.temp_count * 2
+            + self.version_count * 2
+            + 2
     }
 
     fn block_idx(&self, id: MirBlockId) -> usize {
@@ -345,6 +361,10 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     let mut entry_func_index = None;
     for body in &bodies {
         func_map.insert(body.name.clone(), func_index);
+        func_map.insert(
+            format!("{}.{}", module.module.as_str(), body.name),
+            func_index,
+        );
         if matches!(body.kind, MirBodyKind::ScriptEntry) {
             entry_func_index = Some(func_index);
         }
@@ -422,6 +442,7 @@ fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
         .iter()
         .filter(|b| !b.blocks.is_empty())
         .collect();
+    let body_map = wasm_body_lookup(module, &bodies);
 
     if bodies.is_empty() {
         return Err("module has no executable MIR bodies".to_owned());
@@ -446,7 +467,7 @@ fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
         }
         for block in &body.blocks {
             for op in &block.ops {
-                validate_wasm_op(body, &op.kind, &op.args)?;
+                validate_wasm_op(body, &op.kind, &op.args, &body_map)?;
             }
             validate_wasm_terminator(body, &block.terminator)?;
         }
@@ -455,7 +476,26 @@ fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Result<(), String> {
+fn wasm_body_lookup<'a>(
+    module: &MirModule,
+    bodies: &[&'a MirBody],
+) -> BTreeMap<String, &'a MirBody> {
+    let mut lookup = BTreeMap::new();
+    for body in bodies {
+        if matches!(body.kind, MirBodyKind::Function) {
+            lookup.insert(body.name.clone(), *body);
+            lookup.insert(format!("{}.{}", module.module.as_str(), body.name), *body);
+        }
+    }
+    lookup
+}
+
+fn validate_wasm_op(
+    body: &MirBody,
+    kind: &MirOpKind,
+    args: &[MirValueId],
+    body_map: &BTreeMap<String, &MirBody>,
+) -> Result<(), String> {
     match kind {
         MirOpKind::Literal(value) => validate_wasm_literal(value),
         MirOpKind::Use(_) | MirOpKind::TypeRefine(_) | MirOpKind::Bind(_) | MirOpKind::Drop => {
@@ -523,11 +563,37 @@ fn validate_wasm_op(body: &MirBody, kind: &MirOpKind, args: &[MirValueId]) -> Re
         MirOpKind::SafeProject(_) => validate_record_like_arg(body, args, "SafeProject"),
         MirOpKind::Index => validate_index_op(body, args),
         MirOpKind::Updated { .. } => validate_updated_op(body, args),
-        MirOpKind::Call { .. } => Ok(()),
-        MirOpKind::Lambda { .. } | MirOpKind::Econ { .. } => Ok(()),
+        MirOpKind::Call { callee, .. } => validate_wasm_call_op(callee, args, body_map),
+        MirOpKind::Lambda { .. } => Err("Lambda values are not supported in wasm".to_owned()),
+        MirOpKind::Econ { .. } => Err("Econ values are not supported in wasm".to_owned()),
         MirOpKind::Iterator | MirOpKind::IteratorNext => Ok(()),
         MirOpKind::Unknown(_) => Err("unknown MIR op".to_owned()),
     }
+}
+
+fn validate_wasm_call_op(
+    callee: &str,
+    args: &[MirValueId],
+    body_map: &BTreeMap<String, &MirBody>,
+) -> Result<(), String> {
+    let Some(target) = body_map.get(callee) else {
+        return Err(format!(
+            "function call `{callee}` is not a same-module wasm function"
+        ));
+    };
+    if target.parameters.len() != args.len() {
+        return Err(format!(
+            "function call `{callee}` expected {} args, found {}",
+            target.parameters.len(),
+            args.len()
+        ));
+    }
+    if target.result_type.is_none() {
+        return Err(format!(
+            "function call `{callee}` has no known wasm result type"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_wasm_terminator(body: &MirBody, terminator: &MirTerminator) -> Result<(), String> {
@@ -771,11 +837,20 @@ fn require_numeric_args(
 
 fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
     match ty {
-        None => true,
+        None => false,
         Some(VoxType::Int | VoxType::Float | VoxType::Bool | VoxType::String) => true,
-        Some(VoxType::Tuple(_) | VoxType::Record(_) | VoxType::List(_)) => true,
+        Some(VoxType::Tuple(items)) => items
+            .iter()
+            .all(|item| is_supported_wasm_value_type(Some(item))),
+        Some(VoxType::Record(fields)) => fields
+            .iter()
+            .all(|field| is_supported_wasm_value_type(Some(&field.ty))),
+        Some(VoxType::List(item)) | Some(VoxType::Nullable(item)) => {
+            is_supported_wasm_value_type(Some(item))
+        }
         Some(VoxType::OpaqueSurface(name)) => {
             matches!(name.as_str(), "Int" | "Float" | "Bool" | "String" | "Null")
+                || name.starts_with("Iterator<")
         }
         _ => false,
     }
@@ -792,9 +867,10 @@ fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
             "Float" => Some(WasmScalar::Float),
             "Bool" => Some(WasmScalar::Bool),
             "String" => Some(WasmScalar::String),
+            "Null" => Some(WasmScalar::Null),
             _ => None,
         },
-        None => Some(WasmScalar::Null),
+        None => None,
         _ => None,
     }
 }
@@ -1587,22 +1663,26 @@ fn primitive_tag_for_type(ty: &VoxType) -> Option<i32> {
 
 fn literal_tag(value: &MirValue) -> Option<i32> {
     match &value.definition {
-        MirValueDefinition::Literal => {
-            match value.ty.as_ref() {
-                Some(VoxType::Int) => Some(TAG_INT),
-                Some(VoxType::OpaqueSurface(s)) if s == "Int" => Some(TAG_INT),
-                Some(VoxType::Float) => Some(TAG_FLOAT),
-                Some(VoxType::OpaqueSurface(s)) if s == "Float" => Some(TAG_FLOAT),
-                Some(VoxType::Bool) => Some(TAG_BOOL),
-                Some(VoxType::OpaqueSurface(s)) if s == "Bool" => Some(TAG_BOOL),
-                _ => None,
-            }
-        }
+        MirValueDefinition::Literal => match value.ty.as_ref() {
+            Some(VoxType::Int) => Some(TAG_INT),
+            Some(VoxType::OpaqueSurface(s)) if s == "Int" => Some(TAG_INT),
+            Some(VoxType::Float) => Some(TAG_FLOAT),
+            Some(VoxType::OpaqueSurface(s)) if s == "Float" => Some(TAG_FLOAT),
+            Some(VoxType::Bool) => Some(TAG_BOOL),
+            Some(VoxType::OpaqueSurface(s)) if s == "Bool" => Some(TAG_BOOL),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn track_binary_result_tag(name: &str, left: MirValueId, result: MirValueId, ctx: &mut Ctx, body: &MirBody) {
+fn track_binary_result_tag(
+    name: &str,
+    left: MirValueId,
+    result: MirValueId,
+    ctx: &mut Ctx,
+    body: &MirBody,
+) {
     match name {
         "less" | "greater" | "less_equal" | "greater_equal" | "equal" | "not_equal" => {
             record_known_tag(ctx, result, TAG_BOOL);
@@ -1618,7 +1698,13 @@ fn track_binary_result_tag(name: &str, left: MirValueId, result: MirValueId, ctx
     }
 }
 
-fn track_unary_result_tag(name: &str, arg: MirValueId, result: MirValueId, ctx: &mut Ctx, body: &MirBody) {
+fn track_unary_result_tag(
+    name: &str,
+    arg: MirValueId,
+    result: MirValueId,
+    ctx: &mut Ctx,
+    body: &MirBody,
+) {
     match name {
         "negate" => {
             if let Some(WasmScalar::Int) = wasm_scalar_type(body, arg) {
@@ -1627,7 +1713,9 @@ fn track_unary_result_tag(name: &str, arg: MirValueId, result: MirValueId, ctx: 
                 record_known_tag(ctx, result, TAG_FLOAT);
             }
         }
-        "not" => { record_known_tag(ctx, result, TAG_BOOL); }
+        "not" => {
+            record_known_tag(ctx, result, TAG_BOOL);
+        }
         _ => {}
     }
 }

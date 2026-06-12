@@ -588,17 +588,6 @@ fn handle_data_from_inline(value: &InlineValue) -> Option<HandleData> {
     }
 }
 
-fn block_by_id(body: &MirBody, id: MirBlockId) -> Result<&MirBlock, String> {
-    body.blocks
-        .iter()
-        .find(|block| block.id == id)
-        .ok_or_else(|| format!("MIR block %bb{} was not found", id.0))
-}
-
-fn eval_unary(name: &str, value: InlineValue) -> Result<InlineValue, String> {
-    eval_unary_ref(name, &value)
-}
-
 fn eval_unary_ref(name: &str, value: &InlineValue) -> Result<InlineValue, String> {
     match (name, value) {
         ("negate", InlineValue::Int(v)) => Ok(InlineValue::Int(-v)),
@@ -614,10 +603,6 @@ fn eval_unary_ref(name: &str, value: &InlineValue) -> Result<InlineValue, String
         )),
         (name, _) => Err(format!("unsupported unary MIR op `{name}`")),
     }
-}
-
-fn eval_binary(name: &str, left: InlineValue, right: InlineValue) -> Result<InlineValue, String> {
-    eval_binary_impl(name, &left, &right)
 }
 
 fn eval_binary_ref(name: &str, left: &InlineValue, right: &InlineValue) -> Result<InlineValue, String> {
@@ -709,14 +694,6 @@ fn eval_binary_impl(name: &str, left: &InlineValue, right: &InlineValue) -> Resu
             type_name(&right)
         )),
     }
-}
-
-fn compare_values(
-    left: InlineValue,
-    right: InlineValue,
-    predicate: impl FnOnce(std::cmp::Ordering) -> bool,
-) -> Result<InlineValue, String> {
-    compare_values_ref(&left, &right, predicate)
 }
 
 fn compare_values_ref(
@@ -973,14 +950,6 @@ fn op_kind_label(kind: &MirOpKind) -> &'static str {
         MirOpKind::Drop => "drop",
         MirOpKind::Unknown(_) => "unknown",
     }
-}
-
-fn expand_range(
-    start: InlineValue,
-    end: InlineValue,
-    inclusive: bool,
-) -> Result<InlineValue, String> {
-    Ok(InlineValue::Tuple(vec![start, end, InlineValue::Bool(inclusive)]))
 }
 
 fn expand_range_ref(

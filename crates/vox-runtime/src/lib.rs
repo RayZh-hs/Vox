@@ -132,6 +132,8 @@ pub enum RuntimeError {
     ExecutionNotImplemented(ArtifactId),
     #[error("script execution failed: {0}")]
     ExecutionFailed(String),
+    #[error("SOpt is not available for this script: {0}")]
+    SOptUnavailable(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -344,9 +346,10 @@ impl Runtime {
         source: SourceText,
         xopt: Option<OptimizationLevel>,
     ) -> Result<ArtifactId, RuntimeError> {
+        let requested = xopt.unwrap_or(self.default_xopt);
         let request = CompileRequest {
             source,
-            optimization: xopt.unwrap_or(self.default_xopt),
+            optimization: requested,
             optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
         };
@@ -361,6 +364,7 @@ impl Runtime {
         let artifact = result
             .artifact
             .expect("successful compilation should produce an artifact");
+        ensure_sopt_supported(requested >= OptimizationLevel::SOpt, &artifact)?;
         let treewalk = result.treewalk;
         let id = artifact.id;
         self.mir_execution_failures.remove(&id);
@@ -405,6 +409,7 @@ impl Runtime {
             .artifact
             .expect("successful compilation should produce an artifact");
         artifact.id = artifact_id;
+        ensure_sopt_supported(xopt >= OptimizationLevel::SOpt, &artifact)?;
         let generic_signatures_changed = previous_artifact.module != artifact.module
             || previous_artifact.optimization != artifact.optimization
             || previous_treewalk
@@ -428,6 +433,7 @@ impl Runtime {
         source: SourceText,
         settings: OptimizationSettings,
     ) -> Result<ArtifactId, RuntimeError> {
+        let requires_sopt = settings_requires_sopt(&settings);
         let request = CompileRequest {
             source,
             optimization: settings.default,
@@ -445,6 +451,7 @@ impl Runtime {
         let artifact = result
             .artifact
             .expect("successful compilation should produce an artifact");
+        ensure_sopt_supported(requires_sopt, &artifact)?;
         let treewalk = result.treewalk;
         let id = artifact.id;
         self.mir_execution_failures.remove(&id);
@@ -458,6 +465,7 @@ impl Runtime {
         source: SourceText,
         settings: OptimizationSettings,
     ) -> Result<(), RuntimeError> {
+        let requires_sopt = settings_requires_sopt(&settings);
         let Some(previous_artifact) = self.artifacts.get(artifact_id).cloned() else {
             return Err(RuntimeError::MissingArtifact(artifact_id));
         };
@@ -481,6 +489,7 @@ impl Runtime {
             .artifact
             .expect("successful compilation should produce an artifact");
         artifact.id = artifact_id;
+        ensure_sopt_supported(requires_sopt, &artifact)?;
         let generic_signatures_changed = previous_artifact.module != artifact.module
             || previous_artifact.optimization != artifact.optimization
             || previous_treewalk
@@ -596,8 +605,11 @@ impl Runtime {
             return Err(RuntimeError::NotAScript(artifact_id));
         }
 
-        if let Some(wasm) = artifact.plan.wasm.as_ref() {
-            if artifact.optimization >= OptimizationLevel::SOpt {
+        if artifact.optimization >= OptimizationLevel::SOpt {
+            if let Some(reason) = sopt_unavailable_reason(&artifact) {
+                return Err(RuntimeError::SOptUnavailable(reason));
+            }
+            if let Some(wasm) = artifact.plan.wasm.as_ref() {
                 match wasm_executor::try_wasm_execute(self, &wasm.bytes, arguments) {
                     Ok(value) => {
                         self.mir_execution_failures.remove(&artifact_id);
@@ -834,6 +846,51 @@ impl Runtime {
 
 fn qualified_host_name(package: &ModulePath, function: &str) -> String {
     format!("{}.{}", package.as_str(), function)
+}
+
+fn settings_requires_sopt(settings: &OptimizationSettings) -> bool {
+    settings.default >= OptimizationLevel::SOpt
+        || settings
+            .overrides
+            .values()
+            .any(|level| *level >= OptimizationLevel::SOpt)
+}
+
+fn ensure_sopt_supported(
+    requires_sopt: bool,
+    artifact: &CompiledArtifact,
+) -> Result<(), RuntimeError> {
+    if requires_sopt {
+        if let Some(reason) = sopt_unavailable_reason(artifact) {
+            return Err(RuntimeError::SOptUnavailable(reason));
+        }
+    }
+    Ok(())
+}
+
+fn sopt_unavailable_reason(artifact: &CompiledArtifact) -> Option<String> {
+    if artifact
+        .parameters
+        .iter()
+        .any(|parameter| parameter.has_default)
+    {
+        return Some("script parameter defaults are not lowered for SOpt".to_owned());
+    }
+
+    if artifact.plan.wasm.is_some() {
+        return None;
+    }
+
+    Some(
+        artifact
+            .plan
+            .optimization_summary
+            .iter()
+            .rev()
+            .find(|summary| summary.starts_with("backend wasm: unsupported MIR shape:"))
+            .cloned()
+            .unwrap_or_else(|| "wasm backend did not produce an artifact".to_owned()),
+    )
 }
 
 fn artifact_optimization_statuses(
