@@ -8,7 +8,10 @@ use vox_core::{
     value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
 
-use crate::{HostCallArgument, Runtime};
+use crate::{
+    HostCallArgument, Runtime,
+    interpreter::{self, CallArgument, Value},
+};
 
 const TAG_INT: i32 = 0;
 const TAG_FLOAT: i32 = 1;
@@ -276,6 +279,10 @@ fn handle_host_call(
         arg_values.push(from_wasm(runtime, Some(data), tag, val)?);
     }
 
+    if callee == "__dyn" {
+        return handle_dynamic_call(runtime, &arg_values);
+    }
+
     let host_args: Vec<HostCallArgument> = arg_values
         .into_iter()
         .enumerate()
@@ -292,6 +299,37 @@ fn handle_host_call(
     }
 
     Err(format!("host call target not found: {callee}"))
+}
+
+fn handle_dynamic_call(
+    runtime: &mut Runtime,
+    arg_values: &[RuntimeValue],
+) -> Result<(i32, i64), String> {
+    let (callee, call_args) = arg_values
+        .split_first()
+        .ok_or("dynamic call requires at least a callee value")?;
+    let callee_value = interpreter::value_from_runtime_value(runtime, callee)
+        .map_err(|e| format!("failed to convert callee value: {e}"))?;
+    let callable = match &callee_value {
+        Value::Function(function) => function.clone(),
+        _ => {
+            return Err(
+                "dynamic call target is not a function value".to_owned(),
+            );
+        }
+    };
+    let mut arguments: Vec<CallArgument> = Vec::with_capacity(call_args.len());
+    for (i, arg) in call_args.iter().enumerate() {
+        let v = interpreter::value_from_runtime_value(runtime, arg)
+            .map_err(|e| format!("failed to convert argument {i}: {e}"))?;
+        arguments.push(CallArgument::Positional(v));
+    }
+    let result = callable
+        .call(runtime, arguments)
+        .map_err(|e| format!("dynamic call failed: {e:?}"))?;
+    let rt_value = interpreter::runtime_value_from_value(runtime, result)
+        .map_err(|e| format!("failed to convert result: {e}"))?;
+    to_wasm(runtime, &rt_value)
 }
 
 fn builtin_tuple_new(

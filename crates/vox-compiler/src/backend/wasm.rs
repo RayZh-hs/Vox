@@ -483,7 +483,7 @@ fn wasm_body_lookup<'a>(
 ) -> BTreeMap<String, &'a MirBody> {
     let mut lookup = BTreeMap::new();
     for body in bodies {
-        if matches!(body.kind, MirBodyKind::Function) {
+        if matches!(body.kind, MirBodyKind::Function | MirBodyKind::ValueInitializer) {
             lookup.insert(body.name.clone(), *body);
             lookup.insert(format!("{}.{}", module.module.as_str(), body.name), *body);
         }
@@ -565,8 +565,8 @@ fn validate_wasm_op(
         MirOpKind::Index => validate_index_op(body, args),
         MirOpKind::Updated { .. } => validate_updated_op(body, args),
         MirOpKind::Call { callee, .. } => validate_wasm_call_op(callee, args, body_map),
-        MirOpKind::Lambda { .. } => Err("Lambda values are not supported in wasm".to_owned()),
-        MirOpKind::Econ { .. } => Err("Econ values are not supported in wasm".to_owned()),
+        MirOpKind::Lambda { .. } => Ok(()),
+        MirOpKind::Econ { .. } => Ok(()),
         MirOpKind::Iterator | MirOpKind::IteratorNext => Ok(()),
         MirOpKind::Unknown(_) => Err("unknown MIR op".to_owned()),
     }
@@ -578,9 +578,7 @@ fn validate_wasm_call_op(
     body_map: &BTreeMap<String, &MirBody>,
 ) -> Result<(), String> {
     let Some(target) = body_map.get(callee) else {
-        return Err(format!(
-            "function call `{callee}` is not a same-module wasm function"
-        ));
+        return Ok(());
     };
     if target.parameters.len() != args.len() {
         return Err(format!(
@@ -1237,6 +1235,10 @@ fn emit_op(
             if let Some(rid) = result {
                 if let Some(&target_func) = ctx.func_map.get(callee) {
                     emit_vox_call(args, target_func, rid, ctx, f)?;
+                } else if callee.contains('.') {
+                    emit_host_call(callee, args, rid, ctx, f)?;
+                } else if let Some(callee_value) = find_binding_value(body, callee) {
+                    emit_dynamic_call(callee_value, args, rid, ctx, f)?;
                 } else {
                     emit_host_call(callee, args, rid, ctx, f)?;
                 }
@@ -2096,6 +2098,25 @@ fn emit_host_call(
     }));
     local_set(f, ctx.data_local(result));
     Ok(())
+}
+
+fn find_binding_value(body: &MirBody, name: &str) -> Option<MirValueId> {
+    let binding = body.bindings.iter().find(|b| b.name == name)?;
+    let version_id = binding.versions.last()?;
+    let version = body.versions.iter().find(|v| v.id == *version_id)?;
+    Some(version.value)
+}
+
+fn emit_dynamic_call(
+    callee_value: MirValueId,
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let mut all_args = vec![callee_value];
+    all_args.extend_from_slice(args);
+    emit_host_call("__dyn", &all_args, result, ctx, f)
 }
 
 fn i32(f: &mut Function, v: i32) {

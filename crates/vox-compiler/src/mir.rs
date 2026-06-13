@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vox_core::{
+    diagnostics::{Diagnostic, DiagnosticBag},
     host::Purity,
     mir::{
         MirAnalysisSummary, MirBinding, MirBindingId, MirBindingVersion, MirBlock, MirBlockId,
@@ -42,6 +43,44 @@ pub(crate) fn lower_mir(
     import_resolution: ImportResolution,
 ) -> MirModule {
     MirLowerer::new(frontend, optimization, rankings, import_resolution).lower_module()
+}
+
+pub(crate) fn check_return_type_inference(
+    frontend: &FrontendUnit,
+    module: &MirModule,
+) -> DiagnosticBag {
+    let mut diagnostics = DiagnosticBag::default();
+    let annotated: BTreeMap<&str, bool> = frontend
+        .syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Function(f) => Some((f.name.as_str(), f.return_type.is_some())),
+            _ => None,
+        })
+        .collect();
+
+    for body in &module.bodies {
+        if !matches!(body.kind, MirBodyKind::Function) {
+            continue;
+        }
+        if body.result_type.is_some() {
+            continue;
+        }
+        if annotated.get(body.name.as_str()).copied().unwrap_or(false) {
+            continue;
+        }
+        let message = format!(
+            "function `{}` has no return type annotation and its return type cannot be inferred; add an explicit return type annotation",
+            body.name
+        );
+        let mut diagnostic = Diagnostic::error(message);
+        if let Some(span) = &body.span {
+            diagnostic = diagnostic.with_span(span.clone());
+        }
+        diagnostics.push(diagnostic);
+    }
+    diagnostics
 }
 
 struct MirLowerer<'a> {

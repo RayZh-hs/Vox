@@ -17,7 +17,7 @@ use crate::backend::BackendPipeline;
 use crate::frontend::{FrontendUnit, analyze_source};
 use crate::frontend::ast::TopLevelItem;
 use crate::imports::{resolve_imports, ImportResolution};
-use crate::mir::{MirPassFn, lower_mir};
+use crate::mir::{MirPassFn, check_return_type_inference, lower_mir};
 use crate::optimization::{OptimizationPipeline, derive_rankings};
 use crate::treewalk::TreewalkScript;
 
@@ -78,6 +78,7 @@ impl Compiler {
                     &optimization_rankings,
                     build_import_resolution(&frontend, &request.host),
                 );
+                let return_type_diagnostics = check_return_type_inference(&frontend, &mir);
                 let mut optimization_summary =
                     OptimizationPipeline::for_level(pipeline_optimization)
                         .run(&mut mir, custom_mir_passes);
@@ -117,7 +118,7 @@ impl Compiler {
                     artifact: Some(artifact),
                     frontend: Some(frontend),
                     treewalk,
-                    diagnostics: DiagnosticBag::default(),
+                    diagnostics: return_type_diagnostics,
                 }
             }
             Err(diagnostics) => CompileResult {

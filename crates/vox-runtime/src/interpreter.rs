@@ -154,6 +154,53 @@ impl<'a> Interpreter<'a> {
     }
 }
 
+pub(crate) fn evaluate_parameter_defaults(
+    runtime: &mut Runtime,
+    treewalk: &TreewalkScript,
+    artifact: &CompiledArtifact,
+    arguments: &[RuntimeValue],
+) -> Result<Vec<RuntimeValue>, String> {
+    if arguments.len() >= treewalk.parameters.len() {
+        return Ok(arguments.to_vec());
+    }
+    let module =
+        Rc::new(ModuleState::new(treewalk, artifact, artifact.id));
+    let mut values = BTreeMap::new();
+    for (index, parameter) in treewalk.parameters.iter().enumerate() {
+        if let Some(argument) = arguments.get(index) {
+            values.insert(
+                parameter.name.clone(),
+                value_from_runtime_value(runtime, argument)?,
+            );
+        } else if let Some(default) = &parameter.default {
+            module.initialize_parameters(values.clone());
+            let mut context = EvalContext::new(runtime, module.clone());
+            if !values.is_empty() {
+                context.push_scope(Scope::from_values(values.clone()));
+            }
+            let value = context.eval_expr(default).map_err(|e| {
+                if let EvalError::Message(msg) = e {
+                    msg
+                } else {
+                    format!("failed to evaluate default for parameter `{}`: {e:?}", parameter.name)
+                }
+            })?;
+            values.insert(parameter.name.clone(), value);
+        } else {
+            return Err(format!(
+                "missing required script parameter `{}`",
+                parameter.name
+            ));
+        }
+    }
+    let mut result = Vec::with_capacity(treewalk.parameters.len());
+    for parameter in &treewalk.parameters {
+        let value = values.remove(&parameter.name).unwrap();
+        result.push(runtime_value_from_value(runtime, value)?);
+    }
+    Ok(result)
+}
+
 #[derive(Clone)]
 struct ModuleState {
     artifact_id: ArtifactId,
@@ -1931,14 +1978,14 @@ fn render_function_set(functions: &BTreeSet<String>) -> String {
 }
 
 #[derive(Debug, Clone)]
-enum FunctionValue {
+pub(crate) enum FunctionValue {
     User(UserFunction),
     Generic(GenericFunction),
     Host(HostFunction),
 }
 
 impl FunctionValue {
-    fn call(
+    pub(crate) fn call(
         &self,
         runtime: &mut Runtime,
         arguments: Vec<CallArgument>,
@@ -1991,7 +2038,7 @@ impl FunctionValue {
 }
 
 #[derive(Clone)]
-struct UserFunction {
+pub(crate) struct UserFunction {
     name: Option<String>,
     module: Rc<ModuleState>,
     parameters: Vec<CallableParameter>,
@@ -2000,7 +2047,7 @@ struct UserFunction {
 }
 
 impl UserFunction {
-    fn call(
+    pub(crate) fn call(
         &self,
         runtime: &mut Runtime,
         arguments: Vec<CallArgument>,
@@ -2056,7 +2103,7 @@ impl UserFunction {
 }
 
 #[derive(Clone)]
-struct GenericFunction {
+pub(crate) struct GenericFunction {
     name: String,
     key: GenericFunctionKey,
     generic_parameters: Vec<GenericRuntimeParameter>,
@@ -2068,7 +2115,7 @@ struct GenericFunction {
 }
 
 impl GenericFunction {
-    fn call(
+    pub(crate) fn call(
         &self,
         runtime: &mut Runtime,
         arguments: Vec<CallArgument>,
@@ -2160,7 +2207,7 @@ impl GenericFunction {
 }
 
 #[derive(Debug, Clone)]
-struct HostFunction {
+pub(crate) struct HostFunction {
     package: ModulePath,
     name: String,
     parameters: Vec<HostCallableParameter>,
@@ -2185,7 +2232,7 @@ impl HostFunction {
         }
     }
 
-    fn call(
+    pub(crate) fn call(
         &self,
         runtime: &mut Runtime,
         arguments: Vec<CallArgument>,
@@ -2263,13 +2310,13 @@ struct GenericRuntimeParameter {
     bound: String,
 }
 
-enum CallArgument {
+pub(crate) enum CallArgument {
     Positional(Value),
     Named(String, Value),
 }
 
 #[derive(Debug, Clone)]
-enum Value {
+pub(crate) enum Value {
     Null,
     Bool(bool),
     Int(i64),
@@ -2546,7 +2593,7 @@ impl Value {
 }
 
 #[derive(Debug, Clone)]
-struct RangeValue {
+pub(crate) struct RangeValue {
     start: Option<Box<Value>>,
     end: Option<Box<Value>>,
     inclusive_end: bool,
@@ -2585,7 +2632,7 @@ impl RangeValue {
 }
 
 #[derive(Debug, Clone)]
-enum EvalError {
+pub(crate) enum EvalError {
     Message(String),
     Return(Value),
     Break,
@@ -2848,7 +2895,7 @@ fn runtime_type_from_opaque_surface(raw: &str) -> ReplType {
     }
 }
 
-fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<Value, String> {
+pub(crate) fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<Value, String> {
     match value {
         RuntimeValue::Inline(value) => value_from_inline_value(runtime, value),
         RuntimeValue::Handle(handle) => {
@@ -2917,7 +2964,7 @@ fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
     }
 }
 
-fn runtime_value_from_value(runtime: &mut Runtime, value: Value) -> Result<RuntimeValue, String> {
+pub(crate) fn runtime_value_from_value(runtime: &mut Runtime, value: Value) -> Result<RuntimeValue, String> {
     if let Value::Handle(handle, _) = &value {
         return Ok(RuntimeValue::Handle(*handle));
     }

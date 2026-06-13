@@ -605,12 +605,32 @@ impl Runtime {
             return Err(RuntimeError::NotAScript(artifact_id));
         }
 
+        let treewalk = self
+            .artifacts
+            .treewalk(artifact_id)
+            .ok_or(RuntimeError::ExecutionNotImplemented(artifact_id))?
+            .clone();
+
+        let expanded_args = if arguments.len() < treewalk.parameters.len()
+            && treewalk.parameters.iter().any(|p| p.default.is_some())
+        {
+            interpreter::evaluate_parameter_defaults(
+                self,
+                &treewalk,
+                &artifact,
+                arguments,
+            )
+            .map_err(RuntimeError::ExecutionFailed)?
+        } else {
+            arguments.to_vec()
+        };
+
         if artifact.optimization >= OptimizationLevel::SOpt {
             if let Some(reason) = sopt_unavailable_reason(&artifact) {
                 return Err(RuntimeError::SOptUnavailable(reason));
             }
             if let Some(wasm) = artifact.plan.wasm.as_ref() {
-                match wasm_executor::try_wasm_execute(self, &wasm.bytes, arguments) {
+                match wasm_executor::try_wasm_execute(self, &wasm.bytes, &expanded_args) {
                     Ok(value) => {
                         self.mir_execution_failures.remove(&artifact_id);
                         return Ok(value);
@@ -625,7 +645,7 @@ impl Runtime {
         }
 
         if let Some(mir) = artifact.mir.clone() {
-            match MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, arguments) {
+            match MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, &expanded_args) {
                 Ok(value) => {
                     self.mir_execution_failures.remove(&artifact_id);
                     return Ok(value);
@@ -636,14 +656,8 @@ impl Runtime {
             }
         }
 
-        let treewalk = self
-            .artifacts
-            .treewalk(artifact_id)
-            .ok_or(RuntimeError::ExecutionNotImplemented(artifact_id))?
-            .clone();
-
         Interpreter::new(self, artifact.id)
-            .run_script(&treewalk, &artifact, arguments)
+            .run_script(&treewalk, &artifact, &expanded_args)
             .map_err(RuntimeError::ExecutionFailed)
     }
 
@@ -869,14 +883,6 @@ fn ensure_sopt_supported(
 }
 
 fn sopt_unavailable_reason(artifact: &CompiledArtifact) -> Option<String> {
-    if artifact
-        .parameters
-        .iter()
-        .any(|parameter| parameter.has_default)
-    {
-        return Some("script parameter defaults are not lowered for SOpt".to_owned());
-    }
-
     if artifact.plan.wasm.is_some() {
         return None;
     }
