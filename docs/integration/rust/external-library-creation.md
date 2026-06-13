@@ -104,8 +104,8 @@ omitted, Vox uses the Rust function name.
 ### 4. Build the package once
 
 ```rust
-let manifest = ExternalLibrary::new("image")?
-    .build()?;
+    let (manifest, _metadata) = ExternalLibrary::new("image")?
+        .build()?;
 ```
 
 That is the full external library declaration.
@@ -120,6 +120,58 @@ From the exported Rust items, the external library collects:
 
 No separate type or trait registration step is needed.
 No separate function registration step is needed either.
+
+## Docstrings
+
+Every Vox-exported item can carry a docstring. These are collected at build time
+and attached to the voxlib as metadata after the wasm module. Libraries with
+metadata are called *annotated libraries*, and they are the preferred way to
+publish external Vox libraries, since tooling and IDEs can display the
+documentation from the voxlib file itself.
+
+Docstrings are sourced from two places, in priority order:
+
+1.  An explicit `#[vox(doc = "...")]` override on the item.
+2.  Rust `///` doc comments on the item, if no explicit override is given.
+
+All three macro forms support docstrings:
+
+```rust
+/// A pixel buffer with integer dimensions.
+#[derive(VoxExport)]
+struct Image {
+    width: i64,
+    height: i64,
+}
+
+/// Applies a Gaussian blur to the image.
+#[vox_fn(purity = "pure")]
+fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
+    todo!()
+}
+
+/// Describes a compositional image filter.
+#[vox_trait]
+trait Filter {
+    /// Applies this filter to an input image.
+    #[vox(lowered_by = filter_apply, purity = "pure")]
+    fn apply(&self, input: Image) -> Image;
+}
+```
+
+When `ExternalLibrary::build()` is called, the collected docstrings are returned
+alongside the manifest. `ExternalLibrary::generate()` writes them into the
+`.voxlib` file automatically.
+
+To override a docstring (e.g. when the Rust doc comment is intended for Rust
+consumers but the Vox docstring should differ), use the explicit form:
+
+```rust
+#[vox_fn(purity = "pure", doc = "Blurs an image with a Gaussian kernel.")]
+fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
+    todo!()
+}
+```
 
 ## End-to-End Example
 
@@ -148,7 +200,7 @@ fn filter_apply(filter: &dyn Filter, input: Image) -> Image {
     filter.apply(input)
 }
 
-let manifest = ExternalLibrary::new("image")?.build()?;
+let (manifest, _metadata) = ExternalLibrary::new("image")?.build()?;
 ```
 
 The user overhead is intentionally small:
@@ -160,28 +212,20 @@ The user overhead is intentionally small:
 
 ## Generated Artifact Format
 
-When a Rust binding compiles itself into a Vox external library, the generated
-artifact is two files:
+`ExternalLibrary::generate(wasm_bytes)` produces a single `.voxlib` file
+containing:
 
-- `name.voxh`: a compact binary header file;
-- `name.wasm`: the lowered wasm implementation.
+- a header (magic, version, reserved);
+- the package manifest (types, traits, functions, trait impls);
+- the embedded wasm module;
+- optionally, an annotated metadata section at the end.
 
-`name` defaults to the last segment of the Vox package path.
+The resulting `GeneratedExternalLibrary` can be written to disk via
+`write_to_dir(dir)`.
 
-The `.voxh` header contains only:
-
-- a short magic and version;
-- the wasm file name;
-- the exported `PackageManifest`.
-
-The header is the declarative package surface. The wasm file is the executable
-implementation.
-
-This split keeps the format small:
-
-- the runtime can inspect or mount the header metadata without loading wasm;
-- later runtime work can load the referenced wasm module to execute exported
-  host calls through the same library artifact.
+For tooling or codegen that needs raw bytes without wasm, use
+`ExternalLibrary::build()` which returns `(PackageManifest, Vec<u8>)` — the
+manifest plus serialized docstring metadata.
 
 ## Exported Names
 
@@ -315,12 +359,17 @@ In low-level manifest code, the equivalent shape is `VoxType::Record(...)`.
 - `#[derive(VoxExport)]` marks a Rust struct as exportable metadata.
 - `#[vox(name = "...")]` optionally overrides the exported name of a struct or
   trait method.
+- `#[vox(doc = "...")]` optionally overrides the documented description of any
+  exported item.
 - `#[vox_trait(...)]` marks a Rust trait as exportable metadata and may
   override its exported name.
 - `#[vox_fn(...)]` describes one exported function and may override its
-  exported name or Vox return type.
-- `ExternalLibrary::build()` produces the package manifest consumed by the
-  runtime.
+  exported name, Vox return type, or docstring.
+- `ExternalLibrary::build()` returns `(PackageManifest, Vec<u8>)` — the package
+  manifest and serialized docstring metadata.
+- `ExternalLibrary::generate(wasm_bytes)` produces a `GeneratedExternalLibrary`
+  containing the complete `.voxlib` bytes, which can be written to disk with
+  `write_to_dir(dir)`.
 
 ## Advanced Use
 

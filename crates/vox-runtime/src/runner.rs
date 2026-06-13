@@ -128,7 +128,7 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError>;
 
     fn mount_external_library(&self, library: ExternalLibrary) -> Result<LibraryId, RunnerError> {
-        let manifest = library.build().map_err(RunnerError::Session)?;
+        let (manifest, _) = library.build().map_err(RunnerError::Session)?;
         self.mount_library(manifest)
     }
 

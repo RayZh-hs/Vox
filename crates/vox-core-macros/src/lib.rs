@@ -47,6 +47,7 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
     let ident = &input.ident;
     let vox_name = exported_name_from_attrs(&input.attrs)?.unwrap_or_else(|| ident.to_string());
     let trait_impls = trait_impls_from_attrs(&input.attrs, &vox_name)?;
+    let doc = collect_vox_doc_string(&vox_name, &input.attrs, &input.attrs)?;
     let fields = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(fields) => fields.named.iter().collect::<Vec<_>>(),
@@ -140,6 +141,8 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             }
         }
 
+        #doc
+
         #(#trait_impls)*
     })
 }
@@ -148,10 +151,30 @@ fn expand_vox_trait(
     args: syn::Result<Vec<Meta>>,
     item: &mut ItemTrait,
 ) -> syn::Result<proc_macro2::TokenStream> {
-    let vox_name = exported_name_from_meta(&args?)?.unwrap_or_else(|| item.ident.to_string());
+    let args = args?;
+    let vox_name = exported_name_from_meta(&args)?.unwrap_or_else(|| item.ident.to_string());
     let method_exports = exported_trait_method_exports(&vox_name, item)?;
     strip_nested_vox_attrs_from_trait(item);
     let ident = &item.ident;
+
+    let mut doc = extract_rust_doc_comments(&item.attrs);
+    if let Some(d) = vox_doc_from_meta(&args) {
+        doc = d;
+    }
+    let doc_submission: proc_macro2::TokenStream = if doc.is_empty() {
+        proc_macro2::TokenStream::new()
+    } else {
+        quote! {
+            ::vox_core::external_export::inventory::submit! {
+                ::vox_core::external_export::ExportedDocstringRegistration {
+                    vox_name: #vox_name,
+                    doc: #doc,
+                    order: line!(),
+                }
+            }
+        }
+    };
+
     Ok(quote! {
         #item
 
@@ -166,6 +189,8 @@ fn expand_vox_trait(
         }
 
         #(#method_exports)*
+
+        #doc_submission
     })
 }
 
@@ -186,6 +211,24 @@ fn expand_vox_fn(
         ReturnType::Type(_, ty) => quote!(#ty),
     };
     let return_type_override = options.return_type_override.as_ref();
+
+    let mut doc = extract_rust_doc_comments(&item.attrs);
+    if let Some(d) = &options.doc {
+        doc = d.clone();
+    }
+    let doc_submission: proc_macro2::TokenStream = if doc.is_empty() {
+        proc_macro2::TokenStream::new()
+    } else {
+        quote! {
+            ::vox_core::external_export::inventory::submit! {
+                ::vox_core::external_export::ExportedDocstringRegistration {
+                    vox_name: #vox_name,
+                    doc: #doc,
+                    order: line!(),
+                }
+            }
+        }
+    };
 
     let mut parameters = Vec::new();
     let mut invoker_bindings = Vec::new();
@@ -271,6 +314,8 @@ fn expand_vox_fn(
                 order: line!(),
             }
         }
+
+        #doc_submission
     })
 }
 
@@ -324,6 +369,82 @@ fn parse_attr_args(args: TokenStream) -> syn::Result<Vec<Meta>> {
     parser
         .parse(args)
         .map(|items| items.into_iter().collect::<Vec<_>>())
+}
+
+fn collect_vox_doc_string(
+    vox_name: &str,
+    attrs: &[Attribute],
+    vox_attrs: &[Attribute],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut doc = extract_rust_doc_comments(attrs);
+    if let Some(vox_doc) = vox_doc_override(vox_attrs)? {
+        doc = vox_doc;
+    }
+    if doc.is_empty() {
+        return Ok(proc_macro2::TokenStream::new());
+    }
+    Ok(quote! {
+        ::vox_core::external_export::inventory::submit! {
+            ::vox_core::external_export::ExportedDocstringRegistration {
+                vox_name: #vox_name,
+                doc: #doc,
+                order: line!(),
+            }
+        }
+    })
+}
+
+fn extract_rust_doc_comments(attrs: &[Attribute]) -> String {
+    let mut doc = String::new();
+    for attr in attrs {
+        if !attr.path().is_ident("doc") {
+            continue;
+        }
+        if let Meta::NameValue(nv) = &attr.meta {
+            if let syn::Expr::Lit(expr) = &nv.value {
+                if let syn::Lit::Str(s) = &expr.lit {
+                    if !doc.is_empty() {
+                        doc.push('\n');
+                    }
+                    doc.push_str(&s.value());
+                }
+            }
+        }
+    }
+    doc
+}
+
+fn vox_doc_override(vox_attrs: &[Attribute]) -> syn::Result<Option<String>> {
+    for attr in vox_attrs {
+        if !attr.path().is_ident("vox") {
+            continue;
+        }
+        for entry in parse_nested_meta(attr)? {
+            let Meta::NameValue(value) = entry else {
+                continue;
+            };
+            if value.path.is_ident("doc") {
+                return Ok(Some(expect_lit_str(&value.value, "doc")?.value()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn vox_doc_from_meta(meta: &[Meta]) -> Option<String> {
+    for entry in meta {
+        let Meta::NameValue(value) = entry else {
+            continue;
+        };
+        if value.path.is_ident("doc") {
+            if let syn::Expr::Lit(expr) = &value.value {
+                if let syn::Lit::Str(s) = &expr.lit {
+                    return Some(s.value());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn exported_name_from_attrs(attrs: &[Attribute]) -> syn::Result<Option<String>> {
@@ -458,6 +579,22 @@ fn exported_trait_method_exports(
                 }
             }
         });
+
+        let mut method_doc = extract_rust_doc_comments(&method.attrs);
+        if let Some(d) = &options.doc {
+            method_doc = d.clone();
+        }
+        if !method_doc.is_empty() {
+            exports.push(quote! {
+                ::vox_core::external_export::inventory::submit! {
+                    ::vox_core::external_export::ExportedDocstringRegistration {
+                        vox_name: #vox_name,
+                        doc: #method_doc,
+                        order: line!(),
+                    }
+                }
+            });
+        }
     }
     Ok(exports)
 }
@@ -505,6 +642,7 @@ struct FunctionOptions {
     name: Option<String>,
     purity: PurityValue,
     return_type_override: Option<LitStr>,
+    doc: Option<String>,
 }
 
 impl FunctionOptions {
@@ -513,6 +651,7 @@ impl FunctionOptions {
             name: None,
             purity: PurityValue::Pure,
             return_type_override: None,
+            doc: None,
         };
 
         for entry in meta {
@@ -532,6 +671,10 @@ impl FunctionOptions {
                     Some(expect_lit_str(&value.value, "return_type")?.clone());
                 continue;
             }
+            if value.path.is_ident("doc") {
+                options.doc = Some(expect_lit_str(&value.value, "doc")?.value());
+                continue;
+            }
             return Err(Error::new_spanned(value, "unsupported vox_fn option"));
         }
 
@@ -543,6 +686,7 @@ struct TraitMethodOptions {
     name: Option<String>,
     lowered_by: String,
     purity: PurityValue,
+    doc: Option<String>,
 }
 
 impl TraitMethodOptions {
@@ -550,6 +694,7 @@ impl TraitMethodOptions {
         let mut name = None;
         let mut lowered_by = None;
         let mut purity = PurityValue::Pure;
+        let mut doc = None;
 
         for entry in meta {
             let Meta::NameValue(value) = entry else {
@@ -567,6 +712,10 @@ impl TraitMethodOptions {
                 purity = PurityValue::parse(expect_lit_str(&value.value, "purity")?)?;
                 continue;
             }
+            if value.path.is_ident("doc") {
+                doc = Some(expect_lit_str(&value.value, "doc")?.value());
+                continue;
+            }
             return Err(Error::new_spanned(
                 value,
                 "unsupported trait method vox option",
@@ -582,6 +731,7 @@ impl TraitMethodOptions {
                 )
             })?,
             purity,
+            doc,
         })
     }
 }

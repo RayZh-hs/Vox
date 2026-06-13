@@ -199,7 +199,7 @@ impl Runtime {
         &mut self,
         library: ExternalLibrary,
     ) -> Result<LibraryId, String> {
-        library.build().map(|manifest| self.mount_library(manifest))
+        library.build().map(|(manifest, _)| self.mount_library(manifest))
     }
 
     pub fn mount_voxlib_file(&mut self, path: &Path) -> Result<LibraryId, String> {

@@ -177,6 +177,7 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
     let header = ExternalLibraryHeader {
         manifest,
         wasm_bytes,
+        metadata: None,
     };
     encode_external_library_file(&header).map_err(|error| error.to_string())
 }

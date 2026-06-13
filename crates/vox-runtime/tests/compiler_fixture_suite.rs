@@ -245,7 +245,7 @@ fn semantic_manifests() -> Vec<PackageManifest> {
 #[test]
 fn test_external_library_manifest_generation() {
     let package_name = "test.fxt";
-    let manifest = ExternalLibrary::new(package_name)
+    let (manifest, _metadata) = ExternalLibrary::new(package_name)
         .expect("valid package name")
         .build()
         .expect("external library build should collect registered exports");
@@ -435,10 +435,11 @@ fn voxlib_file_compile_write_and_mount_round_trip() {
 }
 
 fn extern_manifest() -> PackageManifest {
-    ExternalLibrary::new("test.fxt")
+    let (manifest, _) = ExternalLibrary::new("test.fxt")
         .expect("valid package name")
         .build()
-        .expect("external library build should succeed")
+        .expect("external library build should succeed");
+    manifest
 }
 
 fn extern_registry() -> HostRegistry {

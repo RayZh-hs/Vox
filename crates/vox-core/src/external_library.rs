@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     diagnostics::Diagnostic,
-    external_export::extend_manifest_with_registered_exports,
+    external_export::{collect_registered_docstrings, extend_manifest_with_registered_exports},
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
         TraitMethodSpec, TraitSpec, TypeSpec,
@@ -28,6 +28,7 @@ pub struct ExternalLibrary {
 pub struct ExternalLibraryHeader {
     pub manifest: PackageManifest,
     pub wasm_bytes: Vec<u8>,
+    pub metadata: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,20 +74,27 @@ impl ExternalLibrary {
         &mut self.manifest
     }
 
-    pub fn build(self) -> Result<PackageManifest, String> {
-        extend_manifest_with_registered_exports(self.manifest)
+    pub fn build(self) -> Result<(PackageManifest, Vec<u8>), String> {
+        let manifest = extend_manifest_with_registered_exports(self.manifest)?;
+        let docstrings = collect_registered_docstrings();
+        let metadata = encode_docstring_metadata(&docstrings);
+        Ok((manifest, metadata))
     }
 
     pub fn generate(
         self,
         wasm_bytes: impl Into<Vec<u8>>,
     ) -> Result<GeneratedExternalLibrary, ExternalLibraryFormatError> {
-        let manifest = extend_manifest_with_registered_exports(self.manifest)
-            .map_err(ExternalLibraryFormatError::Message)?;
+        let (manifest, metadata) = self.build().map_err(ExternalLibraryFormatError::Message)?;
         let wasm_bytes = wasm_bytes.into();
         let header = ExternalLibraryHeader {
             manifest,
             wasm_bytes,
+            metadata: if metadata.is_empty() {
+                None
+            } else {
+                Some(metadata)
+            },
         };
         let library_bytes = encode_external_library_file(&header)?;
         let library_file_name = format!("{}.voxlib", header.manifest.package.as_str());
@@ -151,8 +159,10 @@ impl From<io::Error> for ExternalLibraryFormatError {
 //
 // Layout:  magic(4B) | version(u16) | reserved(u16)
 //        | manifest(len+bytes) | wasm(len+bytes)
+//        | metadata(len+bytes)?
 //
 // Single self-contained file; wasm is embedded inline.
+// Metadata is conditionally attached at the end for annotated libraries.
 // =============================================================================
 
 pub fn encode_external_library_file(
@@ -164,6 +174,9 @@ pub fn encode_external_library_file(
     writer.write_u16(0);
     writer.write_bytes(&encode_package_manifest(&header.manifest)?)?;
     writer.write_bytes(&header.wasm_bytes)?;
+    if let Some(metadata) = &header.metadata {
+        writer.write_bytes(metadata)?;
+    }
     Ok(writer.into_inner())
 }
 
@@ -188,11 +201,29 @@ pub fn decode_external_library_file(
     let _reserved = reader.read_u16()?;
     let manifest = decode_package_manifest(&reader.read_bytes()?)?;
     let wasm_bytes = reader.read_bytes()?;
-    reader.finish()?;
+    let metadata = if reader.cursor < reader.bytes.len() {
+        Some(reader.read_bytes()?)
+    } else {
+        None
+    };
     Ok(ExternalLibraryHeader {
         manifest,
         wasm_bytes,
+        metadata,
     })
+}
+
+fn encode_docstring_metadata(docstrings: &BTreeMap<String, String>) -> Vec<u8> {
+    if docstrings.is_empty() {
+        return Vec::new();
+    }
+    let mut writer = BinaryWriter::new();
+    let _ = writer.write_len(docstrings.len(), "docstring entries");
+    for (name, doc) in docstrings {
+        let _ = writer.write_string(name);
+        let _ = writer.write_string(doc);
+    }
+    writer.into_inner()
 }
 
 pub fn encode_package_manifest(

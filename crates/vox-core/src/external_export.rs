@@ -69,10 +69,18 @@ pub struct ExportedTraitImplRegistration {
     pub order: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExportedDocstringRegistration {
+    pub vox_name: &'static str,
+    pub doc: &'static str,
+    pub order: u32,
+}
+
 inventory::collect!(ExportedSurfaceRegistration);
 inventory::collect!(ExportedFunctionRegistration);
 inventory::collect!(ExportedTraitMethodRegistration);
 inventory::collect!(ExportedTraitImplRegistration);
+inventory::collect!(ExportedDocstringRegistration);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectedPackageExports {
@@ -93,6 +101,20 @@ pub fn extend_manifest_with_registered_exports(
         functions: collected.functions,
         trait_impls: collected.trait_impls,
     })
+}
+
+pub fn collect_registered_docstrings() -> BTreeMap<String, String> {
+    let mut entries: Vec<_> = inventory::iter::<ExportedDocstringRegistration>
+        .into_iter()
+        .copied()
+        .collect();
+    entries.sort_by(|a, b| a.order.cmp(&b.order).then(a.vox_name.cmp(b.vox_name)));
+
+    let mut docs = BTreeMap::new();
+    for entry in entries {
+        docs.insert(entry.vox_name.to_owned(), entry.doc.to_owned());
+    }
+    docs
 }
 
 pub fn collect_registered_package_exports(
