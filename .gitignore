@@ -1,8 +1,9 @@
 # IDE
 .vscode/
 .idea/
-.codex
 target/
 
 # Local files
 /dev
+.codex
+opencode.json
