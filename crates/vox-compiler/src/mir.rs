@@ -20,7 +20,7 @@ use crate::frontend::{
     FrontendUnit,
     ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
-        ExprKind, ForHeader, FunctionDecl, IfExpr, IntrinsicExpr, LocalValueDecl,
+        ExprKind, ForHeader, FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl,
         Mutability, QualifiedName, StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp,
         UpdatedPathSegment, ValueDecl, WhenExpr,
     },
@@ -90,6 +90,7 @@ struct MirLowerer<'a> {
     import_resolution: ImportResolution,
     function_return_types: BTreeMap<String, VoxType>,
     next_body: u32,
+    lambda_bodies: Vec<MirBody>,
 }
 
 impl<'a> MirLowerer<'a> {
@@ -107,6 +108,7 @@ impl<'a> MirLowerer<'a> {
             import_resolution,
             function_return_types,
             next_body: 0,
+            lambda_bodies: Vec::new(),
         }
     }
 
@@ -138,6 +140,8 @@ impl<'a> MirLowerer<'a> {
                 _ => {}
             }
         }
+
+        bodies.append(&mut self.lambda_bodies);
 
         MirModule {
             module: self.frontend.header.module.clone(),
@@ -195,7 +199,9 @@ impl<'a> MirLowerer<'a> {
             .map(|expr| body.lower_expr(expr))
             .unwrap_or_else(|| body.emit_unit());
         body.terminate(MirTerminator::Return(result));
-        body.finish()
+        let (body, lambda_bodies) = body.finish();
+        self.lambda_bodies.extend(lambda_bodies);
+        body
     }
 
     fn lower_function(&mut self, function: &FunctionDecl) -> MirBody {
@@ -235,7 +241,8 @@ impl<'a> MirLowerer<'a> {
 
         let result = body.lower_expr(&function.body);
         body.terminate(MirTerminator::Return(result));
-        let finished = body.finish();
+        let (finished, lambda_bodies) = body.finish();
+        self.lambda_bodies.extend(lambda_bodies);
         if let Some(result_type) = finished.result_type.clone() {
             self.function_return_types
                 .insert(function.name.clone(), result_type.clone());
@@ -261,7 +268,9 @@ impl<'a> MirLowerer<'a> {
         );
         let result = body.lower_expr(&value.initializer);
         body.terminate(MirTerminator::Return(result));
-        body.finish()
+        let (finished, lambda_bodies) = body.finish();
+        self.lambda_bodies.extend(lambda_bodies);
+        finished
     }
 
     fn alloc_body_id(&mut self) -> MirBodyId {
@@ -309,6 +318,7 @@ struct BodyBuilder {
     next_value: u32,
     next_block: u32,
     loop_stack: Vec<LoopContext>,
+    lambda_bodies: Vec<MirBody>,
 }
 
 struct LoopContext {
@@ -357,11 +367,12 @@ impl BodyBuilder {
             next_value: 0,
             next_block: 1,
             loop_stack: Vec::new(),
+            lambda_bodies: Vec::new(),
         }
     }
 
-    fn finish(self) -> MirBody {
-        MirBody {
+    fn finish(self) -> (MirBody, Vec<MirBody>) {
+        let body = MirBody {
             id: self.body_id,
             name: self.name,
             kind: self.kind,
@@ -376,7 +387,8 @@ impl BodyBuilder {
             blocks: self.blocks,
             result_type: self.result_type,
             analyses: MirAnalysisSummary::default(),
-        }
+        };
+        (body, self.lambda_bodies)
     }
 
     fn lower_value_decl(&mut self, value: &ValueDecl) {
@@ -699,19 +711,7 @@ impl BodyBuilder {
             ExprKind::If(if_expr) => self.lower_if_expr(if_expr, Some(expr.span.clone())),
             ExprKind::When(when_expr) => self.lower_when_expr(when_expr, Some(expr.span.clone())),
             ExprKind::For(for_expr) => self.lower_for_expr(for_expr, Some(expr.span.clone())),
-            ExprKind::Lambda(lambda) => {
-                self.emit_op(
-                    MirOpKind::Lambda {
-                        parameters: lambda
-                            .parameters
-                            .iter()
-                            .map(|parameter| parameter.name.clone())
-                            .collect(),
-                    },
-                    Vec::new(),
-                    Some(expr.span.clone()),
-                )
-            }
+            ExprKind::Lambda(lambda) => self.lower_lambda(lambda, expr),
             ExprKind::Block(block) => {
                 self.push_scope();
                 let value = self.lower_block_expr(block);
@@ -1514,6 +1514,287 @@ impl BodyBuilder {
             value.binding_version = Some(version);
         }
     }
+
+    fn register_external_value(&mut self, value_id: MirValueId) {
+        if !self.values.iter().any(|v| v.id == value_id) {
+            self.values.push(MirValue {
+                id: value_id,
+                ty: None,
+                definition: MirValueDefinition::Capture("".to_owned()),
+                span: None,
+                binding_version: None,
+                uses: Vec::new(),
+                lifetime: MirLifetime::default(),
+                escape: MirEscape::default(),
+                demand: MirDemand::Unknown,
+                storage: MirStorage::Fresh,
+            });
+        }
+    }
+
+    fn lower_lambda(&mut self, lambda: &LambdaExpr, expr: &Expr) -> MirValueId {
+        let param_names: Vec<String> =
+            lambda.parameters.iter().map(|p| p.name.clone()).collect();
+        let param_set: BTreeSet<String> = param_names.iter().cloned().collect();
+
+        let mut free_names = BTreeSet::new();
+        collect_free_names_for_lambda(&lambda.body, &param_set, &mut free_names);
+
+        let mut captures: Vec<MirValueId> = Vec::new();
+        let mut capture_names: Vec<String> = Vec::new();
+        for name in &free_names {
+            if let Some(binding) = self.resolve_binding(name) {
+                captures.push(binding.value);
+                capture_names.push(name.clone());
+            }
+        }
+
+        let body_id = self.alloc_foreign_body_id();
+
+        let mut child = BodyBuilder::new(
+            body_id,
+            format!("lambda.{}.{}", body_id.0, captures.len()),
+            MirBodyKind::Lambda,
+            Purity::Pure,
+            self.rank,
+            Some(lambda.span.clone()),
+            self.import_resolution.clone(),
+            self.function_return_types.clone(),
+            None,
+        );
+
+        for (name, value) in capture_names.iter().zip(captures.iter()) {
+            child.register_external_value(*value);
+            child.declare_binding(
+                name.clone(),
+                MirMutability::Val,
+                None,
+                None,
+                *value,
+                MirVersionSource::Capture,
+            );
+        }
+
+        for param in &lambda.parameters {
+            let value = child.new_value(
+                Some(VoxType::opaque_surface("Unknown")),
+                MirValueDefinition::Parameter(param.name.clone()),
+                Some(param.span.clone()),
+            );
+            child.declare_binding(
+                param.name.clone(),
+                MirMutability::Val,
+                None,
+                Some(param.span.clone()),
+                value,
+                MirVersionSource::Parameter,
+            );
+            child.parameters.push(value);
+        }
+
+        for name in &capture_names {
+            if let Some(binding) = child.resolve_binding(name) {
+                child.set_value_version(binding.value, binding.version);
+            }
+        }
+
+        let result = child.lower_expr(&lambda.body);
+        child.terminate(MirTerminator::Return(result));
+        let (lambda_body, _nested_lambdas) = child.finish();
+        self.lambda_bodies.push(lambda_body);
+
+        self.emit_op(
+            MirOpKind::Lambda {
+                parameters: param_names,
+                captures: captures.clone(),
+                body_id,
+            },
+            captures,
+            Some(expr.span.clone()),
+        )
+    }
+
+    fn alloc_foreign_body_id(&mut self) -> MirBodyId {
+        MirBodyId(self.lambda_bodies.len() as u32 + 10000)
+    }
+}
+
+fn collect_free_names_for_lambda(
+    expr: &Expr,
+    param_set: &BTreeSet<String>,
+    names: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Name(name) => {
+            let label = name.to_source_string();
+            if !param_set.contains(&label) {
+                names.insert(label);
+            }
+        }
+        ExprKind::Call { callee, arguments } => {
+            collect_free_names_for_lambda(callee, param_set, names);
+            for arg in arguments {
+                if let Argument::Positional(expr) = arg {
+                    collect_free_names_for_lambda(expr, param_set, names);
+                }
+            }
+        }
+        ExprKind::ReceiverCall {
+            receiver,
+            arguments, ..
+        } => {
+            collect_free_names_for_lambda(receiver, param_set, names);
+            for arg in arguments {
+                if let Argument::Positional(expr) = arg {
+                    collect_free_names_for_lambda(expr, param_set, names);
+                }
+            }
+        }
+        ExprKind::Unary { expr: inner, .. } => {
+            collect_free_names_for_lambda(inner, param_set, names);
+        }
+        ExprKind::Binary { left, right, .. } => {
+            collect_free_names_for_lambda(left, param_set, names);
+            collect_free_names_for_lambda(right, param_set, names);
+        }
+        ExprKind::Block(block) => {
+            let mut block_param_names = BTreeSet::new();
+            for item in &block.items {
+                match item {
+                    BlockItem::LocalValue(local) => {
+                        collect_free_names_for_lambda(&local.initializer, param_set, names);
+                        block_param_names.insert(local.name.clone());
+                    }
+                    BlockItem::Assignment(a) => {
+                        collect_free_names_for_lambda(&a.value, param_set, names);
+                    }
+                    BlockItem::CompoundAssignment(ca) => {
+                        collect_free_names_for_lambda(&ca.value, param_set, names);
+                    }
+                    BlockItem::Expr(e) => {
+                        collect_free_names_for_lambda(e, param_set, names);
+                    }
+                    _ => {}
+                }
+            }
+            let inner_set: BTreeSet<String> =
+                param_set.union(&block_param_names).cloned().collect();
+            if let Some(trailing) = &block.trailing {
+                collect_free_names_for_lambda(trailing, &inner_set, names);
+            }
+        }
+        ExprKind::Lambda(inner_lambda) => {
+            let mut inner_params: BTreeSet<String> = param_set.clone();
+            for p in &inner_lambda.parameters {
+                inner_params.insert(p.name.clone());
+            }
+            collect_free_names_for_lambda(&inner_lambda.body, &inner_params, names);
+        }
+        ExprKind::Index { target, index } => {
+            collect_free_names_for_lambda(target, param_set, names);
+            collect_free_names_for_lambda(index, param_set, names);
+        }
+        ExprKind::Field { target, .. } => {
+            collect_free_names_for_lambda(target, param_set, names);
+        }
+        ExprKind::SafeField { target, .. } => {
+            collect_free_names_for_lambda(target, param_set, names);
+        }
+        ExprKind::If(if_expr) => {
+            for branch in &if_expr.branches {
+                collect_free_names_for_lambda(&branch.condition, param_set, names);
+                collect_free_names_for_lambda_block(&branch.body, param_set, names);
+            }
+            if let Some(else_branch) = &if_expr.else_branch {
+                collect_free_names_for_lambda_block(else_branch, param_set, names);
+            }
+        }
+        ExprKind::Range(range) => {
+            if let Some(start) = &range.start {
+                collect_free_names_for_lambda(start, param_set, names);
+            }
+            if let Some(end) = &range.end {
+                collect_free_names_for_lambda(end, param_set, names);
+            }
+        }
+        ExprKind::When(when) => {
+            collect_free_names_for_lambda(&when.subject, param_set, names);
+            for arm in &when.arms {
+                collect_free_names_for_lambda(&arm.body, param_set, names);
+            }
+            if let Some(else_arm) = &when.else_arm {
+                collect_free_names_for_lambda(else_arm, param_set, names);
+            }
+        }
+        ExprKind::For(for_expr) => {
+            match &for_expr.header {
+                ForHeader::In { pattern, iterable } => {
+                    collect_free_names_for_lambda(iterable, param_set, names);
+                    let mut for_params = param_set.clone();
+                    for_params.insert(pattern.clone());
+                    collect_free_names_for_lambda_block(&for_expr.body, &for_params, names);
+                }
+                ForHeader::Condition(cond) => {
+                    collect_free_names_for_lambda(cond, param_set, names);
+                    collect_free_names_for_lambda_block(&for_expr.body, param_set, names);
+                }
+            }
+        }
+        ExprKind::NonNull { target } => {
+            collect_free_names_for_lambda(target, param_set, names);
+        }
+        ExprKind::Intrinsic(intrinsic) => match intrinsic {
+            IntrinsicExpr::Updated(updated) => {
+                collect_free_names_for_lambda(&updated.target, param_set, names);
+                for update in &updated.updates {
+                    collect_free_names_for_lambda(&update.value, param_set, names);
+                }
+            }
+            IntrinsicExpr::Econ(econ) => {
+                collect_free_names_for_lambda_block(&econ.body, param_set, names);
+            }
+        },
+        _ => {}
+    }
+}
+
+fn collect_free_names_for_lambda_block(
+    block: &BlockExpr,
+    param_set: &BTreeSet<String>,
+    names: &mut BTreeSet<String>,
+) {
+    let mut block_param_names = BTreeSet::new();
+    for item in &block.items {
+        match item {
+            BlockItem::LocalValue(local) => {
+                collect_free_names_for_lambda(&local.initializer, param_set, names);
+                block_param_names.insert(local.name.clone());
+            }
+            BlockItem::Assignment(a) => {
+                collect_free_names_for_lambda(&a.value, param_set, names);
+            }
+            BlockItem::CompoundAssignment(ca) => {
+                collect_free_names_for_lambda(&ca.value, param_set, names);
+            }
+            BlockItem::Expr(e) => {
+                collect_free_names_for_lambda(e, param_set, names);
+            }
+            BlockItem::Return(r) => {
+                if let Some(expr) = &r.value {
+                    collect_free_names_for_lambda(expr, param_set, names);
+                }
+            }
+            BlockItem::Panic(_)
+            | BlockItem::Break(_)
+            | BlockItem::Continue(_)
+            | BlockItem::BlockStatement(_) => {}
+        }
+    }
+    let inner_set: BTreeSet<String> =
+        param_set.union(&block_param_names).cloned().collect();
+    if let Some(trailing) = &block.trailing {
+        collect_free_names_for_lambda(trailing, &inner_set, names);
+    }
 }
 
 pub(crate) fn build_def_use(module: &mut MirModule) -> MirPassReport {
@@ -2140,7 +2421,7 @@ fn pure_op_name(kind: &MirOpKind) -> Option<String> {
         MirOpKind::Project(projection) => Some(format!("project:{projection:?}")),
         MirOpKind::Index => Some("index".to_owned()),
         MirOpKind::Updated { path } => Some(format!("updated:{path:?}")),
-        MirOpKind::Lambda { parameters } => Some(format!("lambda:{}", parameters.join(","))),
+        MirOpKind::Lambda { parameters, .. } => Some(format!("lambda:{}", parameters.join(","))),
         MirOpKind::NonNull => Some("non_null".to_owned()),
         MirOpKind::SafeProject(field) => Some(format!("safe_project:{field}")),
         MirOpKind::TypeTest(ty) => Some(format!("type_test:{ty}")),

@@ -3,13 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use wasm_encoder::{
     BlockType, CodeSection, ConstExpr, DataSection, DataSegment, DataSegmentMode, EntityType,
     ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
-    Instruction, MemArg, MemoryType, Module, ValType,
+    Instruction, MemArg, MemoryType, Module, RefType, ValType,
 };
 
 use vox_core::{
     mir::{
-        MirBlock, MirBlockId, MirBody, MirBodyKind, MirModule, MirOpKind, MirPathSegment,
-        MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId, MirVersionId,
+        MirBlock, MirBlockId, MirBody, MirBodyId, MirBodyKind, MirModule, MirOpKind,
+        MirPathSegment, MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId,
+        MirVersionSource, MirVersionId,
     },
     plan::WasmArtifact,
     types::VoxType,
@@ -34,6 +35,7 @@ const TAG_RECORD: i32 = 5;
 const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
+const TAG_CLOSURE: i32 = 9;
 
 const SCRATCH_OFF: u32 = 0;
 const RESULT_OFF: u32 = 16384;
@@ -52,6 +54,7 @@ const HEAP_TOP_GLOBAL: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
+#[allow(dead_code)]
 enum BuiltinOp {
     StringInterpolate = 4,
     Project = 5,
@@ -82,6 +85,9 @@ struct Ctx {
     version_count: u32,
     version_to_binding_value: BTreeMap<MirVersionId, MirValueId>,
     known_tags: BTreeMap<MirValueId, i32>,
+    lambda_table: BTreeMap<MirBodyId, (u32, usize)>,
+    lambda_types: BTreeMap<usize, u32>,
+    is_lambda_body: bool,
 }
 
 impl Ctx {
@@ -98,6 +104,9 @@ impl Ctx {
             version_count: 0,
             version_to_binding_value: BTreeMap::new(),
             known_tags: BTreeMap::new(),
+            lambda_table: BTreeMap::new(),
+            lambda_types: BTreeMap::new(),
+            is_lambda_body: false,
         };
         ctx.init_for_body(body);
         ctx
@@ -111,8 +120,11 @@ impl Ctx {
         self.version_index.clear();
         self.version_count = 0;
 
+        self.is_lambda_body = matches!(body.kind, MirBodyKind::Lambda);
+        let param_offset: u32 = if self.is_lambda_body { 1 } else { 0 };
+
         for (i, p) in body.parameters.iter().enumerate() {
-            self.parameter_index.insert(*p, i as u32);
+            self.parameter_index.insert(*p, i as u32 + param_offset);
         }
 
         let mut idx = 0u32;
@@ -225,7 +237,16 @@ impl Ctx {
     }
 
     fn parameter_local_count(&self) -> u32 {
-        self.parameter_index.len() as u32 * 2
+        let base = self.parameter_index.len() as u32 * 2;
+        if self.is_lambda_body {
+            base + 2
+        } else {
+            base
+        }
+    }
+
+    fn closure_local(&self) -> u32 {
+        0
     }
 
     fn version_tag_local(&self, version: MirVersionId) -> u32 {
@@ -340,6 +361,32 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         next_type_idx += 1;
     }
 
+    let mut closure_type_indices: BTreeMap<usize, u32> = BTreeMap::new();
+    for body in &bodies {
+        if !matches!(body.kind, MirBodyKind::Lambda) {
+            continue;
+        }
+        let capture_count: usize = body
+            .name
+            .split('.')
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let explicit_params = body.parameters.len().saturating_sub(capture_count);
+        if closure_type_indices.contains_key(&explicit_params) {
+            continue;
+        }
+        let mut params = Vec::with_capacity(1 + explicit_params * 2);
+        params.push(ValType::I32);
+        for _ in 0..explicit_params {
+            params.push(ValType::I32);
+            params.push(ValType::I64);
+        }
+        types.ty().function(params, [ValType::I32, ValType::I64]);
+        closure_type_indices.insert(explicit_params, next_type_idx);
+        next_type_idx += 1;
+    }
+
     let mut imports = ImportSection::new();
     imports.import(
         "vox",
@@ -379,6 +426,8 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     let entry_func_index = entry_func_index
         .ok_or_else(|| "module must have a ScriptEntry body for wasm".to_owned())?;
 
+    let func_map_clone = func_map.clone();
+
     let mut exports = ExportSection::new();
     exports.export("script_entry", ExportKind::Func, entry_func_index);
     exports.export("memory", ExportKind::Memory, 0);
@@ -386,6 +435,50 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
 
     let mut ctx = Ctx::new(bodies[0], module);
     ctx.func_map = func_map;
+    ctx.lambda_types = closure_type_indices;
+
+    let lambda_count: u32 = bodies
+        .iter()
+        .filter(|b| matches!(b.kind, MirBodyKind::Lambda))
+        .count() as u32;
+    let mut table = wasm_encoder::TableSection::new();
+    let mut elems = wasm_encoder::ElementSection::new();
+    if lambda_count > 0 {
+        table.table(wasm_encoder::TableType {
+            element_type: RefType::FUNCREF,
+            minimum: lambda_count as u64,
+            maximum: None,
+            table64: false,
+            shared: false,
+        });
+        let mut table_index = 0u32;
+        let mut elem_funcs: Vec<u32> = Vec::new();
+        for body in &bodies {
+            if !matches!(body.kind, MirBodyKind::Lambda) {
+                continue;
+            }
+            let func_idx = func_map_clone
+                .get(&body.name)
+                .copied()
+                .ok_or_else(|| format!("lambda body {} not found in func_map", body.name))?;
+            elem_funcs.push(func_idx);
+            let capture_count: usize = body
+                .name
+                .split('.')
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if let Some(item) = module.bodies.iter().find(|b| b.name == body.name) {
+                ctx.lambda_table.insert(item.id, (table_index, capture_count));
+            }
+            table_index += 1;
+        }
+        elems.active(
+            None,
+            &ConstExpr::i32_const(0),
+            wasm_encoder::Elements::Functions(std::borrow::Cow::Borrowed(&elem_funcs)),
+        );
+    }
 
     let mut codes = CodeSection::new();
     for (i, body) in bodies.iter().enumerate() {
@@ -417,6 +510,10 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     wasm.section(&types);
     wasm.section(&imports);
     wasm.section(&funcs);
+    if lambda_count > 0 {
+        wasm.section(&table);
+        wasm.section(&elems);
+    }
     wasm.section(&globals);
     wasm.section(&exports);
     wasm.section(&codes);
@@ -937,6 +1034,10 @@ fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
 
     let mut f = Function::new(locals);
 
+    if ctx.is_lambda_body {
+        emit_lambda_capture_prologue(body, ctx, &mut f)?;
+    }
+
     let entry_id = ctx.block_idx(body.blocks.first().map(|b| b.id).unwrap_or(MirBlockId(0)));
     f.instruction(&Instruction::I32Const(entry_id as i32));
     f.instruction(&Instruction::LocalSet(ctx.block_id_local()));
@@ -1238,16 +1339,19 @@ fn emit_op(
                 } else if callee.contains('.') {
                     emit_host_call(callee, args, rid, ctx, f)?;
                 } else if let Some(callee_value) = find_binding_value(body, callee) {
-                    emit_dynamic_call(callee_value, args, rid, ctx, f)?;
+                    emit_dynamic_call(callee_value, args, rid, ctx, f, body)?;
                 } else {
                     emit_host_call(callee, args, rid, ctx, f)?;
                 }
             }
         }
-        MirOpKind::Lambda { parameters } => {
+        MirOpKind::Lambda {
+            parameters,
+            captures,
+            body_id,
+        } => {
             if let Some(rid) = result {
-                let ps: Vec<Vec<u8>> = parameters.iter().map(|p| p.as_bytes().to_vec()).collect();
-                builtin_op_call(BuiltinOp::LambdaNew, &[], &ps, rid, ctx, f)?;
+                emit_closure_new(*body_id, captures, parameters, rid, ctx, f)?;
             }
         }
         MirOpKind::Econ { .. } => {
@@ -2107,16 +2211,140 @@ fn find_binding_value(body: &MirBody, name: &str) -> Option<MirValueId> {
     Some(version.value)
 }
 
+fn emit_closure_new(
+    body_id: MirBodyId,
+    captures: &[MirValueId],
+    parameters: &[String],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let (table_index, capture_count) = ctx
+        .lambda_table
+        .get(&body_id)
+        .copied()
+        .ok_or_else(|| format!("lambda body_id {} not found in lambda_table", body_id.0))?;
+    let explicit_params = parameters.len();
+    let _type_index = ctx
+        .lambda_types
+        .get(&explicit_params)
+        .copied()
+        .ok_or_else(|| format!("no closure type for {} explicit params", explicit_params))?;
+    let size = 8u32 + capture_count as u32 * 16;
+    emit_heap_alloc_const(size, result, ctx, f);
+    i32(f, table_index as i32);
+    i32_store_at(f, ctx, result, 0);
+    i32(f, capture_count as i32);
+    i32_store_at(f, ctx, result, 4);
+    for (i, cap) in captures.iter().enumerate().take(capture_count) {
+        let offset = 8u32 + i as u32 * 16;
+        local_get(f, ctx.tag_local(*cap));
+        i32_store_at(f, ctx, result, offset);
+        local_get(f, ctx.data_local(*cap));
+        i64_store_at(f, ctx, result, offset + 8);
+    }
+    i32(f, TAG_CLOSURE);
+    local_set(f, ctx.tag_local(result));
+    Ok(())
+}
+
 fn emit_dynamic_call(
     callee_value: MirValueId,
     args: &[MirValueId],
     result: MirValueId,
     ctx: &mut Ctx,
     f: &mut Function,
+    _body: &MirBody,
 ) -> Result<(), String> {
-    let mut all_args = vec![callee_value];
-    all_args.extend_from_slice(args);
-    emit_host_call("__dyn", &all_args, result, ctx, f)
+    let closure_data = ctx.data_local(callee_value);
+
+    i32(f, TAG_CLOSURE);
+    local_get(f, ctx.tag_local(callee_value));
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+
+    local_get(f, closure_data);
+
+    for arg in args {
+        local_get(f, ctx.tag_local(*arg));
+        local_get(f, ctx.data_local(*arg));
+    }
+
+    let explicit_params = args.len();
+    let type_index = ctx
+        .lambda_types
+        .get(&explicit_params)
+        .copied()
+        .unwrap_or_else(|| {
+            *ctx.lambda_types.values().next().unwrap_or(&0)
+        });
+
+    local_get(f, closure_data);
+    f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+
+    f.instruction(&Instruction::CallIndirect { type_index, table_index: 0 });
+
+    f.instruction(&Instruction::LocalSet(ctx.data_local(result)));
+    f.instruction(&Instruction::LocalSet(ctx.tag_local(result)));
+    Ok(())
+}
+
+fn i32_store_at(
+    f: &mut Function,
+    ctx: &Ctx,
+    value: MirValueId,
+    offset: u32,
+) {
+    local_get(f, ctx.data_local(value));
+    i32(f, offset as i32);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
+}
+
+fn i64_store_at(
+    f: &mut Function,
+    ctx: &Ctx,
+    value: MirValueId,
+    offset: u32,
+) {
+    local_get(f, ctx.data_local(value));
+    i32(f, offset as i32);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+}
+
+fn emit_lambda_capture_prologue(
+    body: &MirBody,
+    ctx: &Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let mut captures: Vec<(MirValueId, u32)> = Vec::new();
+    for version in &body.versions {
+        if version.source == MirVersionSource::Capture {
+            captures.push((version.value, captures.len() as u32));
+        }
+    }
+    if captures.is_empty() {
+        return Ok(());
+    }
+
+    for (value_id, idx) in &captures {
+        let offset = 8u32 + idx * 16;
+        i32(f, offset as i32);
+        f.instruction(&Instruction::LocalGet(ctx.closure_local()));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::LocalSet(ctx.tag_local(*value_id)));
+
+        i32(f, offset as i32 + 8);
+        f.instruction(&Instruction::LocalGet(ctx.closure_local()));
+        f.instruction(&Instruction::I32Add);
+        f.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        f.instruction(&Instruction::LocalSet(ctx.data_local(*value_id)));
+    }
+    Ok(())
 }
 
 fn i32(f: &mut Function, v: i32) {

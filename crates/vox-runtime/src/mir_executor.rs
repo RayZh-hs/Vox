@@ -276,7 +276,7 @@ impl<'a> MirExecutor<'a> {
                 let _ = purity;
                 Some(self.eval_call(callee, &op.args)?)
             }
-            MirOpKind::Lambda { parameters } => Some(self.materialize_lambda(parameters)),
+            MirOpKind::Lambda { parameters, .. } => Some(self.materialize_lambda(parameters)),
             MirOpKind::Econ { .. } => Some(self.materialize_econ(self.single_arg(op)?)),
             MirOpKind::NonNull => {
                 let value = self.single_arg(op)?;

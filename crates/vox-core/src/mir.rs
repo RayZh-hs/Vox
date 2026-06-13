@@ -411,7 +411,11 @@ pub enum MirOpKind {
     Index,
     Updated { path: Vec<MirPathSegment> },
     Call { callee: String, purity: Purity },
-    Lambda { parameters: Vec<String> },
+    Lambda {
+        parameters: Vec<String>,
+        captures: Vec<MirValueId>,
+        body_id: MirBodyId,
+    },
     Econ { ty: String },
     NonNull,
     SafeProject(String),
@@ -467,7 +471,21 @@ impl MirOpKind {
                     Purity::Evil => "evil",
                 }
             ),
-            Self::Lambda { parameters } => write!(out, "lambda ({})", parameters.join(",")),
+            Self::Lambda {
+                parameters,
+                captures,
+                body_id,
+            } => write!(
+                out,
+                "lambda ({}) captures=[{}] body=@{}",
+                parameters.join(","),
+                captures
+                    .iter()
+                    .map(|v| format!("%{}", v.0))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                body_id.0
+            ),
             Self::Econ { ty } => write!(out, "econ {ty}"),
             Self::NonNull => {
                 out.push_str("non_null");
