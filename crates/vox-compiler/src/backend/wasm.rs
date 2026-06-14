@@ -10,7 +10,7 @@ use vox_core::{
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyId, MirBodyKind, MirModule, MirOpKind,
         MirPathSegment, MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId,
-        MirVersionSource, MirVersionId,
+        MirVersionId, MirVersionSource,
     },
     plan::WasmArtifact,
     types::VoxType,
@@ -238,11 +238,7 @@ impl Ctx {
 
     fn parameter_local_count(&self) -> u32 {
         let base = self.parameter_index.len() as u32 * 2;
-        if self.is_lambda_body {
-            base + 2
-        } else {
-            base
-        }
+        if self.is_lambda_body { base + 2 } else { base }
     }
 
     fn closure_local(&self) -> u32 {
@@ -469,7 +465,8 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             if let Some(item) = module.bodies.iter().find(|b| b.name == body.name) {
-                ctx.lambda_table.insert(item.id, (table_index, capture_count));
+                ctx.lambda_table
+                    .insert(item.id, (table_index, capture_count));
             }
             table_index += 1;
         }
@@ -580,7 +577,10 @@ fn wasm_body_lookup<'a>(
 ) -> BTreeMap<String, &'a MirBody> {
     let mut lookup = BTreeMap::new();
     for body in bodies {
-        if matches!(body.kind, MirBodyKind::Function | MirBodyKind::ValueInitializer) {
+        if matches!(
+            body.kind,
+            MirBodyKind::Function | MirBodyKind::ValueInitializer
+        ) {
             lookup.insert(body.name.clone(), *body);
             lookup.insert(format!("{}.{}", module.module.as_str(), body.name), *body);
         }
@@ -2277,49 +2277,48 @@ fn emit_dynamic_call(
         .lambda_types
         .get(&explicit_params)
         .copied()
-        .unwrap_or_else(|| {
-            *ctx.lambda_types.values().next().unwrap_or(&0)
-        });
+        .unwrap_or_else(|| *ctx.lambda_types.values().next().unwrap_or(&0));
 
     local_get(f, closure_data);
-    f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
 
-    f.instruction(&Instruction::CallIndirect { type_index, table_index: 0 });
+    f.instruction(&Instruction::CallIndirect {
+        type_index,
+        table_index: 0,
+    });
 
     f.instruction(&Instruction::LocalSet(ctx.data_local(result)));
     f.instruction(&Instruction::LocalSet(ctx.tag_local(result)));
     Ok(())
 }
 
-fn i32_store_at(
-    f: &mut Function,
-    ctx: &Ctx,
-    value: MirValueId,
-    offset: u32,
-) {
+fn i32_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
     local_get(f, ctx.data_local(value));
     i32(f, offset as i32);
     f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Store(MemArg { offset: 0, align: 2, memory_index: 0 }));
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
 }
 
-fn i64_store_at(
-    f: &mut Function,
-    ctx: &Ctx,
-    value: MirValueId,
-    offset: u32,
-) {
+fn i64_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
     local_get(f, ctx.data_local(value));
     i32(f, offset as i32);
     f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I64Store(MemArg { offset: 0, align: 3, memory_index: 0 }));
+    f.instruction(&Instruction::I64Store(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
 }
 
-fn emit_lambda_capture_prologue(
-    body: &MirBody,
-    ctx: &Ctx,
-    f: &mut Function,
-) -> Result<(), String> {
+fn emit_lambda_capture_prologue(body: &MirBody, ctx: &Ctx, f: &mut Function) -> Result<(), String> {
     let mut captures: Vec<(MirValueId, u32)> = Vec::new();
     for version in &body.versions {
         if version.source == MirVersionSource::Capture {
@@ -2335,13 +2334,21 @@ fn emit_lambda_capture_prologue(
         i32(f, offset as i32);
         f.instruction(&Instruction::LocalGet(ctx.closure_local()));
         f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I32Load(MemArg { offset: 0, align: 2, memory_index: 0 }));
+        f.instruction(&Instruction::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalSet(ctx.tag_local(*value_id)));
 
         i32(f, offset as i32 + 8);
         f.instruction(&Instruction::LocalGet(ctx.closure_local()));
         f.instruction(&Instruction::I32Add);
-        f.instruction(&Instruction::I64Load(MemArg { offset: 0, align: 3, memory_index: 0 }));
+        f.instruction(&Instruction::I64Load(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
         f.instruction(&Instruction::LocalSet(ctx.data_local(*value_id)));
     }
     Ok(())

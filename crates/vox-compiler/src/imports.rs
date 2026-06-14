@@ -10,10 +10,7 @@ pub struct ImportResolution {
     pub module_aliases: BTreeMap<String, String>,
 }
 
-pub fn resolve_imports(
-    imports: &[ImportDecl],
-    host: &HostRegistry,
-) -> ImportResolution {
+pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportResolution {
     let mut module_aliases = BTreeMap::new();
     let mut unqualified_sources: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut explicit: BTreeMap<String, String> = BTreeMap::new();
@@ -25,12 +22,10 @@ pub fn resolve_imports(
             module_aliases.insert(alias.clone(), module_str.clone());
         }
 
-        let manifest = host
-            .package(
-                &vox_core::source::ModulePath::parse(&module_str).unwrap_or_else(|_| {
-                    vox_core::source::ModulePath::parse("unknown").unwrap()
-                }),
-            );
+        let manifest = host.package(
+            &vox_core::source::ModulePath::parse(&module_str)
+                .unwrap_or_else(|_| vox_core::source::ModulePath::parse("unknown").unwrap()),
+        );
 
         match &import.items {
             None => {

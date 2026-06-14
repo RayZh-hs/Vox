@@ -9,5 +9,7 @@ mod treewalk;
 pub use frontend::{FrontendUnit, SurfaceParameter};
 pub use imports::ImportResolution;
 pub use mir::{MirPassFn, MirPassReport};
-pub use pipeline::{CompileRequest, CompileResult, Compiler, compile_to_voxlib};
+pub use pipeline::{
+    CompileRequest, CompileResult, Compiler, compile_to_voxlib, package_manifest_from_frontend,
+};
 pub use treewalk::TreewalkScript;

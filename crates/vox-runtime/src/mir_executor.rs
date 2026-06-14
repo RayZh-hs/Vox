@@ -69,8 +69,18 @@ impl<'a> MirExecutor<'a> {
         arguments: &[RuntimeValue],
         parameter_specs: Option<&[ParameterSpec]>,
     ) -> Result<InlineValue, String> {
-        let mv = body.values.iter().map(|v| v.id.0 as usize).max().unwrap_or(0);
-        let mp = body.parameters.iter().map(|p| p.0 as usize).max().unwrap_or(0);
+        let mv = body
+            .values
+            .iter()
+            .map(|v| v.id.0 as usize)
+            .max()
+            .unwrap_or(0);
+        let mp = body
+            .parameters
+            .iter()
+            .map(|p| p.0 as usize)
+            .max()
+            .unwrap_or(0);
         self.max_value_id = mv.max(mp);
         self.max_version_id = body
             .versions
@@ -85,7 +95,8 @@ impl<'a> MirExecutor<'a> {
 
         for binding in &body.bindings {
             if let Some(first_version) = binding.versions.first() {
-                if let Some(binding_version) = body.versions.iter().find(|v| v.id == *first_version) {
+                if let Some(binding_version) = body.versions.iter().find(|v| v.id == *first_version)
+                {
                     let identity_value = binding_version.value;
                     for &version_id in &binding.versions {
                         let idx = version_id.0 as usize;
@@ -224,7 +235,11 @@ impl<'a> MirExecutor<'a> {
                     .ok_or_else(|| "bind op missing source value".to_owned())
                     .and_then(|value| self.value(value))?;
                 let vidx = version.0 as usize;
-                let bv = self.version_to_binding.get(vidx).copied().unwrap_or(UNINIT_VALUE);
+                let bv = self
+                    .version_to_binding
+                    .get(vidx)
+                    .copied()
+                    .unwrap_or(UNINIT_VALUE);
                 if bv != UNINIT_VALUE {
                     let bidx = bv.0 as usize;
                     if bidx < self.values.len() && vidx < self.versions.len() {
@@ -334,11 +349,7 @@ impl<'a> MirExecutor<'a> {
         Ok(())
     }
 
-    fn eval_call(
-        &mut self,
-        callee: &str,
-        args: &[MirValueId],
-    ) -> Result<InlineValue, String> {
+    fn eval_call(&mut self, callee: &str, args: &[MirValueId]) -> Result<InlineValue, String> {
         let runtime_args = args
             .iter()
             .map(|arg| self.value(*arg))
@@ -388,7 +399,11 @@ impl<'a> MirExecutor<'a> {
         Err(format!("MIR call target `{callee}` is not executable yet"))
     }
 
-    fn eval_iterator(&mut self, result: MirValueId, args: &[MirValueId]) -> Result<InlineValue, String> {
+    fn eval_iterator(
+        &mut self,
+        result: MirValueId,
+        args: &[MirValueId],
+    ) -> Result<InlineValue, String> {
         let [iterable] = args else {
             return Err("iterator expects one argument".to_owned());
         };
@@ -483,7 +498,10 @@ impl<'a> MirExecutor<'a> {
                 return Ok(v);
             }
         }
-        Err(format!("MIR op `{}` value not defined", op_kind_label(&op.kind)))
+        Err(format!(
+            "MIR op `{}` value not defined",
+            op_kind_label(&op.kind)
+        ))
     }
 
     fn two_args(&self, op: &MirOp) -> Result<(InlineValue, InlineValue), String> {
@@ -512,7 +530,10 @@ impl<'a> MirExecutor<'a> {
                 return Ok((l, r));
             }
         }
-        Err(format!("MIR op `{}` value not defined", op_kind_label(&op.kind)))
+        Err(format!(
+            "MIR op `{}` value not defined",
+            op_kind_label(&op.kind)
+        ))
     }
 
     #[inline(always)]
@@ -527,10 +548,13 @@ impl<'a> MirExecutor<'a> {
             .bodies
             .iter()
             .find_map(|body| {
-                body.values.iter().find(|value| value.id == id).and_then(|value| match &value.definition {
-                    MirValueDefinition::Unit => Some(InlineValue::Tuple(Vec::new())),
-                    _ => None,
-                })
+                body.values
+                    .iter()
+                    .find(|value| value.id == id)
+                    .and_then(|value| match &value.definition {
+                        MirValueDefinition::Unit => Some(InlineValue::Tuple(Vec::new())),
+                        _ => None,
+                    })
             })
             .ok_or_else(|| format!("MIR value %{} is not defined", id.0))
     }
@@ -593,23 +617,25 @@ fn eval_unary_ref(name: &str, value: &InlineValue) -> Result<InlineValue, String
         ("negate", InlineValue::Int(v)) => Ok(InlineValue::Int(-v)),
         ("negate", InlineValue::Float(v)) => Ok(InlineValue::Float(-v)),
         ("not", InlineValue::Bool(v)) => Ok(InlineValue::Bool(!v)),
-        ("negate", other) => Err(format!(
-            "unary `-` is not defined for {}",
-            type_name(other)
-        )),
-        ("not", other) => Err(format!(
-            "unary `!` is not defined for {}",
-            type_name(other)
-        )),
+        ("negate", other) => Err(format!("unary `-` is not defined for {}", type_name(other))),
+        ("not", other) => Err(format!("unary `!` is not defined for {}", type_name(other))),
         (name, _) => Err(format!("unsupported unary MIR op `{name}`")),
     }
 }
 
-fn eval_binary_ref(name: &str, left: &InlineValue, right: &InlineValue) -> Result<InlineValue, String> {
+fn eval_binary_ref(
+    name: &str,
+    left: &InlineValue,
+    right: &InlineValue,
+) -> Result<InlineValue, String> {
     eval_binary_impl(name, left, right)
 }
 
-fn eval_binary_impl(name: &str, left: &InlineValue, right: &InlineValue) -> Result<InlineValue, String> {
+fn eval_binary_impl(
+    name: &str,
+    left: &InlineValue,
+    right: &InlineValue,
+) -> Result<InlineValue, String> {
     match (name, left, right) {
         ("add", InlineValue::Int(left), InlineValue::Int(right)) => {
             Ok(InlineValue::Int(*left + *right))
@@ -859,49 +885,48 @@ fn expect_bool(value: InlineValue, label: &str) -> Result<bool, String> {
 }
 
 fn matches_type_name(executor: &MirExecutor<'_>, value: &InlineValue, ty: &str) -> bool {
-        match (ty, value) {
-            ("Int", InlineValue::Int(_))
-            | ("Float", InlineValue::Float(_))
-            | ("Bool", InlineValue::Bool(_))
-            | ("String", InlineValue::String(_))
-            | ("Null", InlineValue::Null) => return true,
-            ("Unit", InlineValue::Tuple(items)) => return items.is_empty(),
-            _ => {}
-        }
+    match (ty, value) {
+        ("Int", InlineValue::Int(_))
+        | ("Float", InlineValue::Float(_))
+        | ("Bool", InlineValue::Bool(_))
+        | ("String", InlineValue::String(_))
+        | ("Null", InlineValue::Null) => return true,
+        ("Unit", InlineValue::Tuple(items)) => return items.is_empty(),
+        _ => {}
+    }
 
-        let InlineValue::Handle(handle_id) = value else {
-            return false;
-        };
+    let InlineValue::Handle(handle_id) = value else {
+        return false;
+    };
 
-        let Some(summary) = executor.runtime.describe_handle(*handle_id) else {
-            return false;
-        };
-        let handle_type = &summary.type_name;
+    let Some(summary) = executor.runtime.describe_handle(*handle_id) else {
+        return false;
+    };
+    let handle_type = &summary.type_name;
 
-        if handle_type == ty
-            || handle_type.ends_with(&format!(".{}", ty))
-            || ty.ends_with(&format!(".{}", handle_type))
-        {
-            return true;
-        }
+    if handle_type == ty
+        || handle_type.ends_with(&format!(".{}", ty))
+        || ty.ends_with(&format!(".{}", handle_type))
+    {
+        return true;
+    }
 
-        for manifest in executor.runtime.host.packages() {
-            for (trait_qt, impl_types) in &manifest.trait_impls {
-                let full_trait_name = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
-                if full_trait_name == ty || trait_qt.name == ty {
-                    for impl_qt in impl_types {
-                        let full_impl_name =
-                            format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
-                        if *handle_type == full_impl_name || *handle_type == impl_qt.name {
-                            return true;
-                        }
+    for manifest in executor.runtime.host.packages() {
+        for (trait_qt, impl_types) in &manifest.trait_impls {
+            let full_trait_name = format!("{}.{}", trait_qt.module.as_str(), trait_qt.name);
+            if full_trait_name == ty || trait_qt.name == ty {
+                for impl_qt in impl_types {
+                    let full_impl_name = format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                    if *handle_type == full_impl_name || *handle_type == impl_qt.name {
+                        return true;
                     }
                 }
             }
         }
-
-        false
     }
+
+    false
+}
 
 fn split_qualified_host_name(callee: &str) -> Option<(ModulePath, String)> {
     let (package, function) = callee.rsplit_once('.')?;
@@ -957,7 +982,11 @@ fn expand_range_ref(
     end: &InlineValue,
     inclusive: bool,
 ) -> Result<InlineValue, String> {
-    Ok(InlineValue::Tuple(vec![start.clone(), end.clone(), InlineValue::Bool(inclusive)]))
+    Ok(InlineValue::Tuple(vec![
+        start.clone(),
+        end.clone(),
+        InlineValue::Bool(inclusive),
+    ]))
 }
 
 fn expand_iterable(value: &InlineValue) -> Result<Vec<InlineValue>, String> {
@@ -975,9 +1004,9 @@ fn expand_iterable(value: &InlineValue) -> Result<Vec<InlineValue>, String> {
                 Err("range requires Int bounds".to_owned())
             }
         }
-        InlineValue::Handle(_) => Err(
-            "Handle-backed iterables are not supported by the MIR executor yet".to_owned(),
-        ),
+        InlineValue::Handle(_) => {
+            Err("Handle-backed iterables are not supported by the MIR executor yet".to_owned())
+        }
         _ => Err(format!(
             "iteration is not supported for {}",
             type_name(value)

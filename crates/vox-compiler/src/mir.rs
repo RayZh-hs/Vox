@@ -960,13 +960,9 @@ impl BodyBuilder {
         }
 
         match &for_expr.header {
-            ForHeader::In {
-                pattern,
-                iterable,
-            } => {
+            ForHeader::In { pattern, iterable } => {
                 let iterable = self.lower_expr(iterable);
-                let iterator =
-                    self.emit_op(MirOpKind::Iterator, vec![iterable], span.clone());
+                let iterator = self.emit_op(MirOpKind::Iterator, vec![iterable], span.clone());
                 let header = self.new_block("for_header");
                 let body_block = self.new_block("for_body");
                 let exit = self.new_block("for_exit");
@@ -976,8 +972,7 @@ impl BodyBuilder {
                 });
 
                 self.current = header;
-                let item =
-                    self.emit_op(MirOpKind::IteratorNext, vec![iterator], span.clone());
+                let item = self.emit_op(MirOpKind::IteratorNext, vec![iterator], span.clone());
                 let is_null = self.emit_op(
                     MirOpKind::TypeTest("Null".to_owned()),
                     vec![item],
@@ -1215,10 +1210,7 @@ impl BodyBuilder {
         self.emit_unit_with_span(None)
     }
 
-    fn emit_unit_with_span(
-        &mut self,
-        span: Option<vox_core::diagnostics::TextSpan>,
-    ) -> MirValueId {
+    fn emit_unit_with_span(&mut self, span: Option<vox_core::diagnostics::TextSpan>) -> MirValueId {
         let value = self.new_value(
             Some(VoxType::Tuple(Vec::new())),
             MirValueDefinition::Unit,
@@ -1238,9 +1230,7 @@ impl BodyBuilder {
             MirOpKind::Literal(val) => Some(mir_type_from_literal(val)),
             MirOpKind::Binary(name) => Some(mir_type_from_binary_op(name, &args, self)),
             MirOpKind::Unary(name) => Some(mir_type_from_unary_op(name, &args, self)),
-            MirOpKind::Use(_) => {
-                args.first().and_then(|arg| self.value_type(*arg).cloned())
-            }
+            MirOpKind::Use(_) => args.first().and_then(|arg| self.value_type(*arg).cloned()),
             MirOpKind::TypeRefine(ty) => Some(VoxType::opaque_surface(ty.clone())),
             MirOpKind::Unit => Some(VoxType::Tuple(Vec::new())),
             MirOpKind::NonNull => args
@@ -1533,8 +1523,7 @@ impl BodyBuilder {
     }
 
     fn lower_lambda(&mut self, lambda: &LambdaExpr, expr: &Expr) -> MirValueId {
-        let param_names: Vec<String> =
-            lambda.parameters.iter().map(|p| p.name.clone()).collect();
+        let param_names: Vec<String> = lambda.parameters.iter().map(|p| p.name.clone()).collect();
         let param_set: BTreeSet<String> = param_names.iter().cloned().collect();
 
         let mut free_names = BTreeSet::new();
@@ -1641,7 +1630,8 @@ fn collect_free_names_for_lambda(
         }
         ExprKind::ReceiverCall {
             receiver,
-            arguments, ..
+            arguments,
+            ..
         } => {
             collect_free_names_for_lambda(receiver, param_set, names);
             for arg in arguments {
@@ -1726,20 +1716,18 @@ fn collect_free_names_for_lambda(
                 collect_free_names_for_lambda(else_arm, param_set, names);
             }
         }
-        ExprKind::For(for_expr) => {
-            match &for_expr.header {
-                ForHeader::In { pattern, iterable } => {
-                    collect_free_names_for_lambda(iterable, param_set, names);
-                    let mut for_params = param_set.clone();
-                    for_params.insert(pattern.clone());
-                    collect_free_names_for_lambda_block(&for_expr.body, &for_params, names);
-                }
-                ForHeader::Condition(cond) => {
-                    collect_free_names_for_lambda(cond, param_set, names);
-                    collect_free_names_for_lambda_block(&for_expr.body, param_set, names);
-                }
+        ExprKind::For(for_expr) => match &for_expr.header {
+            ForHeader::In { pattern, iterable } => {
+                collect_free_names_for_lambda(iterable, param_set, names);
+                let mut for_params = param_set.clone();
+                for_params.insert(pattern.clone());
+                collect_free_names_for_lambda_block(&for_expr.body, &for_params, names);
             }
-        }
+            ForHeader::Condition(cond) => {
+                collect_free_names_for_lambda(cond, param_set, names);
+                collect_free_names_for_lambda_block(&for_expr.body, param_set, names);
+            }
+        },
         ExprKind::NonNull { target } => {
             collect_free_names_for_lambda(target, param_set, names);
         }
@@ -1790,8 +1778,7 @@ fn collect_free_names_for_lambda_block(
             | BlockItem::BlockStatement(_) => {}
         }
     }
-    let inner_set: BTreeSet<String> =
-        param_set.union(&block_param_names).cloned().collect();
+    let inner_set: BTreeSet<String> = param_set.union(&block_param_names).cloned().collect();
     if let Some(trailing) = &block.trailing {
         collect_free_names_for_lambda(trailing, &inner_set, names);
     }
@@ -2019,7 +2006,9 @@ pub(crate) fn propagate_copies(module: &mut MirModule) -> MirPassReport {
             let before = block.ops.len();
             block.ops.retain(|op| {
                 !(matches!(op.kind, MirOpKind::Use(_))
-                    && op.result.is_some_and(|result| aliases.contains_key(&result)))
+                    && op
+                        .result
+                        .is_some_and(|result| aliases.contains_key(&result)))
             });
             removed += before - block.ops.len();
         }
@@ -2415,9 +2404,7 @@ fn pure_op_name(kind: &MirOpKind) -> Option<String> {
         MirOpKind::Tuple { shape } => Some(format!("tuple:{shape}")),
         MirOpKind::Record { fields } => Some(format!("record:{}", fields.join(","))),
         MirOpKind::List => Some("list".to_owned()),
-        MirOpKind::StringInterpolate { text } => {
-            Some(format!("string_interpolate:{text:?}"))
-        }
+        MirOpKind::StringInterpolate { text } => Some(format!("string_interpolate:{text:?}")),
         MirOpKind::Project(projection) => Some(format!("project:{projection:?}")),
         MirOpKind::Index => Some("index".to_owned()),
         MirOpKind::Updated { path } => Some(format!("updated:{path:?}")),
@@ -2701,9 +2688,7 @@ impl BodyBuilder {
             }
             ExprKind::Field { target, name } => {
                 let prefix = callee_label(target);
-                if let Some(resolved_prefix) =
-                    self.import_resolution.module_aliases.get(&prefix)
-                {
+                if let Some(resolved_prefix) = self.import_resolution.module_aliases.get(&prefix) {
                     return format!("{}.{}", resolved_prefix, name);
                 }
                 format!("{}.{}", prefix, name)
@@ -2742,7 +2727,9 @@ fn mir_type_from_binary_op(name: &str, args: &[MirValueId], body: &BodyBuilder) 
         "less" | "greater" | "less_equal" | "greater_equal" | "equal" | "not_equal" => {
             VoxType::Bool
         }
-        "range" | "range_inclusive" => VoxType::Tuple(vec![VoxType::Int, VoxType::Int, VoxType::Bool]),
+        "range" | "range_inclusive" => {
+            VoxType::Tuple(vec![VoxType::Int, VoxType::Int, VoxType::Bool])
+        }
         _ => {
             if let Some(first) = args.first() {
                 body.value_type(*first).cloned().unwrap_or(VoxType::Int)

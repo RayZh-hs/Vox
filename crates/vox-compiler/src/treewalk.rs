@@ -16,10 +16,13 @@ pub struct TreewalkScript {
 
 impl TreewalkScript {
     pub fn lower(frontend: &FrontendUnit) -> Result<Self, DiagnosticBag> {
-        if !matches!(frontend.header.kind, ModuleKind::Script { .. }) {
+        if !matches!(
+            frontend.header.kind,
+            ModuleKind::Script { .. } | ModuleKind::Package
+        ) {
             return Err(DiagnosticBag::from(vec![
                 vox_core::diagnostics::Diagnostic::error(
-                    "tree-walk execution is only available for scripts",
+                    "tree-walk execution is only available for scripts and packages",
                 ),
             ]));
         }

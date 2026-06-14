@@ -184,7 +184,7 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
     encode_external_library_file(&header).map_err(|error| error.to_string())
 }
 
-fn package_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifest {
+pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifest {
     PackageManifest {
         package: frontend.header.module.clone(),
         reexports: public_reexports(frontend),

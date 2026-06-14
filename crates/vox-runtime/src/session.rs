@@ -6,9 +6,9 @@ use vox_compiler::frontend::{
     ast::{
         Argument, AssignmentStatement, BlockExpr, BlockItem, CompilationUnit,
         CompoundAssignmentStatement, EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader,
-        FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName,
-        RangeExpr, ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg,
-        UpdatedIntrinsic, WhenArm, WhenExpr,
+        FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl, QualifiedName, RangeExpr,
+        ReturnStatement, StringLiteral, StringPart, TopLevelItem, UpdatedArg, UpdatedIntrinsic,
+        WhenArm, WhenExpr,
     },
 };
 use vox_core::{
@@ -1791,10 +1791,7 @@ impl<'a> FunctionCallCollector<'a> {
             }
         }
         match &statement.header {
-            ForHeader::In {
-                pattern,
-                iterable,
-            } => {
+            ForHeader::In { pattern, iterable } => {
                 self.visit_expr(iterable);
                 self.push_scope();
                 self.bind_name(pattern);

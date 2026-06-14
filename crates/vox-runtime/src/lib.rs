@@ -19,7 +19,7 @@ mod session;
 mod wasm_executor;
 
 use thiserror::Error;
-use vox_compiler::{CompileRequest, Compiler};
+use vox_compiler::{CompileRequest, Compiler, package_manifest_from_frontend};
 use vox_core::{
     external_library::{ExternalLibrary, decode_external_library_file},
     host::{HostRegistry, PackageManifest},
@@ -57,6 +57,7 @@ pub struct MountedLibrary {
     pub id: LibraryId,
     pub revision: u64,
     pub manifest: PackageManifest,
+    pub artifact: Option<ArtifactId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +156,7 @@ pub struct Runtime {
     mir_execution_failures: BTreeMap<ArtifactId, String>,
     generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
     libraries: Vec<MountedLibrary>,
+    package_artifacts: BTreeMap<ModulePath, ArtifactId>,
     next_library_id: u64,
     next_library_revision: u64,
     default_xopt: OptimizationLevel,
@@ -180,8 +182,22 @@ impl fmt::Debug for RegisteredHostFunction {
 
 impl Runtime {
     pub fn mount_library(&mut self, manifest: PackageManifest) -> LibraryId {
+        self.mount_library_with_artifact(manifest, None)
+    }
+
+    fn mount_library_with_artifact(
+        &mut self,
+        manifest: PackageManifest,
+        artifact: Option<ArtifactId>,
+    ) -> LibraryId {
         self.host_functions
             .retain(|(package, _), _| package != &manifest.package);
+        if let Some(artifact_id) = artifact {
+            self.package_artifacts
+                .insert(manifest.package.clone(), artifact_id);
+        } else {
+            self.package_artifacts.remove(&manifest.package);
+        }
         self.host.register_package(manifest.clone());
         self.next_library_id += 1;
         self.next_library_revision += 1;
@@ -191,6 +207,7 @@ impl Runtime {
             id,
             revision: self.next_library_revision,
             manifest,
+            artifact,
         });
         id
     }
@@ -199,7 +216,9 @@ impl Runtime {
         &mut self,
         library: ExternalLibrary,
     ) -> Result<LibraryId, String> {
-        library.build().map(|(manifest, _)| self.mount_library(manifest))
+        library
+            .build()
+            .map(|(manifest, _)| self.mount_library(manifest))
     }
 
     pub fn mount_voxlib_file(&mut self, path: &Path) -> Result<LibraryId, String> {
@@ -215,8 +234,7 @@ impl Runtime {
             .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
         let mut ids = Vec::new();
         for entry in entries {
-            let entry = entry
-                .map_err(|error| format!("directory read error: {error}"))?;
+            let entry = entry.map_err(|error| format!("directory read error: {error}"))?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("voxlib") {
                 ids.push(self.mount_voxlib_file(&path)?);
@@ -232,23 +250,35 @@ impl Runtime {
             .to_str()
             .ok_or_else(|| format!("non-UTF8 path: {}", path.display()))?;
         let source = SourceText::new(path_str, 0, text);
-        let voxlib_bytes =
-            vox_compiler::compile_to_voxlib(vox_compiler::CompileRequest {
-                source,
-                optimization: self.default_xopt,
-                optimization_overrides: BTreeMap::new(),
-                host: self.host.clone(),
-            })
-            .map_err(|error| {
-                format!("failed to compile {}: {error}", path.display())
-            })?;
-        let header = decode_external_library_file(&voxlib_bytes).map_err(|error| {
+        let result = self.compiler.compile(CompileRequest {
+            source,
+            optimization: self.default_xopt,
+            optimization_overrides: BTreeMap::new(),
+            host: self.host.clone(),
+        });
+
+        if result.diagnostics.has_errors() {
+            return Err(format!(
+                "failed to compile {}:\n{}",
+                path.display(),
+                result.diagnostics
+            ));
+        }
+
+        let artifact = result
+            .artifact
+            .ok_or_else(|| format!("failed to compile {}: no artifact produced", path.display()))?;
+        let frontend = result.frontend.as_ref().ok_or_else(|| {
             format!(
-                "failed to decode compiled voxlib from {}: {error}",
+                "failed to compile {}: no frontend unit produced",
                 path.display()
             )
         })?;
-        Ok(self.mount_library(header.manifest))
+        let manifest = package_manifest_from_frontend(frontend);
+        let id = artifact.id;
+        self.mir_execution_failures.remove(&id);
+        self.artifacts.insert(artifact, result.treewalk);
+        Ok(self.mount_library_with_artifact(manifest, Some(id)))
     }
 
     pub fn mount_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
@@ -256,8 +286,7 @@ impl Runtime {
             .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
         let mut ids = Vec::new();
         for entry in entries {
-            let entry = entry
-                .map_err(|error| format!("directory read error: {error}"))?;
+            let entry = entry.map_err(|error| format!("directory read error: {error}"))?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -549,10 +578,16 @@ impl Runtime {
             return false;
         };
         let package = self.libraries[index].manifest.package.clone();
+        let artifact = self.libraries[index].artifact;
         let was_active = !self.libraries[index + 1..]
             .iter()
             .any(|library| library.manifest.package == package);
         self.libraries.remove(index);
+        if let Some(artifact_id) = artifact {
+            self.clear_generic_handles(Some(artifact_id));
+            self.mir_execution_failures.remove(&artifact_id);
+            self.artifacts.remove(artifact_id);
+        }
         if was_active {
             self.host_functions
                 .retain(|(function_package, _), _| function_package != &package);
@@ -563,8 +598,14 @@ impl Runtime {
                 .find(|library| library.manifest.package == package)
             {
                 self.host.register_package(replacement.manifest.clone());
+                if let Some(artifact_id) = replacement.artifact {
+                    self.package_artifacts.insert(package.clone(), artifact_id);
+                } else {
+                    self.package_artifacts.remove(&package);
+                }
             } else {
                 self.host.unregister_package(&package);
+                self.package_artifacts.remove(&package);
             }
         }
         self.next_library_revision += 1;
@@ -614,13 +655,8 @@ impl Runtime {
         let expanded_args = if arguments.len() < treewalk.parameters.len()
             && treewalk.parameters.iter().any(|p| p.default.is_some())
         {
-            interpreter::evaluate_parameter_defaults(
-                self,
-                &treewalk,
-                &artifact,
-                arguments,
-            )
-            .map_err(RuntimeError::ExecutionFailed)?
+            interpreter::evaluate_parameter_defaults(self, &treewalk, &artifact, arguments)
+                .map_err(RuntimeError::ExecutionFailed)?
         } else {
             arguments.to_vec()
         };
@@ -727,6 +763,10 @@ impl Runtime {
         self.host.package(package)
     }
 
+    pub(crate) fn package_artifact(&self, package: &ModulePath) -> Option<ArtifactId> {
+        self.package_artifacts.get(package).copied()
+    }
+
     pub(crate) fn invoke_host_function(
         &mut self,
         package: &ModulePath,
@@ -775,6 +815,10 @@ impl Runtime {
         self.artifacts = ArtifactStore::default();
         self.mir_execution_failures.clear();
         self.clear_generic_handles(None);
+        self.package_artifacts.clear();
+        for library in &mut self.libraries {
+            library.artifact = None;
+        }
     }
 
     pub fn materialize_generic_handle(

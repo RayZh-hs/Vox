@@ -571,8 +571,12 @@ impl RuntimeRunner for RemoteRunner {
     }
 
     fn mount_dir(&self, dir: &Path) -> Result<Vec<LibraryId>, RunnerError> {
-        let entries = fs::read_dir(dir)
-            .map_err(|error| RunnerError::Session(format!("failed to read directory {}: {error}", dir.display())))?;
+        let entries = fs::read_dir(dir).map_err(|error| {
+            RunnerError::Session(format!(
+                "failed to read directory {}: {error}",
+                dir.display()
+            ))
+        })?;
         let mut ids = Vec::new();
         for entry in entries {
             let entry = entry
@@ -605,10 +609,7 @@ impl RuntimeRunner for RemoteRunner {
             RunnerError::Session(format!("failed to read {}: {error}", path.display()))
         })?;
         let header = decode_external_library_file(&bytes).map_err(|error| {
-            RunnerError::Session(format!(
-                "invalid .voxlib file {}: {error}",
-                path.display()
-            ))
+            RunnerError::Session(format!("invalid .voxlib file {}: {error}", path.display()))
         })?;
         self.mount_library(header.manifest)
     }

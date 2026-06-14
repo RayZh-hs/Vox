@@ -12,9 +12,9 @@ use crate::frontend::{
         EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader, FrontendUnit, FunctionDecl,
         GenericParameter, IfBranch, IfExpr, ImportDecl, ImportItem, IntrinsicExpr, LambdaExpr,
         LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
-        QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement,
-        StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg,
-        UpdatedIntrinsic, UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
+        QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement, StringLiteral,
+        StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg, UpdatedIntrinsic,
+        UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
     },
     lexer::{LexedStringPart, Lexer, Token, TokenKind},
 };
@@ -77,7 +77,10 @@ impl Parser {
             if matches!(header.kind, ModuleKind::Package) {
                 self.validate_package_items(&syntax)?;
             }
-            return Ok(FrontendUnit::from_syntax_with_docs(syntax, package_docs.clone()));
+            return Ok(FrontendUnit::from_syntax_with_docs(
+                syntax,
+                package_docs.clone(),
+            ));
         }
 
         let end = self.current().span.end;
@@ -90,7 +93,10 @@ impl Parser {
         if matches!(header.kind, ModuleKind::Package) {
             self.validate_package_items(&syntax)?;
         }
-        Ok(FrontendUnit::from_syntax_with_docs(syntax, package_docs.clone()))
+        Ok(FrontendUnit::from_syntax_with_docs(
+            syntax,
+            package_docs.clone(),
+        ))
     }
 
     fn parse_header(&mut self) -> Result<SurfaceHeader, DiagnosticBag> {
@@ -312,7 +318,10 @@ impl Parser {
                     break;
                 }
             }
-            self.expect_simple(TokenKind::RParen, "expected `)` after selective import list")?;
+            self.expect_simple(
+                TokenKind::RParen,
+                "expected `)` after selective import list",
+            )?;
             Some(items)
         } else {
             None
@@ -426,9 +435,7 @@ impl Parser {
         })
     }
 
-    fn parse_local_value_decl_for_header(
-        &mut self,
-    ) -> Result<LocalValueDecl, DiagnosticBag> {
+    fn parse_local_value_decl_for_header(&mut self) -> Result<LocalValueDecl, DiagnosticBag> {
         let start = self.current().span.start;
         let mutability = self.parse_mutability()?;
         let (name, _) = self.expect_identifier("expected binding name")?;
@@ -1520,8 +1527,7 @@ impl Parser {
         if self.consume(TokenKind::In) {
             let pattern = if let ExprKind::Name(ref name) = expr.kind {
                 if name.segments.len() != 1 {
-                    return self
-                        .error_here("expected a single identifier as loop pattern");
+                    return self.error_here("expected a single identifier as loop pattern");
                 }
                 name.segments[0].clone()
             } else {
@@ -1540,7 +1546,10 @@ impl Parser {
         }
     }
 
-    fn try_parse_assignment_for_header(&mut self, name: String) -> Result<BlockItem, DiagnosticBag> {
+    fn try_parse_assignment_for_header(
+        &mut self,
+        name: String,
+    ) -> Result<BlockItem, DiagnosticBag> {
         let start = self.current().span.start;
         match self.current().kind.clone() {
             TokenKind::Identifier(_) => {}
@@ -1572,14 +1581,12 @@ impl Parser {
                     _ => unreachable!(),
                 };
                 let value = self.parse_expr()?;
-                Ok(BlockItem::CompoundAssignment(
-                    CompoundAssignmentStatement {
-                        name,
-                        op,
-                        value,
-                        span: TextSpan::new(start, self.previous().span.end),
-                    },
-                ))
+                Ok(BlockItem::CompoundAssignment(CompoundAssignmentStatement {
+                    name,
+                    op,
+                    value,
+                    span: TextSpan::new(start, self.previous().span.end),
+                }))
             }
             _ => unreachable!(),
         }
@@ -1633,7 +1640,10 @@ impl Parser {
     fn parse_continue_statement(&mut self) -> Result<ContinueStatement, DiagnosticBag> {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::Continue, "expected `continue`")?;
-        self.expect_simple(TokenKind::Semicolon, "expected `;` after continue statement")?;
+        self.expect_simple(
+            TokenKind::Semicolon,
+            "expected `;` after continue statement",
+        )?;
         Ok(ContinueStatement {
             span: TextSpan::new(start, self.previous().span.end),
         })

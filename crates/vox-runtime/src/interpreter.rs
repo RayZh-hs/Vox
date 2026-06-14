@@ -9,14 +9,14 @@ use vox_compiler::{
     TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
-        ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter,
-        Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit,
-        StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp,
-        UpdatedIntrinsic, UpdatedPathSegment, ValueDecl,
+        ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
+        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart,
+        TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
+        ValueDecl,
     },
 };
 use vox_core::{
-    host::FunctionSpec,
+    host::{FunctionSpec, PackageManifest},
     ids::ArtifactId,
     plan::CompiledArtifact,
     source::ModulePath,
@@ -163,8 +163,7 @@ pub(crate) fn evaluate_parameter_defaults(
     if arguments.len() >= treewalk.parameters.len() {
         return Ok(arguments.to_vec());
     }
-    let module =
-        Rc::new(ModuleState::new(treewalk, artifact, artifact.id));
+    let module = Rc::new(ModuleState::new(treewalk, artifact, artifact.id));
     let mut values = BTreeMap::new();
     for (index, parameter) in treewalk.parameters.iter().enumerate() {
         if let Some(argument) = arguments.get(index) {
@@ -182,7 +181,10 @@ pub(crate) fn evaluate_parameter_defaults(
                 if let EvalError::Message(msg) = e {
                     msg
                 } else {
-                    format!("failed to evaluate default for parameter `{}`: {e:?}", parameter.name)
+                    format!(
+                        "failed to evaluate default for parameter `{}`: {e:?}",
+                        parameter.name
+                    )
                 }
             })?;
             values.insert(parameter.name.clone(), value);
@@ -199,6 +201,53 @@ pub(crate) fn evaluate_parameter_defaults(
         result.push(runtime_value_from_value(runtime, value)?);
     }
     Ok(result)
+}
+
+pub(crate) fn evaluate_package_value(
+    runtime: &mut Runtime,
+    package: &ModulePath,
+    name: &str,
+) -> Result<RuntimeValue, String> {
+    let artifact_id = runtime.package_artifact(package).ok_or_else(|| {
+        format!(
+            "package value implementation is not mounted for `{}.{}`",
+            package.as_str(),
+            name
+        )
+    })?;
+    let artifact = runtime
+        .artifacts
+        .get(artifact_id)
+        .cloned()
+        .ok_or_else(|| format!("artifact {artifact_id:?} was not found"))?;
+    let treewalk = runtime
+        .artifacts
+        .treewalk(artifact_id)
+        .cloned()
+        .ok_or_else(|| format!("artifact {artifact_id:?} has no executable package plan"))?;
+
+    let module = Rc::new(ModuleState::new(&treewalk, &artifact, artifact_id));
+    let mut context = EvalContext::new(runtime, module.clone());
+    for function in &treewalk.functions {
+        let captured = context
+            .capture_function_bindings(function)
+            .map_err(eval_error_message)?;
+        module.define_function_capture(function.name.clone(), captured);
+    }
+
+    let value = module
+        .top_level_value(name, &mut context)
+        .map_err(eval_error_message)?;
+    runtime_value_from_value(runtime, value)
+}
+
+fn eval_error_message(error: EvalError) -> String {
+    match error {
+        EvalError::Return(_) => "`return` may only be used inside a function body".to_owned(),
+        EvalError::Break => "`break` may only be used inside a `for` loop".to_owned(),
+        EvalError::Continue => "`continue` may only be used inside a `for` loop".to_owned(),
+        EvalError::Message(message) => message,
+    }
 }
 
 #[derive(Clone)]
@@ -234,7 +283,12 @@ impl ModuleState {
             imports: script.imports.clone(),
             parameters: script.parameters.clone(),
             result: script.syntax.result.clone(),
-            values: BTreeMap::new(),
+            values: script
+                .values
+                .iter()
+                .cloned()
+                .map(|value| (value.name.clone(), value))
+                .collect(),
             functions,
             parameter_values: RefCell::new(BTreeMap::new()),
             script_bindings: RefCell::new(BTreeMap::new()),
@@ -408,16 +462,25 @@ impl ModuleState {
 
         for length in (1..name.segments.len()).rev() {
             let package = name.segments[..length].join(".");
-            let Some(import_decl) = self.find_import_by_path(&package) else {
-                continue;
-            };
-            let module_path = ModulePath::parse(&import_decl.module.to_source_string())
-                .expect("parsed import paths should be valid module paths");
+            let (module_path, import_decl) =
+                if let Some(import_decl) = self.find_import_by_path(&package) {
+                    (
+                        ModulePath::parse(&import_decl.module.to_source_string())
+                            .expect("parsed import paths should be valid module paths"),
+                        Some(import_decl),
+                    )
+                } else if let Some(module_path) =
+                    self.resolve_reexported_package_by_path(runtime, &package)?
+                {
+                    (module_path, None)
+                } else {
+                    continue;
+                };
             let Some(manifest) = runtime.package_manifest(&module_path) else {
                 return Err(format!("package `{package}` is not mounted"));
             };
 
-            if let Some(items) = &import_decl.items {
+            if let Some(items) = import_decl.and_then(|import| import.items.as_ref()) {
                 if name.segments.len() != length + 1 {
                     continue;
                 }
@@ -434,6 +497,58 @@ impl ModuleState {
             let symbol = &name.segments[length];
             if let Some(function) = manifest.functions.iter().find(|item| &item.name == symbol) {
                 return Ok(Some(HostFunction::from_spec(module_path, function)));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_imported_package_value(
+        &self,
+        runtime: &Runtime,
+        name: &QualifiedName,
+    ) -> Result<Option<(ModulePath, String)>, String> {
+        if name.segments.len() == 1 {
+            return self.resolve_unqualified_package_value(runtime, &name.segments[0]);
+        }
+
+        for length in (1..name.segments.len()).rev() {
+            let package = name.segments[..length].join(".");
+            let (module_path, import_decl) =
+                if let Some(import_decl) = self.find_import_by_path(&package) {
+                    (
+                        ModulePath::parse(&import_decl.module.to_source_string())
+                            .expect("parsed import paths should be valid module paths"),
+                        Some(import_decl),
+                    )
+                } else if let Some(module_path) =
+                    self.resolve_reexported_package_by_path(runtime, &package)?
+                {
+                    (module_path, None)
+                } else {
+                    continue;
+                };
+            let Some(manifest) = runtime.package_manifest(&module_path) else {
+                return Err(format!("package `{package}` is not mounted"));
+            };
+
+            if let Some(items) = import_decl.and_then(|import| import.items.as_ref()) {
+                if name.segments.len() != length + 1 {
+                    continue;
+                }
+                let symbol = &name.segments[length];
+                if !items.iter().any(|item| item.name == *symbol) {
+                    continue;
+                }
+            }
+
+            if name.segments.len() != length + 1 {
+                continue;
+            }
+
+            let symbol = &name.segments[length];
+            if manifest.values.iter().any(|item| &item.name == symbol) {
+                return Ok(Some((module_path, symbol.clone())));
             }
         }
 
@@ -476,7 +591,19 @@ impl ModuleState {
                 .find(|f| f.name == symbol)
                 .cloned()
             {
-                candidates.push((module_path, function));
+                candidates.push((module_path.clone(), function));
+            }
+            for (reexport_path, reexport_manifest) in
+                self.reexported_manifests(runtime, &module_path, manifest)?
+            {
+                if let Some(function) = reexport_manifest
+                    .functions
+                    .iter()
+                    .find(|f| f.name == symbol)
+                    .cloned()
+                {
+                    candidates.push((reexport_path, function));
+                }
             }
         }
 
@@ -492,11 +619,102 @@ impl ModuleState {
         }
     }
 
+    fn resolve_unqualified_package_value(
+        &self,
+        runtime: &Runtime,
+        symbol: &str,
+    ) -> Result<Option<(ModulePath, String)>, String> {
+        let mut candidates: Vec<(ModulePath, String)> = Vec::new();
+        for import_decl in &self.imports {
+            let module_path = ModulePath::parse(&import_decl.module.to_source_string())
+                .expect("parsed import paths should be valid module paths");
+            let Some(manifest) = runtime.package_manifest(&module_path) else {
+                continue;
+            };
+
+            if let Some(items) = &import_decl.items {
+                if let Some(item) = items.iter().find(|item| {
+                    let effective = item.alias.as_ref().unwrap_or(&item.name);
+                    effective == symbol
+                }) {
+                    if manifest.values.iter().any(|value| value.name == item.name) {
+                        candidates.push((module_path, item.name.clone()));
+                    }
+                }
+                continue;
+            }
+
+            if manifest.values.iter().any(|value| value.name == symbol) {
+                candidates.push((module_path.clone(), symbol.to_owned()));
+            }
+            for (reexport_path, reexport_manifest) in
+                self.reexported_manifests(runtime, &module_path, manifest)?
+            {
+                if reexport_manifest
+                    .values
+                    .iter()
+                    .any(|value| value.name == symbol)
+                {
+                    candidates.push((reexport_path, symbol.to_owned()));
+                }
+            }
+        }
+
+        match candidates.len() {
+            0 => Ok(None),
+            1 => Ok(Some(candidates.into_iter().next().unwrap())),
+            _ => Err(format!(
+                "ambiguous name `{symbol}` (imported from multiple packages)"
+            )),
+        }
+    }
+
     fn find_import_by_path(&self, path: &str) -> Option<&ImportDecl> {
         self.imports.iter().find(|import| {
             import.module.to_source_string() == path
                 || import.alias.as_ref().is_some_and(|alias| alias == path)
         })
+    }
+
+    fn resolve_reexported_package_by_path(
+        &self,
+        runtime: &Runtime,
+        path: &str,
+    ) -> Result<Option<ModulePath>, String> {
+        let Ok(target) = ModulePath::parse(path) else {
+            return Ok(None);
+        };
+
+        for import_decl in &self.imports {
+            if import_decl.items.is_some() {
+                continue;
+            }
+            let module_path = ModulePath::parse(&import_decl.module.to_source_string())
+                .expect("parsed import paths should be valid module paths");
+            let Some(manifest) = runtime.package_manifest(&module_path) else {
+                return Err(format!("package `{}` is not mounted", module_path.as_str()));
+            };
+            let mut seen = BTreeSet::new();
+            seen.insert(module_path.clone());
+            if reexport_chain_contains(runtime, &module_path, manifest, &target, &mut seen)? {
+                return Ok(Some(target));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn reexported_manifests<'a>(
+        &self,
+        runtime: &'a Runtime,
+        package: &ModulePath,
+        manifest: &'a PackageManifest,
+    ) -> Result<Vec<(ModulePath, &'a PackageManifest)>, String> {
+        let mut packages = Vec::new();
+        let mut seen = BTreeSet::new();
+        seen.insert(package.clone());
+        collect_reexported_manifests(runtime, package, manifest, &mut seen, &mut packages)?;
+        Ok(packages)
     }
 
     fn top_level_value(
@@ -536,6 +754,60 @@ impl ModuleState {
 
         Ok(evaluated)
     }
+}
+
+fn collect_reexported_manifests<'a>(
+    runtime: &'a Runtime,
+    source_package: &ModulePath,
+    manifest: &'a PackageManifest,
+    seen: &mut BTreeSet<ModulePath>,
+    packages: &mut Vec<(ModulePath, &'a PackageManifest)>,
+) -> Result<(), String> {
+    for module in &manifest.reexports {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        let Some(reexport) = runtime.package_manifest(module) else {
+            return Err(format!(
+                "re-exported package `{}` from `{}` is not mounted",
+                module.as_str(),
+                source_package.as_str()
+            ));
+        };
+        packages.push((module.clone(), reexport));
+        collect_reexported_manifests(runtime, module, reexport, seen, packages)?;
+    }
+
+    Ok(())
+}
+
+fn reexport_chain_contains(
+    runtime: &Runtime,
+    source_package: &ModulePath,
+    manifest: &PackageManifest,
+    target: &ModulePath,
+    seen: &mut BTreeSet<ModulePath>,
+) -> Result<bool, String> {
+    for module in &manifest.reexports {
+        if module == target {
+            return Ok(true);
+        }
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        let Some(reexport) = runtime.package_manifest(module) else {
+            return Err(format!(
+                "re-exported package `{}` from `{}` is not mounted",
+                module.as_str(),
+                source_package.as_str()
+            ));
+        };
+        if reexport_chain_contains(runtime, module, reexport, target, seen)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 #[derive(Clone)]
@@ -628,12 +900,8 @@ impl<'a> EvalContext<'a> {
                 "panic: {}",
                 self.eval_string_literal(&statement.message)?
             ))),
-            BlockItem::Break(_) => Err(EvalError::Message(
-                "break outside loop".to_owned(),
-            )),
-            BlockItem::Continue(_) => Err(EvalError::Message(
-                "continue outside loop".to_owned(),
-            )),
+            BlockItem::Break(_) => Err(EvalError::Message("break outside loop".to_owned())),
+            BlockItem::Continue(_) => Err(EvalError::Message("continue outside loop".to_owned())),
             BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(())
@@ -800,7 +1068,9 @@ impl<'a> EvalContext<'a> {
                 return Ok(Value::Function(Rc::new(function)));
             }
 
-            return self.module.clone().top_level_value(&local_name, self);
+            if self.module.values.contains_key(&local_name) {
+                return self.module.clone().top_level_value(&local_name, self);
+            }
         }
 
         if let Some(function) = self
@@ -809,6 +1079,17 @@ impl<'a> EvalContext<'a> {
             .map_err(EvalError::Message)?
         {
             return Ok(Value::Function(Rc::new(FunctionValue::Host(function))));
+        }
+
+        if let Some((package, value_name)) = self
+            .module
+            .resolve_imported_package_value(self.runtime, name)
+            .map_err(EvalError::Message)?
+        {
+            let runtime_value = evaluate_package_value(self.runtime, &package, &value_name)
+                .map_err(EvalError::Message)?;
+            return value_from_runtime_value(self.runtime, &runtime_value)
+                .map_err(EvalError::Message);
         }
 
         Err(EvalError::Message(format!(
@@ -1312,10 +1593,7 @@ impl<'a> EvalContext<'a> {
         }
 
         let result = match &statement.header {
-            ForHeader::In {
-                pattern,
-                iterable,
-            } => {
+            ForHeader::In { pattern, iterable } => {
                 let iterable = self.eval_expr(iterable)?;
                 let items = self.expand_iterable(iterable)?;
                 for item in items {
@@ -1427,9 +1705,7 @@ impl<'a> EvalContext<'a> {
                     _ => self.matches_named_type(value, &ty_name),
                 }
             }
-            TypeKind::Dyn(trait_name) => {
-                self.matches_dyn_trait(value, trait_name)
-            }
+            TypeKind::Dyn(trait_name) => self.matches_dyn_trait(value, trait_name),
             TypeKind::Grouped(inner) => self.matches_type(value, inner),
             TypeKind::Tuple(items) => match value {
                 Value::Tuple(values) => {
@@ -1837,10 +2113,7 @@ impl CaptureNameCollector {
                     }
                 }
                 match &expr.header {
-                    ForHeader::In {
-                        iterable,
-                        pattern,
-                    } => {
+                    ForHeader::In { iterable, pattern } => {
                         self.visit_expr(iterable);
                         self.push_scope();
                         self.bind_name(pattern);
@@ -2519,14 +2792,10 @@ impl Value {
                         format!("<generic function {} {}>", function.name, sig)
                     }
                     FunctionValue::Host(function) => {
-                        format!(
-                            "<host function {} {}>",
-                            function.qualified_name(),
-                            sig
-                        )
+                        format!("<host function {} {}>", function.qualified_name(), sig)
                     }
                 }
-            },
+            }
             Self::Econ(value) => format!("econ({})", value.render()),
         }
     }
@@ -2895,7 +3164,10 @@ fn runtime_type_from_opaque_surface(raw: &str) -> ReplType {
     }
 }
 
-pub(crate) fn value_from_runtime_value(runtime: &Runtime, value: &RuntimeValue) -> Result<Value, String> {
+pub(crate) fn value_from_runtime_value(
+    runtime: &Runtime,
+    value: &RuntimeValue,
+) -> Result<Value, String> {
     match value {
         RuntimeValue::Inline(value) => value_from_inline_value(runtime, value),
         RuntimeValue::Handle(handle) => {
@@ -2964,7 +3236,10 @@ fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
     }
 }
 
-pub(crate) fn runtime_value_from_value(runtime: &mut Runtime, value: Value) -> Result<RuntimeValue, String> {
+pub(crate) fn runtime_value_from_value(
+    runtime: &mut Runtime,
+    value: Value,
+) -> Result<RuntimeValue, String> {
     if let Value::Handle(handle, _) = &value {
         return Ok(RuntimeValue::Handle(*handle));
     }

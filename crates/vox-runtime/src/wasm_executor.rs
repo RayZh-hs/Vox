@@ -313,9 +313,7 @@ fn handle_dynamic_call(
     let callable = match &callee_value {
         Value::Function(function) => function.clone(),
         _ => {
-            return Err(
-                "dynamic call target is not a function value".to_owned(),
-            );
+            return Err("dynamic call target is not a function value".to_owned());
         }
     };
     let mut arguments: Vec<CallArgument> = Vec::with_capacity(call_args.len());
