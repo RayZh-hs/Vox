@@ -42,6 +42,10 @@ A script header may be either:
 
 An `evil script` marks the script entrypoint as effectful.
 
+Scripts that omit the header are anonymous pure scripts. They are executable
+directly, but they cannot be imported or compiled as libraries. Use a named
+`evil script` header when the script entrypoint itself must be effectful.
+
 ## 4. `econ`
 
 `econ` is a built-in intrinsic that creates a pure handle to a cached snapshot

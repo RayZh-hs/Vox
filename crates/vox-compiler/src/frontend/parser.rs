@@ -36,9 +36,18 @@ impl Parser {
     }
 
     pub fn parse_unit(&mut self) -> Result<FrontendUnit, DiagnosticBag> {
-        let package_docs = self.take_doc_comments();
-        let header = self.parse_header()?;
-        self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")?;
+        let package_docs = if self.starts_file_header_after_doc_comments() {
+            self.take_doc_comments()
+        } else {
+            Vec::new()
+        };
+        let header = if self.starts_file_header() {
+            let header = self.parse_header()?;
+            self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")?;
+            header
+        } else {
+            self.anonymous_script_header()
+        };
 
         let mut items = Vec::new();
         loop {
@@ -100,25 +109,30 @@ impl Parser {
     }
 
     pub fn parse_unit_lossy(&mut self) -> (Option<FrontendUnit>, DiagnosticBag) {
-        let package_docs = self.take_doc_comments();
+        let package_docs = if self.starts_file_header_after_doc_comments() {
+            self.take_doc_comments()
+        } else {
+            Vec::new()
+        };
         let mut diagnostics = DiagnosticBag::default();
         let mut synthesized_header = false;
-        let header = match self.parse_header() {
-            Ok(header) => header,
-            Err(error) => {
-                diagnostics.extend(error.into_vec());
-                self.recover_top_level_from(0);
-                synthesized_header = true;
-                SurfaceHeader {
-                    kind: ModuleKind::Script { evil: false },
-                    module: ModulePath::parse("lsp.scratch")
-                        .expect("synthetic LSP module path should be valid"),
-                    span: TextSpan::new(0, 0),
+        let has_explicit_header = self.starts_file_header();
+        let header = if has_explicit_header {
+            match self.parse_header() {
+                Ok(header) => header,
+                Err(error) => {
+                    diagnostics.extend(error.into_vec());
+                    self.recover_top_level_from(0);
+                    synthesized_header = true;
+                    self.anonymous_script_header()
                 }
             }
+        } else {
+            self.anonymous_script_header()
         };
 
-        if !synthesized_header
+        if has_explicit_header
+            && !synthesized_header
             && let Err(error) =
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")
         {
@@ -231,8 +245,45 @@ impl Parser {
         Ok(SurfaceHeader {
             kind,
             module,
+            anonymous: false,
             span: TextSpan::new(start, end),
         })
+    }
+
+    fn anonymous_script_header(&self) -> SurfaceHeader {
+        let start = self.current().span.start;
+        SurfaceHeader {
+            kind: ModuleKind::Script { evil: false },
+            module: ModulePath::anonymous_script(),
+            anonymous: true,
+            span: TextSpan::new(start, start),
+        }
+    }
+
+    fn starts_file_header_after_doc_comments(&self) -> bool {
+        let mut index = self.index;
+        while matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::DocComment(_))
+        ) {
+            index += 1;
+        }
+        self.starts_file_header_at(index)
+    }
+
+    fn starts_file_header(&self) -> bool {
+        self.starts_file_header_at(self.index)
+    }
+
+    fn starts_file_header_at(&self, index: usize) -> bool {
+        match self.tokens.get(index).map(|token| &token.kind) {
+            Some(TokenKind::Package | TokenKind::Script) => true,
+            Some(TokenKind::Evil) => matches!(
+                self.tokens.get(index + 1).map(|token| &token.kind),
+                Some(TokenKind::Script)
+            ),
+            _ => false,
+        }
     }
 
     fn parse_top_level_item(

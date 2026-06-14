@@ -7,9 +7,12 @@ This chapter defines the file-level structure of Vox source code.
 A Vox source file is exactly one of:
 
 - a package file;
-- a script file.
+- a named script file;
+- an anonymous script file.
 
-The first line of the file is the file header.
+Package files and named script files start with a file header. Anonymous script
+files omit the header and begin directly with script top-level items or a
+script result expression.
 
 ## 2. Module Paths
 
@@ -55,11 +58,19 @@ Package rules:
 
 ## 4. Script Files
 
-A script file declares an executable entrypoint.
+A script file declares an executable entrypoint. A named script carries an
+explicit module path. An anonymous script has no source-level module path.
 
 ```ebnf
 ScriptUnit
+  ::= NamedScriptUnit
+   |  AnonymousScriptUnit
+
+NamedScriptUnit
   ::= ScriptHeader ";" ScriptTopLevelItem* ScriptResult?
+
+AnonymousScriptUnit
+  ::= ScriptTopLevelItem* ScriptResult?
 
 ScriptHeader
   ::= "script" ModulePath
@@ -75,6 +86,10 @@ Script rules:
 - a script may end with one top-level trailing expression;
 - the trailing expression, when present, is the script result;
 - declarations inside a script are script-local and are not importable;
+- anonymous scripts cannot be imported or compiled as libraries; they can only
+  be executed directly;
+- anonymous scripts are pure scripts. Use `evil script ModulePath;` when the
+  script entrypoint itself must be marked effectful;
 - script values and statements are processed in source order;
 - script value initializers and statements may reference only values already
   introduced earlier in the script;

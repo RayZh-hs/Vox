@@ -9,15 +9,20 @@ semantic rules.
 
 ## What A File Can Be
 
-Every Vox file starts with one header:
+Reusable Vox files start with a package header:
 
 - `package demo.math;` for reusable code
-- `script demo.main;` for an executable entrypoint
-- `evil script demo.main;` for an executable entrypoint that may perform side effects
 
-Packages may be imported by other Vox files. Scripts may declare `param`
-inputs and may end with one trailing expression that becomes the script result.
-Declarations inside scripts are local to that script.
+Executable scripts may either start with a header or omit it:
+
+- `script demo.main;` for a named executable entrypoint
+- `evil script demo.main;` for a named executable entrypoint that may perform side effects
+- no header for an anonymous executable script
+
+Packages may be imported by other Vox files. Scripts may declare `param` inputs
+and may end with one trailing expression that becomes the script result.
+Declarations inside scripts are local to that script. Anonymous scripts cannot
+be imported or compiled as libraries; they can only be executed directly.
 
 ## Basic Declarations
 
@@ -143,11 +148,23 @@ incomplete.
 ## Scripts
 
 Scripts use the same declaration syntax as packages, plus `param` inputs and an
-optional trailing result expression.
+optional trailing result expression. The `script ...;` header is optional for a
+pure script that is meant to be executed directly.
 
 ```vox
 script demo.main;
 
+param value: Float;
+param factor: Float = 2.0;
+
+fun scale(x: Float): Float = x * factor;
+
+scale(value)
+```
+
+The same script can be written anonymously:
+
+```vox
 param value: Float;
 param factor: Float = 2.0;
 
@@ -215,8 +232,8 @@ Doc comments come in two forms:
   documentation for the function. A `///` on the same line as a value
   declaration (after the `;`) is a body docstring for that value.
 
-A `package` or `script` header may also be preceded by `///` lines to document
-the module:
+A `package` or named `script` header may also be preceded by `///` lines to
+document the module:
 
 ```vox
 /// Geometry utilities for 2D and 3D coordinate transforms.
@@ -224,5 +241,5 @@ package geo.transform;
 ```
 
 **Important**: Every `///` comment must annotate either a `val`/`var`, `fun`,
-`import`, `param`, or the `package`/`script` header. The language server will
-raise a warning if a doc comment is not attached to any declaration.
+`import`, `param`, or a `package`/named `script` header. The language server
+will raise a warning if a doc comment is not attached to any declaration.

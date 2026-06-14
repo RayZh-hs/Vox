@@ -42,6 +42,12 @@ impl ModulePath {
     pub fn segments(&self) -> &[String] {
         &self.segments
     }
+
+    pub fn anonymous_script() -> Self {
+        Self {
+            segments: vec!["__anonymous".to_owned(), "script".to_owned()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +78,7 @@ impl SourceText {
 pub struct SurfaceHeader {
     pub kind: ModuleKind,
     pub module: ModulePath,
+    pub anonymous: bool,
     pub span: TextSpan,
 }
 

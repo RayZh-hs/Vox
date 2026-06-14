@@ -34,6 +34,9 @@ When the server receives a document:
 
 1. Runs the Vox lexer and parser on the source text.
 2. Converts any parse errors into editor diagnostics with source positions.
+3. Treats files without a `package`, `script`, or `evil script` header as
+   anonymous executable scripts, so the editor does not report a missing-header
+   error for directly executable script files.
 
 ### Planned
 

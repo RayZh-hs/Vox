@@ -827,7 +827,7 @@ fn is_valid_doc_comment(
                 }
             }
         }
-        if pos == 0 {
+        if pos == 0 && !unit.header.anonymous {
             return true;
         }
     }

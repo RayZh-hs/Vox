@@ -265,7 +265,8 @@ impl Runtime {
                 path.display()
             )
         })?;
-        let manifest = package_manifest_from_frontend(frontend);
+        let manifest = package_manifest_from_frontend(frontend)
+            .map_err(|error| format!("failed to mount {}: {error}", path.display()))?;
         let id = artifact.id;
         self.mir_execution_failures.remove(&id);
         self.artifacts.insert(artifact, result.treewalk);

@@ -13,7 +13,7 @@ use vox_core::{
     ids::ArtifactId,
     opt::{OptimizationLevel, OptimizationSubject},
     plan::{CompiledArtifact, DependencyFingerprint, ExecutablePlan},
-    source::{ModulePath, SourceText},
+    source::{ModuleKind, ModulePath, SourceText},
     types::VoxType,
 };
 
@@ -175,7 +175,7 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
         .frontend
         .as_ref()
         .expect("successful compilation should produce a frontend unit");
-    let manifest = package_manifest_from_frontend(frontend);
+    let manifest = package_manifest_from_frontend(frontend)?;
     let header = ExternalLibraryHeader {
         manifest,
         wasm_bytes,
@@ -184,8 +184,16 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
     encode_external_library_file(&header).map_err(|error| error.to_string())
 }
 
-pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifest {
-    PackageManifest {
+pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> Result<PackageManifest, String> {
+    if !matches!(frontend.header.kind, ModuleKind::Package) {
+        return Err(if frontend.header.anonymous {
+            "anonymous scripts cannot be compiled as importable libraries".to_owned()
+        } else {
+            "script files cannot be compiled as importable libraries".to_owned()
+        });
+    }
+
+    Ok(PackageManifest {
         package: frontend.header.module.clone(),
         reexports: public_reexports(frontend),
         types: Vec::new(),
@@ -215,7 +223,7 @@ pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifes
             })
             .collect(),
         trait_impls: BTreeMap::new(),
-    }
+    })
 }
 
 fn public_reexports(frontend: &FrontendUnit) -> Vec<ModulePath> {
