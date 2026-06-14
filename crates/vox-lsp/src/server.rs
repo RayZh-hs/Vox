@@ -235,6 +235,13 @@ fn semantic_error_span(
     unit: &vox_compiler::frontend::ast::FrontendUnit,
     message: &str,
 ) -> Option<vox_core::diagnostics::TextSpan> {
+    if let Some(name) = message
+        .strip_prefix("Unknown type ")
+        .map(|rest| rest.trim_end_matches('.'))
+    {
+        return type_name_span(unit, name).or_else(|| identifier_substring_span(source, name));
+    }
+
     if let Some(package) = message
         .strip_prefix("imported package `")
         .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
@@ -279,7 +286,407 @@ fn semantic_error_span(
         return identifier_substring_span(source, name);
     }
 
+    if let Some(name) = assignability_subject_name(message) {
+        return declaration_name_span(source, unit, name)
+            .or_else(|| identifier_substring_span(source, name));
+    }
+
     None
+}
+
+fn assignability_subject_name(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("value `")
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        .or_else(|| {
+            message
+                .strip_prefix("local `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+        .or_else(|| {
+            message
+                .strip_prefix("parameter `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+        .or_else(|| {
+            message
+                .strip_prefix("function `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+        .filter(|_| message.contains("not assignable"))
+}
+
+fn type_name_span(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    name: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::ast::*;
+
+    fn visit_type(ty: &TypeSyntax, name: &str) -> Option<vox_core::diagnostics::TextSpan> {
+        match &ty.kind {
+            TypeKind::Function { parameters, result } => parameters
+                .iter()
+                .find_map(|parameter| visit_type(parameter, name))
+                .or_else(|| visit_type(result, name)),
+            TypeKind::Nullable(inner) | TypeKind::Grouped(inner) => visit_type(inner, name),
+            TypeKind::Named {
+                name: type_name,
+                arguments,
+            } => {
+                if type_name.to_source_string() == name {
+                    return Some(type_name.span.clone());
+                }
+                arguments
+                    .iter()
+                    .find_map(|argument| visit_type(argument, name))
+            }
+            TypeKind::Dyn(type_name) => {
+                if type_name.to_source_string() == name {
+                    Some(type_name.span.clone())
+                } else {
+                    None
+                }
+            }
+            TypeKind::Tuple(items) => items.iter().find_map(|item| visit_type(item, name)),
+            TypeKind::Record(fields) => fields.iter().find_map(|field| visit_type(&field.ty, name)),
+        }
+    }
+
+    fn visit_expr(expr: &Expr, name: &str) -> Option<vox_core::diagnostics::TextSpan> {
+        match &expr.kind {
+            ExprKind::String(literal) => literal.parts.iter().find_map(|part| match part {
+                StringPart::Text(_) => None,
+                StringPart::Interpolation(expr) => visit_expr(expr, name),
+            }),
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                items.iter().find_map(|item| visit_expr(item, name))
+            }
+            ExprKind::Record(fields) => fields.iter().find_map(|field| {
+                field
+                    .ty
+                    .as_ref()
+                    .and_then(|ty| visit_type(ty, name))
+                    .or_else(|| visit_expr(&field.value, name))
+            }),
+            ExprKind::Call { callee, arguments } => visit_expr(callee, name).or_else(|| {
+                arguments.iter().find_map(|argument| match argument {
+                    Argument::Positional(expr) => visit_expr(expr, name),
+                    Argument::Named { value, .. } => visit_expr(value, name),
+                })
+            }),
+            ExprKind::Intrinsic(IntrinsicExpr::Updated(updated)) => {
+                visit_expr(&updated.target, name).or_else(|| {
+                    updated
+                        .updates
+                        .iter()
+                        .find_map(|update| visit_expr(&update.value, name))
+                })
+            }
+            ExprKind::Intrinsic(IntrinsicExpr::Econ(econ)) => {
+                visit_type(&econ.ty, name).or_else(|| visit_block(&econ.body, name))
+            }
+            ExprKind::Index { target, index } => {
+                visit_expr(target, name).or_else(|| visit_expr(index, name))
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::NonNull { target } => visit_expr(target, name),
+            ExprKind::ReceiverCall {
+                receiver,
+                arguments,
+                ..
+            } => visit_expr(receiver, name).or_else(|| {
+                arguments.iter().find_map(|argument| match argument {
+                    Argument::Positional(expr) => visit_expr(expr, name),
+                    Argument::Named { value, .. } => visit_expr(value, name),
+                })
+            }),
+            ExprKind::Unary { expr, .. } => visit_expr(expr, name),
+            ExprKind::Binary { left, right, .. } => {
+                visit_expr(left, name).or_else(|| visit_expr(right, name))
+            }
+            ExprKind::Range(range) => range
+                .start
+                .as_ref()
+                .and_then(|expr| visit_expr(expr, name))
+                .or_else(|| range.end.as_ref().and_then(|expr| visit_expr(expr, name))),
+            ExprKind::If(if_expr) => if_expr
+                .branches
+                .iter()
+                .find_map(|branch| {
+                    visit_expr(&branch.condition, name).or_else(|| visit_block(&branch.body, name))
+                })
+                .or_else(|| {
+                    if_expr
+                        .else_branch
+                        .as_ref()
+                        .and_then(|branch| visit_block(branch, name))
+                }),
+            ExprKind::When(when_expr) => visit_expr(&when_expr.subject, name)
+                .or_else(|| {
+                    when_expr.arms.iter().find_map(|arm| {
+                        visit_type(&arm.ty, name).or_else(|| visit_expr(&arm.body, name))
+                    })
+                })
+                .or_else(|| {
+                    when_expr
+                        .else_arm
+                        .as_ref()
+                        .and_then(|expr| visit_expr(expr, name))
+                }),
+            ExprKind::For(for_expr) => for_expr
+                .init
+                .as_ref()
+                .and_then(|item| visit_block_item(item, name))
+                .or_else(|| match &for_expr.header {
+                    ForHeader::In { iterable, .. } => visit_expr(iterable, name),
+                    ForHeader::Condition(condition) => visit_expr(condition, name),
+                })
+                .or_else(|| visit_block(&for_expr.body, name)),
+            ExprKind::Lambda(lambda) => lambda
+                .parameters
+                .iter()
+                .find_map(|parameter| parameter.ty.as_ref().and_then(|ty| visit_type(ty, name)))
+                .or_else(|| visit_expr(&lambda.body, name)),
+            ExprKind::Block(block) => visit_block(block, name),
+            ExprKind::Integer(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::Name(_) => None,
+        }
+    }
+
+    fn visit_block(block: &BlockExpr, name: &str) -> Option<vox_core::diagnostics::TextSpan> {
+        block
+            .items
+            .iter()
+            .find_map(|item| visit_block_item(item, name))
+            .or_else(|| {
+                block
+                    .trailing
+                    .as_ref()
+                    .and_then(|expr| visit_expr(expr, name))
+            })
+    }
+
+    fn visit_block_item(item: &BlockItem, name: &str) -> Option<vox_core::diagnostics::TextSpan> {
+        match item {
+            BlockItem::LocalValue(value) => value
+                .ty
+                .as_ref()
+                .and_then(|ty| visit_type(ty, name))
+                .or_else(|| visit_expr(&value.initializer, name)),
+            BlockItem::Assignment(value) => visit_expr(&value.value, name),
+            BlockItem::CompoundAssignment(value) => visit_expr(&value.value, name),
+            BlockItem::Return(value) => {
+                value.value.as_ref().and_then(|expr| visit_expr(expr, name))
+            }
+            BlockItem::Panic(value) => value.message.parts.iter().find_map(|part| match part {
+                StringPart::Text(_) => None,
+                StringPart::Interpolation(expr) => visit_expr(expr, name),
+            }),
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => visit_expr(expr, name),
+            BlockItem::Break(_) | BlockItem::Continue(_) => None,
+        }
+    }
+
+    unit.syntax.items.iter().find_map(|item| match item {
+        TopLevelItem::Param(parameter) => visit_type(&parameter.ty, name),
+        TopLevelItem::Value(value) => value
+            .ty
+            .as_ref()
+            .and_then(|ty| visit_type(ty, name))
+            .or_else(|| visit_expr(&value.initializer, name)),
+        TopLevelItem::Function(function) => function
+            .parameters
+            .iter()
+            .find_map(|parameter| visit_type(&parameter.ty, name))
+            .or_else(|| {
+                function
+                    .return_type
+                    .as_ref()
+                    .and_then(|ty| visit_type(ty, name))
+            })
+            .or_else(|| visit_expr(&function.body, name)),
+        TopLevelItem::Statement(item) => visit_block_item(item, name),
+        TopLevelItem::Import(_) => None,
+    })
+}
+
+fn declaration_name_span(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    name: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::ast::*;
+
+    fn visit_expr(
+        source: &str,
+        expr: &Expr,
+        name: &str,
+    ) -> Option<vox_core::diagnostics::TextSpan> {
+        match &expr.kind {
+            ExprKind::String(literal) => literal.parts.iter().find_map(|part| match part {
+                StringPart::Text(_) => None,
+                StringPart::Interpolation(expr) => visit_expr(source, expr, name),
+            }),
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                items.iter().find_map(|item| visit_expr(source, item, name))
+            }
+            ExprKind::Record(fields) => fields
+                .iter()
+                .find_map(|field| visit_expr(source, &field.value, name)),
+            ExprKind::Call { callee, arguments } => {
+                visit_expr(source, callee, name).or_else(|| {
+                    arguments.iter().find_map(|argument| match argument {
+                        Argument::Positional(expr) => visit_expr(source, expr, name),
+                        Argument::Named { value, .. } => visit_expr(source, value, name),
+                    })
+                })
+            }
+            ExprKind::Intrinsic(IntrinsicExpr::Updated(updated)) => {
+                visit_expr(source, &updated.target, name).or_else(|| {
+                    updated
+                        .updates
+                        .iter()
+                        .find_map(|update| visit_expr(source, &update.value, name))
+                })
+            }
+            ExprKind::Intrinsic(IntrinsicExpr::Econ(econ)) => visit_block(source, &econ.body, name),
+            ExprKind::Index { target, index } => {
+                visit_expr(source, target, name).or_else(|| visit_expr(source, index, name))
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::NonNull { target } => visit_expr(source, target, name),
+            ExprKind::ReceiverCall {
+                receiver,
+                arguments,
+                ..
+            } => visit_expr(source, receiver, name).or_else(|| {
+                arguments.iter().find_map(|argument| match argument {
+                    Argument::Positional(expr) => visit_expr(source, expr, name),
+                    Argument::Named { value, .. } => visit_expr(source, value, name),
+                })
+            }),
+            ExprKind::Unary { expr, .. } => visit_expr(source, expr, name),
+            ExprKind::Binary { left, right, .. } => {
+                visit_expr(source, left, name).or_else(|| visit_expr(source, right, name))
+            }
+            ExprKind::Range(range) => range
+                .start
+                .as_ref()
+                .and_then(|expr| visit_expr(source, expr, name))
+                .or_else(|| {
+                    range
+                        .end
+                        .as_ref()
+                        .and_then(|expr| visit_expr(source, expr, name))
+                }),
+            ExprKind::If(if_expr) => if_expr
+                .branches
+                .iter()
+                .find_map(|branch| {
+                    visit_expr(source, &branch.condition, name)
+                        .or_else(|| visit_block(source, &branch.body, name))
+                })
+                .or_else(|| {
+                    if_expr
+                        .else_branch
+                        .as_ref()
+                        .and_then(|branch| visit_block(source, branch, name))
+                }),
+            ExprKind::When(when_expr) => visit_expr(source, &when_expr.subject, name)
+                .or_else(|| {
+                    when_expr
+                        .arms
+                        .iter()
+                        .find_map(|arm| visit_expr(source, &arm.body, name))
+                })
+                .or_else(|| {
+                    when_expr
+                        .else_arm
+                        .as_ref()
+                        .and_then(|expr| visit_expr(source, expr, name))
+                }),
+            ExprKind::For(for_expr) => for_expr
+                .init
+                .as_ref()
+                .and_then(|item| visit_block_item(source, item, name))
+                .or_else(|| match &for_expr.header {
+                    ForHeader::In { iterable, .. } => visit_expr(source, iterable, name),
+                    ForHeader::Condition(condition) => visit_expr(source, condition, name),
+                })
+                .or_else(|| visit_block(source, &for_expr.body, name)),
+            ExprKind::Lambda(lambda) => visit_expr(source, &lambda.body, name),
+            ExprKind::Block(block) => visit_block(source, block, name),
+            ExprKind::Integer(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::Name(_) => None,
+        }
+    }
+
+    fn visit_block(
+        source: &str,
+        block: &BlockExpr,
+        name: &str,
+    ) -> Option<vox_core::diagnostics::TextSpan> {
+        block
+            .items
+            .iter()
+            .find_map(|item| visit_block_item(source, item, name))
+            .or_else(|| {
+                block
+                    .trailing
+                    .as_ref()
+                    .and_then(|expr| visit_expr(source, expr, name))
+            })
+    }
+
+    fn visit_block_item(
+        source: &str,
+        item: &BlockItem,
+        name: &str,
+    ) -> Option<vox_core::diagnostics::TextSpan> {
+        match item {
+            BlockItem::LocalValue(value) if value.name == name => {
+                find_identifier_span_in(source, &value.span, name)
+            }
+            BlockItem::LocalValue(value) => visit_expr(source, &value.initializer, name),
+            BlockItem::Assignment(value) => visit_expr(source, &value.value, name),
+            BlockItem::CompoundAssignment(value) => visit_expr(source, &value.value, name),
+            BlockItem::Return(value) => value
+                .value
+                .as_ref()
+                .and_then(|expr| visit_expr(source, expr, name)),
+            BlockItem::Panic(value) => value.message.parts.iter().find_map(|part| match part {
+                StringPart::Text(_) => None,
+                StringPart::Interpolation(expr) => visit_expr(source, expr, name),
+            }),
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
+                visit_expr(source, expr, name)
+            }
+            BlockItem::Break(_) | BlockItem::Continue(_) => None,
+        }
+    }
+
+    unit.syntax.items.iter().find_map(|item| match item {
+        TopLevelItem::Param(parameter) if parameter.name == name => {
+            find_identifier_span_in(source, &parameter.span, name)
+        }
+        TopLevelItem::Value(value) if value.name == name => {
+            find_identifier_span_in(source, &value.span, name)
+        }
+        TopLevelItem::Function(function) if function.name == name => {
+            find_identifier_span_in(source, &function.span, name)
+        }
+        TopLevelItem::Function(function) => visit_expr(source, &function.body, name),
+        TopLevelItem::Statement(item) => visit_block_item(source, item, name),
+        TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Value(_) => None,
+    })
 }
 
 fn import_module_span(

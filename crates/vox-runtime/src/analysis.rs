@@ -386,15 +386,15 @@ impl<'a> TypeEngine<'a> {
 
     fn prime(&mut self) -> Result<(), String> {
         self.collect_imports()?;
-        self.collect_function_headers();
+        self.collect_function_headers()?;
         match self.unit.header.kind {
             ModuleKind::Package => {
-                self.collect_value_placeholders();
+                self.collect_value_placeholders()?;
                 self.infer_function_bodies()?;
                 self.infer_value_initializers()?;
             }
             ModuleKind::Script { .. } => {
-                self.collect_parameter_bindings();
+                self.collect_parameter_bindings()?;
                 self.infer_parameter_defaults()?;
                 self.infer_script_items()?;
             }
@@ -473,9 +473,24 @@ impl<'a> TypeEngine<'a> {
         Ok(())
     }
 
-    fn collect_function_headers(&mut self) {
+    fn collect_function_headers(&mut self) -> Result<(), String> {
         for item in &self.unit.items {
             if let TopLevelItem::Function(function) = item {
+                let generic_parameters = generic_parameter_scope(&function.generic_parameters);
+                let mut parameters = Vec::with_capacity(function.parameters.len());
+                for parameter in &function.parameters {
+                    parameters.push(CallableParameterSummary {
+                        name: parameter.name.clone(),
+                        ty: self.type_from_syntax_checked(&parameter.ty, &generic_parameters)?,
+                        has_default: parameter.default.is_some(),
+                    });
+                }
+                let return_type = function
+                    .return_type
+                    .as_ref()
+                    .map(|ty| self.type_from_syntax_checked(ty, &generic_parameters))
+                    .transpose()?
+                    .unwrap_or_else(|| ReplType::Unknown(format!("{} return type", function.name)));
                 self.functions.insert(
                     function.name.clone(),
                     FunctionInfo {
@@ -489,63 +504,44 @@ impl<'a> TypeEngine<'a> {
                                     bound: parameter.bound.clone(),
                                 })
                                 .collect(),
-                            parameters: function
-                                .parameters
-                                .iter()
-                                .map(|parameter| CallableParameterSummary {
-                                    name: parameter.name.clone(),
-                                    ty: from_type_syntax(
-                                        &parameter.ty,
-                                        &generic_parameter_scope(&function.generic_parameters),
-                                    ),
-                                    has_default: parameter.default.is_some(),
-                                })
-                                .collect(),
-                            return_type: function
-                                .return_type
-                                .as_ref()
-                                .map(|ty| {
-                                    from_type_syntax(
-                                        ty,
-                                        &generic_parameter_scope(&function.generic_parameters),
-                                    )
-                                })
-                                .unwrap_or_else(|| {
-                                    ReplType::Unknown(format!("{} return type", function.name))
-                                }),
+                            parameters,
+                            return_type,
                             evil: function.evil,
                         },
                     },
                 );
             }
         }
+        Ok(())
     }
 
-    fn collect_value_placeholders(&mut self) {
+    fn collect_value_placeholders(&mut self) -> Result<(), String> {
         for item in &self.unit.items {
             match item {
                 TopLevelItem::Param(parameter) => {
+                    let ty = self.type_from_syntax_checked(&parameter.ty, &BTreeMap::new())?;
                     self.values.insert(
                         parameter.name.clone(),
                         ValueInfo {
                             name: parameter.name.clone(),
-                            ty: from_type_syntax(&parameter.ty, &BTreeMap::new()),
+                            ty,
                             mutable: false,
                         },
                     );
                 }
                 TopLevelItem::Value(value) => {
+                    let ty = value
+                        .ty
+                        .as_ref()
+                        .map(|ty| self.type_from_syntax_checked(ty, &BTreeMap::new()))
+                        .transpose()?;
                     self.values.insert(
                         value.name.clone(),
                         ValueInfo {
                             name: value.name.clone(),
-                            ty: value
-                                .ty
-                                .as_ref()
-                                .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
-                                .unwrap_or_else(|| {
-                                    ReplType::Unknown(format!("{} type", value.name))
-                                }),
+                            ty: ty.unwrap_or_else(|| {
+                                ReplType::Unknown(format!("{} type", value.name))
+                            }),
                             mutable: matches!(value.mutability, Mutability::Var),
                         },
                     );
@@ -554,22 +550,25 @@ impl<'a> TypeEngine<'a> {
                 TopLevelItem::Statement(_) => {}
             }
         }
+        Ok(())
     }
 
-    fn collect_parameter_bindings(&mut self) {
+    fn collect_parameter_bindings(&mut self) -> Result<(), String> {
         for item in &self.unit.items {
             let TopLevelItem::Param(parameter) = item else {
                 continue;
             };
+            let ty = self.type_from_syntax_checked(&parameter.ty, &BTreeMap::new())?;
             self.values.insert(
                 parameter.name.clone(),
                 ValueInfo {
                     name: parameter.name.clone(),
-                    ty: from_type_syntax(&parameter.ty, &BTreeMap::new()),
+                    ty,
                     mutable: false,
                 },
             );
         }
+        Ok(())
     }
 
     fn infer_parameter_defaults(&self) -> Result<(), String> {
@@ -583,7 +582,8 @@ impl<'a> TypeEngine<'a> {
 
             let mut scope = self.top_level_scope();
             let inferred = self.infer_expr(default, &mut scope)?;
-            let explicit = from_type_syntax(&parameter.ty, &scope.generic_parameters);
+            let explicit =
+                self.type_from_syntax_checked(&parameter.ty, &scope.generic_parameters)?;
             if !inferred.is_assignable_to(&explicit) {
                 return Err(format!(
                     "parameter `{}` has default type `{}`, which is not assignable to `{}`",
@@ -686,7 +686,7 @@ impl<'a> TypeEngine<'a> {
             scope.values.insert(
                 parameter.name.clone(),
                 LocalBinding {
-                    ty: from_type_syntax(&parameter.ty, &scope.generic_parameters),
+                    ty: self.type_from_syntax_checked(&parameter.ty, &scope.generic_parameters)?,
                     mutable: false,
                 },
             );
@@ -694,7 +694,7 @@ impl<'a> TypeEngine<'a> {
 
         let inferred = self.infer_expr(&function.body, scope)?;
         let return_type = if let Some(explicit) = &function.return_type {
-            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
+            let explicit = self.type_from_syntax_checked(explicit, &scope.generic_parameters)?;
             if !inferred.is_assignable_to(&explicit) {
                 return Err(format!(
                     "function `{}` returns `{}`, which is not assignable to `{}`",
@@ -745,9 +745,13 @@ impl<'a> TypeEngine<'a> {
         value: &ValueDecl,
         scope: &mut TypeScope,
     ) -> Result<ReplType, String> {
+        let explicit = value
+            .ty
+            .as_ref()
+            .map(|ty| self.type_from_syntax_checked(ty, &scope.generic_parameters))
+            .transpose()?;
         let inferred = self.infer_expr(&value.initializer, scope)?;
-        if let Some(explicit) = &value.ty {
-            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
+        if let Some(explicit) = explicit {
             if !inferred.is_assignable_to(&explicit) {
                 return Err(format!(
                     "value `{}` has initializer type `{}`, which is not assignable to `{}`",
@@ -812,6 +816,9 @@ impl<'a> TypeEngine<'a> {
             ExprKind::Record(fields) => fields
                 .iter()
                 .map(|field| {
+                    if let Some(ty) = &field.ty {
+                        self.type_from_syntax_checked(ty, &scope.generic_parameters)?;
+                    }
                     self.infer_expr(&field.value, scope)
                         .map(|ty| RecordFieldType {
                             name: field.name.clone(),
@@ -921,7 +928,10 @@ impl<'a> TypeEngine<'a> {
                         nested.values.insert(
                             binding.clone(),
                             LocalBinding {
-                                ty: from_type_syntax(&arm.ty, &nested.generic_parameters),
+                                ty: self.type_from_syntax_checked(
+                                    &arm.ty,
+                                    &nested.generic_parameters,
+                                )?,
                                 mutable: false,
                             },
                         );
@@ -1045,7 +1055,8 @@ impl<'a> TypeEngine<'a> {
                     let ty = parameter
                         .ty
                         .as_ref()
-                        .map(|ty| from_type_syntax(ty, &nested.generic_parameters))
+                        .map(|ty| self.type_from_syntax_checked(ty, &nested.generic_parameters))
+                        .transpose()?
                         .unwrap_or_else(|| ReplType::Unknown(parameter.name.clone()));
                     nested.values.insert(
                         parameter.name.clone(),
@@ -1268,9 +1279,13 @@ impl<'a> TypeEngine<'a> {
         value: &LocalValueDecl,
         scope: &mut TypeScope,
     ) -> Result<(), String> {
+        let explicit = value
+            .ty
+            .as_ref()
+            .map(|ty| self.type_from_syntax_checked(ty, &scope.generic_parameters))
+            .transpose()?;
         let inferred = self.infer_expr(&value.initializer, scope)?;
-        let ty = if let Some(explicit) = &value.ty {
-            let explicit = from_type_syntax(explicit, &scope.generic_parameters);
+        let ty = if let Some(explicit) = explicit {
             if !inferred.is_assignable_to(&explicit) {
                 return Err(format!(
                     "local `{}` has initializer type `{}`, which is not assignable to `{}`",
@@ -1392,7 +1407,91 @@ impl<'a> TypeEngine<'a> {
     fn infer_econ(&self, econ: &EconIntrinsic, scope: &TypeScope) -> Result<ReplType, String> {
         Ok(ReplType::Named {
             name: "Econ".to_owned(),
-            arguments: vec![from_type_syntax(&econ.ty, &scope.generic_parameters)],
+            arguments: vec![self.type_from_syntax_checked(&econ.ty, &scope.generic_parameters)?],
+        })
+    }
+
+    fn type_from_syntax_checked(
+        &self,
+        ty: &TypeSyntax,
+        generic_parameters: &BTreeMap<String, GenericParameterSummary>,
+    ) -> Result<ReplType, String> {
+        self.validate_type_syntax(ty, generic_parameters)?;
+        Ok(from_type_syntax(ty, generic_parameters))
+    }
+
+    fn validate_type_syntax(
+        &self,
+        ty: &TypeSyntax,
+        generic_parameters: &BTreeMap<String, GenericParameterSummary>,
+    ) -> Result<(), String> {
+        match &ty.kind {
+            TypeKind::Function { parameters, result } => {
+                for parameter in parameters {
+                    self.validate_type_syntax(parameter, generic_parameters)?;
+                }
+                self.validate_type_syntax(result, generic_parameters)
+            }
+            TypeKind::Nullable(inner) | TypeKind::Grouped(inner) => {
+                self.validate_type_syntax(inner, generic_parameters)
+            }
+            TypeKind::Named { name, arguments } => {
+                for argument in arguments {
+                    self.validate_type_syntax(argument, generic_parameters)?;
+                }
+
+                let raw = name.to_source_string();
+                if is_predefined_type_name(&raw)
+                    || generic_parameters.contains_key(&raw)
+                    || self.named_type_exists(&raw)
+                {
+                    Ok(())
+                } else {
+                    Err(format!("Unknown type {raw}."))
+                }
+            }
+            TypeKind::Dyn(name) => {
+                let raw = name.to_source_string();
+                if raw == "Any" || self.trait_type_exists(&raw) {
+                    Ok(())
+                } else {
+                    Err(format!("Unknown type {raw}."))
+                }
+            }
+            TypeKind::Tuple(items) => {
+                for item in items {
+                    self.validate_type_syntax(item, generic_parameters)?;
+                }
+                Ok(())
+            }
+            TypeKind::Record(fields) => {
+                for field in fields {
+                    self.validate_type_syntax(&field.ty, generic_parameters)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn named_type_exists(&self, raw: &str) -> bool {
+        self.manifests.values().any(|manifest| {
+            manifest.types.iter().any(|ty| {
+                ty.name.name == raw
+                    || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == raw
+            })
+        })
+    }
+
+    fn trait_type_exists(&self, raw: &str) -> bool {
+        self.manifests.values().any(|manifest| {
+            manifest.traits.iter().any(|trait_spec| {
+                trait_spec.name.name == raw
+                    || format!(
+                        "{}.{}",
+                        trait_spec.name.module.as_str(),
+                        trait_spec.name.name
+                    ) == raw
+            })
         })
     }
 
@@ -2562,6 +2661,10 @@ fn predefined_type_name_kind(name: &str) -> Option<&'static str> {
         "List" | "Econ" => Some("type constructor"),
         _ => None,
     }
+}
+
+fn is_predefined_type_name(name: &str) -> bool {
+    predefined_type_name_kind(name).is_some()
 }
 
 fn type_name_used_as_value_error(name: &str, kind: &str) -> String {
