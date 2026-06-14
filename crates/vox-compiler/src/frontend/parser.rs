@@ -875,40 +875,10 @@ impl Parser {
         let parameters = if let Some(single) = self.try_parse_single_lambda_parameter() {
             vec![single]
         } else if self.consume(TokenKind::LParen) {
-            let start = self.tokens[checkpoint].span.start;
-            let mut parameters = Vec::new();
-            if !self.at(TokenKind::RParen) {
-                loop {
-                    let TokenKind::Identifier(name) = self.current().kind.clone() else {
-                        self.index = checkpoint;
-                        return Ok(None);
-                    };
-                    let param_start = self.current().span.start;
-                    self.index += 1;
-                    let ty = if self.consume(TokenKind::Colon) {
-                        Some(self.parse_type()?)
-                    } else {
-                        None
-                    };
-                    let end = ty
-                        .as_ref()
-                        .map(|ty| ty.span.end)
-                        .unwrap_or(self.previous().span.end);
-                    parameters.push(LambdaParameter {
-                        name,
-                        ty,
-                        span: TextSpan::new(param_start, end),
-                    });
-                    if !self.consume(TokenKind::Comma) {
-                        break;
-                    }
-                    if self.at(TokenKind::RParen) {
-                        break;
-                    }
-                }
-            }
-            self.expect_simple(TokenKind::RParen, "expected `)` after lambda parameters")?;
-            let _ = start;
+            let Some(parameters) = self.try_parse_parenthesized_lambda_parameters(checkpoint)?
+            else {
+                return Ok(None);
+            };
             parameters
         } else {
             return Ok(None);
@@ -934,6 +904,54 @@ impl Parser {
             }),
             span: TextSpan::new(start, body.span.end),
         }))
+    }
+
+    fn try_parse_parenthesized_lambda_parameters(
+        &mut self,
+        checkpoint: usize,
+    ) -> Result<Option<Vec<LambdaParameter>>, DiagnosticBag> {
+        let mut parameters = Vec::new();
+        if !self.at(TokenKind::RParen) {
+            loop {
+                let TokenKind::Identifier(name) = self.current().kind.clone() else {
+                    self.index = checkpoint;
+                    return Ok(None);
+                };
+                let param_start = self.current().span.start;
+                self.index += 1;
+                let ty = if self.consume(TokenKind::Colon) {
+                    Some(self.parse_type()?)
+                } else {
+                    None
+                };
+                let end = ty
+                    .as_ref()
+                    .map(|ty| ty.span.end)
+                    .unwrap_or(self.previous().span.end);
+                parameters.push(LambdaParameter {
+                    name,
+                    ty,
+                    span: TextSpan::new(param_start, end),
+                });
+                if !self.consume(TokenKind::Comma) {
+                    break;
+                }
+                if self.at(TokenKind::RParen) {
+                    break;
+                }
+            }
+        }
+
+        if !self.consume(TokenKind::RParen) {
+            self.index = checkpoint;
+            return Ok(None);
+        }
+        if !matches!(self.current().kind, TokenKind::Arrow) {
+            self.index = checkpoint;
+            return Ok(None);
+        }
+
+        Ok(Some(parameters))
     }
 
     fn try_parse_single_lambda_parameter(&mut self) -> Option<LambdaParameter> {
