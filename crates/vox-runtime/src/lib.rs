@@ -21,7 +21,7 @@ mod wasm_executor;
 use thiserror::Error;
 use vox_compiler::{CompileRequest, Compiler, package_manifest_from_frontend};
 use vox_core::{
-    external_library::{ExternalLibrary, decode_external_library_file},
+    external_library::decode_external_library_file,
     host::{HostRegistry, PackageManifest},
     ids::{ArtifactId, HandleId, LibraryId},
     opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
@@ -210,15 +210,6 @@ impl Runtime {
             artifact,
         });
         id
-    }
-
-    pub fn mount_external_library(
-        &mut self,
-        library: ExternalLibrary,
-    ) -> Result<LibraryId, String> {
-        library
-            .build()
-            .map(|(manifest, _)| self.mount_library(manifest))
     }
 
     pub fn mount_voxlib_file(&mut self, path: &Path) -> Result<LibraryId, String> {

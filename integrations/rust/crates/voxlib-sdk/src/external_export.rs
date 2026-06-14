@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::{
+use vox_core::{
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
         TraitMethodSpec, TraitSpec, TypeSpec,
@@ -87,7 +87,7 @@ pub struct CollectedPackageExports {
     pub types: Vec<TypeSpec>,
     pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
-    pub values: Vec<crate::host::ValueSpec>,
+    pub values: Vec<vox_core::host::ValueSpec>,
     pub trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>>,
 }
 

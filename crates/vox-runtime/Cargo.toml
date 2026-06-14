@@ -5,7 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+inventory.workspace = true
 thiserror.workspace = true
 wasmtime.workspace = true
 vox-compiler = { path = "../vox-compiler" }
 vox-core = { path = "../vox-core" }
+
+[dev-dependencies]
+voxlib-sdk = { path = "../../integrations/rust/crates/voxlib-sdk" }

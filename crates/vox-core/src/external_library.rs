@@ -1,12 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt, fs, io,
-    path::{Path, PathBuf},
+    fmt, io,
 };
 
 use crate::{
-    diagnostics::Diagnostic,
-    external_export::{collect_registered_docstrings, extend_manifest_with_registered_exports},
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
         TraitMethodSpec, TraitSpec, TypeSpec, ValueSpec,
@@ -20,123 +17,16 @@ pub const EXTERNAL_LIBRARY_VERSION: u16 = 4;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalLibrary {
-    manifest: PackageManifest,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLibraryHeader {
     pub manifest: PackageManifest,
     pub wasm_bytes: Vec<u8>,
     pub metadata: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeneratedExternalLibrary {
-    header: ExternalLibraryHeader,
-    library_bytes: Vec<u8>,
-    library_file_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GeneratedExternalLibraryFiles {
-    pub library_path: PathBuf,
-}
-
 #[derive(Debug)]
 pub enum ExternalLibraryFormatError {
     Io(io::Error),
     Message(String),
-}
-
-impl ExternalLibrary {
-    pub fn new(package: &str) -> Result<Self, Diagnostic> {
-        Ok(Self {
-            manifest: PackageManifest {
-                package: ModulePath::parse(package)?,
-                reexports: Vec::new(),
-                types: Vec::new(),
-                traits: Vec::new(),
-                functions: Vec::new(),
-                values: Vec::new(),
-                trait_impls: BTreeMap::new(),
-            },
-        })
-    }
-
-    pub fn package(&self) -> &ModulePath {
-        &self.manifest.package
-    }
-
-    pub fn manifest(&self) -> &PackageManifest {
-        &self.manifest
-    }
-
-    pub fn manifest_mut(&mut self) -> &mut PackageManifest {
-        &mut self.manifest
-    }
-
-    pub fn build(self) -> Result<(PackageManifest, Vec<u8>), String> {
-        let manifest = extend_manifest_with_registered_exports(self.manifest)?;
-        let docstrings = collect_registered_docstrings();
-        let metadata = encode_docstring_metadata(&docstrings);
-        Ok((manifest, metadata))
-    }
-
-    pub fn generate(
-        self,
-        wasm_bytes: impl Into<Vec<u8>>,
-    ) -> Result<GeneratedExternalLibrary, ExternalLibraryFormatError> {
-        let (manifest, metadata) = self.build().map_err(ExternalLibraryFormatError::Message)?;
-        let wasm_bytes = wasm_bytes.into();
-        let header = ExternalLibraryHeader {
-            manifest,
-            wasm_bytes,
-            metadata: if metadata.is_empty() {
-                None
-            } else {
-                Some(metadata)
-            },
-        };
-        let library_bytes = encode_external_library_file(&header)?;
-        let library_file_name = format!("{}.voxlib", header.manifest.package.as_str());
-        Ok(GeneratedExternalLibrary {
-            header,
-            library_bytes,
-            library_file_name,
-        })
-    }
-}
-
-impl GeneratedExternalLibrary {
-    pub fn header(&self) -> &ExternalLibraryHeader {
-        &self.header
-    }
-
-    pub fn library_bytes(&self) -> &[u8] {
-        &self.library_bytes
-    }
-
-    pub fn library_file_name(&self) -> &str {
-        &self.library_file_name
-    }
-
-    pub fn wasm_bytes(&self) -> &[u8] {
-        &self.header.wasm_bytes
-    }
-
-    pub fn write_to_dir(
-        &self,
-        dir: impl AsRef<Path>,
-    ) -> Result<GeneratedExternalLibraryFiles, ExternalLibraryFormatError> {
-        let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
-
-        let library_path = dir.join(self.library_file_name());
-        fs::write(&library_path, &self.library_bytes)?;
-
-        Ok(GeneratedExternalLibraryFiles { library_path })
-    }
 }
 
 impl fmt::Display for ExternalLibraryFormatError {
@@ -156,16 +46,9 @@ impl From<io::Error> for ExternalLibraryFormatError {
     }
 }
 
-// =============================================================================
-// .voxlib binary format (version 4)
-//
-// Layout:  magic(4B) | version(u16) | reserved(u16)
-//        | manifest(len+bytes) | wasm(len+bytes)
-//        | metadata(len+bytes)?
-//
-// Single self-contained file; wasm is embedded inline.
-// Metadata is conditionally attached at the end for annotated libraries.
-// =============================================================================
+// .voxlib binary format (version 4):
+// magic(4B) | version(u16) | reserved(u16) | manifest(len+bytes)
+// | wasm(len+bytes) | metadata(len+bytes)?
 
 pub fn encode_external_library_file(
     header: &ExternalLibraryHeader,
@@ -213,19 +96,6 @@ pub fn decode_external_library_file(
         wasm_bytes,
         metadata,
     })
-}
-
-fn encode_docstring_metadata(docstrings: &BTreeMap<String, String>) -> Vec<u8> {
-    if docstrings.is_empty() {
-        return Vec::new();
-    }
-    let mut writer = BinaryWriter::new();
-    let _ = writer.write_len(docstrings.len(), "docstring entries");
-    for (name, doc) in docstrings {
-        let _ = writer.write_string(name);
-        let _ = writer.write_string(doc);
-    }
-    writer.into_inner()
 }
 
 pub fn encode_package_manifest(

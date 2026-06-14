@@ -96,7 +96,7 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
         let field_ty = &field.ty;
         let field_ty_text = field_ty.to_token_stream().to_string();
         quote! {
-            ::vox_core::external_export::ExportedSurfaceField {
+            ::voxlib_sdk::external_export::ExportedSurfaceField {
                 name: #field_name,
                 rust_type: #field_ty_text,
             }
@@ -131,11 +131,11 @@ fn expand_vox_export(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream
             }
         }
 
-        ::vox_core::external_export::inventory::submit! {
-            ::vox_core::external_export::ExportedSurfaceRegistration {
+        ::voxlib_sdk::external_export::inventory::submit! {
+            ::voxlib_sdk::external_export::ExportedSurfaceRegistration {
                 rust_name: stringify!(#ident),
                 vox_name: #vox_name,
-                kind: ::vox_core::external_export::ExportedSurfaceKind::Struct,
+                kind: ::voxlib_sdk::external_export::ExportedSurfaceKind::Struct,
                 fields: &[#(#exported_fields),*],
                 order: line!(),
             }
@@ -165,8 +165,8 @@ fn expand_vox_trait(
         proc_macro2::TokenStream::new()
     } else {
         quote! {
-            ::vox_core::external_export::inventory::submit! {
-                ::vox_core::external_export::ExportedDocstringRegistration {
+            ::voxlib_sdk::external_export::inventory::submit! {
+                ::voxlib_sdk::external_export::ExportedDocstringRegistration {
                     vox_name: #vox_name,
                     doc: #doc,
                     order: line!(),
@@ -178,11 +178,11 @@ fn expand_vox_trait(
     Ok(quote! {
         #item
 
-        ::vox_core::external_export::inventory::submit! {
-            ::vox_core::external_export::ExportedSurfaceRegistration {
+        ::voxlib_sdk::external_export::inventory::submit! {
+            ::voxlib_sdk::external_export::ExportedSurfaceRegistration {
                 rust_name: stringify!(#ident),
                 vox_name: #vox_name,
-                kind: ::vox_core::external_export::ExportedSurfaceKind::Trait,
+                kind: ::voxlib_sdk::external_export::ExportedSurfaceKind::Trait,
                 fields: &[],
                 order: line!(),
             }
@@ -220,8 +220,8 @@ fn expand_vox_fn(
         proc_macro2::TokenStream::new()
     } else {
         quote! {
-            ::vox_core::external_export::inventory::submit! {
-                ::vox_core::external_export::ExportedDocstringRegistration {
+            ::voxlib_sdk::external_export::inventory::submit! {
+                ::voxlib_sdk::external_export::ExportedDocstringRegistration {
                     vox_name: #vox_name,
                     doc: #doc,
                     order: line!(),
@@ -257,7 +257,7 @@ fn expand_vox_fn(
         let ty = (*parameter.ty).clone();
         let ty_text = ty.to_token_stream().to_string();
         parameters.push(quote! {
-            ::vox_core::external_export::ExportedFunctionParameter {
+            ::voxlib_sdk::external_export::ExportedFunctionParameter {
                 name: #name,
                 rust_type: #ty_text,
                 has_default: #has_default,
@@ -294,8 +294,8 @@ fn expand_vox_fn(
             )
         }
 
-        ::vox_core::external_export::inventory::submit! {
-            ::vox_core::external_export::ExportedFunctionRegistration {
+        ::voxlib_sdk::external_export::inventory::submit! {
+            ::voxlib_sdk::external_export::ExportedFunctionRegistration {
                 rust_name: stringify!(#ident),
                 vox_name: #vox_name,
                 purity: #purity,
@@ -331,9 +331,7 @@ fn expand_vox_trait_impl(item: ItemImpl) -> syn::Result<proc_macro2::TokenStream
         .segments
         .last()
         .map(|seg| seg.ident.to_string())
-        .ok_or_else(|| {
-            Error::new_spanned(trait_path, "could not extract trait name")
-        })?;
+        .ok_or_else(|| Error::new_spanned(trait_path, "could not extract trait name"))?;
 
     let Type::Path(type_path) = &*item.self_ty else {
         return Err(Error::new_spanned(
@@ -347,15 +345,13 @@ fn expand_vox_trait_impl(item: ItemImpl) -> syn::Result<proc_macro2::TokenStream
         .segments
         .last()
         .map(|seg| seg.ident.to_string())
-        .ok_or_else(|| {
-            Error::new_spanned(type_path, "could not extract struct name")
-        })?;
+        .ok_or_else(|| Error::new_spanned(type_path, "could not extract struct name"))?;
 
     Ok(quote! {
         #item
 
-        ::vox_core::external_export::inventory::submit! {
-            ::vox_core::external_export::ExportedTraitImplRegistration {
+        ::voxlib_sdk::external_export::inventory::submit! {
+            ::voxlib_sdk::external_export::ExportedTraitImplRegistration {
                 struct_vox_name: #struct_name,
                 trait_vox_name: #trait_name,
                 order: line!(),
@@ -384,8 +380,8 @@ fn collect_vox_doc_string(
         return Ok(proc_macro2::TokenStream::new());
     }
     Ok(quote! {
-        ::vox_core::external_export::inventory::submit! {
-            ::vox_core::external_export::ExportedDocstringRegistration {
+        ::voxlib_sdk::external_export::inventory::submit! {
+            ::voxlib_sdk::external_export::ExportedDocstringRegistration {
                 vox_name: #vox_name,
                 doc: #doc,
                 order: line!(),
@@ -470,8 +466,8 @@ fn trait_impls_from_attrs(
                 if value.path.is_ident("trait_impl") {
                     let trait_name = expect_lit_str(&value.value, "trait_impl")?.value();
                     submissions.push(quote! {
-                        ::vox_core::external_export::inventory::submit! {
-                            ::vox_core::external_export::ExportedTraitImplRegistration {
+                        ::voxlib_sdk::external_export::inventory::submit! {
+                            ::voxlib_sdk::external_export::ExportedTraitImplRegistration {
                                 struct_vox_name: #vox_name,
                                 trait_vox_name: #trait_name,
                                 order: line!(),
@@ -555,7 +551,7 @@ fn exported_trait_method_exports(
                     let has_default = take_default_marker(&mut parameter.attrs)?;
                     let ty_text = parameter.ty.to_token_stream().to_string();
                     parameters.push(quote! {
-                        ::vox_core::external_export::ExportedFunctionParameter {
+                        ::voxlib_sdk::external_export::ExportedFunctionParameter {
                             name: #name,
                             rust_type: #ty_text,
                             has_default: #has_default,
@@ -566,8 +562,8 @@ fn exported_trait_method_exports(
         }
 
         exports.push(quote! {
-            ::vox_core::external_export::inventory::submit! {
-                ::vox_core::external_export::ExportedTraitMethodRegistration {
+            ::voxlib_sdk::external_export::inventory::submit! {
+                ::voxlib_sdk::external_export::ExportedTraitMethodRegistration {
                     trait_vox_name: #trait_vox_name,
                     rust_name: stringify!(#method_ident),
                     vox_name: #vox_name,
@@ -586,8 +582,8 @@ fn exported_trait_method_exports(
         }
         if !method_doc.is_empty() {
             exports.push(quote! {
-                ::vox_core::external_export::inventory::submit! {
-                    ::vox_core::external_export::ExportedDocstringRegistration {
+                ::voxlib_sdk::external_export::inventory::submit! {
+                    ::voxlib_sdk::external_export::ExportedDocstringRegistration {
                         vox_name: #vox_name,
                         doc: #method_doc,
                         order: line!(),

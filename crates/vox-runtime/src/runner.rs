@@ -6,7 +6,6 @@ use std::{
 
 use thiserror::Error;
 use vox_core::{
-    external_library::ExternalLibrary,
     host::PackageManifest,
     ids::{ArtifactId, HandleId, LibraryId, SessionId},
     opt::OptimizationLevel,
@@ -126,11 +125,6 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
     ) -> Result<Option<OptimizationDump>, RunnerError>;
 
     fn mount_library(&self, manifest: PackageManifest) -> Result<LibraryId, RunnerError>;
-
-    fn mount_external_library(&self, library: ExternalLibrary) -> Result<LibraryId, RunnerError> {
-        let (manifest, _) = library.build().map_err(RunnerError::Session)?;
-        self.mount_library(manifest)
-    }
 
     fn unmount_library(&self, library: LibraryId) -> Result<bool, RunnerError>;
 

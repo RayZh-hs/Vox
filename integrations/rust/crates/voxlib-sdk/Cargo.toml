@@ -1,0 +1,10 @@
+[package]
+name = "voxlib-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inventory.workspace = true
+vox-core = { path = "../../../../crates/vox-core" }
+voxlib-macros = { path = "../voxlib-macros" }

@@ -1,11 +1,12 @@
 [workspace]
 members = [
     "crates/vox-core",
-    "crates/vox-core-macros",
     "crates/vox-compiler",
     "crates/vox-runtime",
     "crates/vox-repl",
     "crates/vox-lsp",
+    "integrations/rust/crates/voxlib-macros",
+    "integrations/rust/crates/voxlib-sdk",
 ]
 resolver = "3"
 

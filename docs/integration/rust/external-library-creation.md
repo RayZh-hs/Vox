@@ -6,6 +6,10 @@ Rust host integration should feel small:
 - mark Rust structs, traits, and functions as Vox-exportable once;
 - let the library collect everything automatically.
 
+Rust `.voxlib` authoring lives in `voxlib-sdk`. The lower-level `vox_core`
+crate only contains language-neutral Vox manifest, type, value, and `.voxlib`
+encoding types.
+
 An external library is the Rust-side description of one Vox package. In Rust,
 the builder type for that concept is `ExternalLibrary`. Ordinary library
 authors should not build `PackageManifest`, `TypeSpec`, `FunctionSpec`, or
@@ -34,10 +38,10 @@ That means:
 
 ### 1. Mark exported structs once
 
-Use a Vox Core derive on each Rust struct that should be visible to Vox:
+Use a Vox SDK derive on each Rust struct that should be visible to Vox:
 
 ```rust
-use vox_core::external_library::ExternalLibrary;
+use voxlib_sdk::{VoxExport, external_library::ExternalLibrary};
 
 #[derive(VoxExport)]
 struct Image {
@@ -176,7 +180,7 @@ fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
 ## End-to-End Example
 
 ```rust
-use vox_core::external_library::ExternalLibrary;
+use voxlib_sdk::{VoxExport, external_library::ExternalLibrary, vox_fn, vox_trait};
 
 #[derive(VoxExport)]
 struct Image {

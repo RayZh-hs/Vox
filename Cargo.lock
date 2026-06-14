@@ -1733,17 +1733,6 @@ name = "vox-core"
 version = "0.1.0"
 dependencies = [
  "camino",
- "inventory",
- "vox-core-macros",
-]
-
-[[package]]
-name = "vox-core-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -1772,10 +1761,30 @@ dependencies = [
 name = "vox-runtime"
 version = "0.1.0"
 dependencies = [
+ "inventory",
  "thiserror 2.0.18",
  "vox-compiler",
  "vox-core",
+ "voxlib-sdk",
  "wasmtime",
+]
+
+[[package]]
+name = "voxlib-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "voxlib-sdk"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "vox-core",
+ "voxlib-macros",
 ]
 
 [[package]]

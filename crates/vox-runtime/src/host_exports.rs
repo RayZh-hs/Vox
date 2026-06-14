@@ -8,7 +8,7 @@ use vox_core::{
 
 use crate::{HostCallArgument, HostFunctionHandler, Runtime};
 
-pub use vox_core::external_export::inventory;
+pub use inventory;
 
 pub type HostExportInvoker = fn(&mut Runtime, &[HostCallArgument]) -> Result<RuntimeValue, String>;
 

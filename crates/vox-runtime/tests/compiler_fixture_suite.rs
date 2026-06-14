@@ -6,8 +6,6 @@ use std::{
 
 use vox_compiler::{CompileRequest, Compiler, FrontendUnit};
 use vox_core::{
-    VoxExport,
-    external_library::ExternalLibrary,
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, HostRegistry, PackageManifest, ParameterSpec,
         Purity, TraitMethodSpec, TraitSpec, TypeSpec,
@@ -15,9 +13,9 @@ use vox_core::{
     opt::OptimizationLevel,
     source::{ModulePath, SourceText},
     types::{QualifiedTypeName, VoxType},
-    vox_fn,
 };
 use vox_runtime::infer_environment;
+use voxlib_sdk::{external_library::ExternalLibrary, vox_fn, VoxExport};
 
 use std::env;
 
@@ -52,7 +50,11 @@ fn point_distance(a: TestPoint, b: TestPoint) -> f64 {
 
 #[vox_fn(purity = "pure")]
 fn maybe_point(has: bool, x: i64, y: i64) -> Option<TestPoint> {
-    if has { Some(TestPoint { x, y }) } else { None }
+    if has {
+        Some(TestPoint { x, y })
+    } else {
+        None
+    }
 }
 
 #[vox_fn(purity = "pure")]
