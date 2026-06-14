@@ -99,6 +99,117 @@ impl Parser {
         ))
     }
 
+    pub fn parse_unit_lossy(&mut self) -> (Option<FrontendUnit>, DiagnosticBag) {
+        let package_docs = self.take_doc_comments();
+        let mut diagnostics = DiagnosticBag::default();
+        let mut synthesized_header = false;
+        let header = match self.parse_header() {
+            Ok(header) => header,
+            Err(error) => {
+                diagnostics.extend(error.into_vec());
+                self.recover_top_level_from(0);
+                synthesized_header = true;
+                SurfaceHeader {
+                    kind: ModuleKind::Script { evil: false },
+                    module: ModulePath::parse("lsp.scratch")
+                        .expect("synthetic LSP module path should be valid"),
+                    span: TextSpan::new(0, 0),
+                }
+            }
+        };
+
+        if !synthesized_header
+            && let Err(error) =
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after file header")
+        {
+            diagnostics.extend(error.into_vec());
+            self.recover_top_level_from(0);
+        }
+
+        let mut items = Vec::new();
+        let mut result = None;
+
+        while !self.at(TokenKind::Eof) {
+            let item_start = self.index;
+            let docs = self.take_doc_comments();
+            if self.at(TokenKind::Eof) {
+                break;
+            }
+
+            match self.parse_top_level_item(docs.clone(), header.kind) {
+                Ok(Some(item)) => {
+                    items.push(item);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.extend(error.into_vec());
+                    self.recover_top_level_from(item_start);
+                    continue;
+                }
+            }
+
+            if matches!(header.kind, ModuleKind::Package) {
+                diagnostics.push(
+                    Diagnostic::error("package files may contain only top-level declarations")
+                        .with_span(self.current().span.clone()),
+                );
+                self.recover_top_level_from(item_start);
+                continue;
+            }
+
+            match self.parse_script_statement() {
+                Ok(Some(statement)) => {
+                    items.push(TopLevelItem::Statement(statement));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    diagnostics.extend(error.into_vec());
+                    self.recover_top_level_from(item_start);
+                    continue;
+                }
+            }
+
+            match self.parse_expr() {
+                Ok(expr) => {
+                    if self.at(TokenKind::Eof) {
+                        result = Some(expr);
+                        break;
+                    }
+                    diagnostics.push(
+                        Diagnostic::error("unexpected tokens after top-level expression")
+                            .with_span(self.current().span.clone()),
+                    );
+                    self.recover_top_level_from(item_start);
+                }
+                Err(error) => {
+                    diagnostics.extend(error.into_vec());
+                    self.recover_top_level_from(item_start);
+                }
+            }
+        }
+
+        let end = self.current().span.end;
+        let syntax = CompilationUnit {
+            header: header.clone(),
+            items,
+            result,
+            span: TextSpan::new(header.span.start, end),
+        };
+
+        if matches!(header.kind, ModuleKind::Package) {
+            if let Err(error) = self.validate_package_items(&syntax) {
+                diagnostics.extend(error.into_vec());
+            }
+        }
+
+        (
+            Some(FrontendUnit::from_syntax_with_docs(syntax, package_docs)),
+            diagnostics,
+        )
+    }
+
     fn parse_header(&mut self) -> Result<SurfaceHeader, DiagnosticBag> {
         let start = self.current().span.start;
         let kind = if self.consume(TokenKind::Package) {
@@ -2111,6 +2222,58 @@ impl Parser {
     fn bump(&mut self) -> &Token {
         self.index += 1;
         &self.tokens[self.index - 1]
+    }
+
+    fn recover_top_level_from(&mut self, start_index: usize) {
+        let mut depth = 0usize;
+        let end_index = self.index.min(self.tokens.len());
+        for token in &self.tokens[start_index.min(end_index)..end_index] {
+            match token.kind {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+
+        while !self.at(TokenKind::Eof) {
+            if depth == 0 && self.index > start_index && self.at_top_level_start() {
+                break;
+            }
+
+            match self.current().kind {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.index += 1;
+                }
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    self.index += 1;
+                }
+                TokenKind::Semicolon if depth == 0 => {
+                    self.index += 1;
+                    break;
+                }
+                _ => {
+                    self.index += 1;
+                }
+            }
+        }
+    }
+
+    fn at_top_level_start(&self) -> bool {
+        matches!(
+            self.current().kind,
+            TokenKind::Public
+                | TokenKind::Private
+                | TokenKind::Import
+                | TokenKind::Param
+                | TokenKind::Val
+                | TokenKind::Var
+                | TokenKind::Evil
+                | TokenKind::Fun
+        )
     }
 
     fn expected_expression_message(&self) -> String {

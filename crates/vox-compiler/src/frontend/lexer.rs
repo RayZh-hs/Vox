@@ -110,7 +110,16 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    pub fn lex(mut self) -> Result<Vec<Token>, DiagnosticBag> {
+    pub fn lex(self) -> Result<Vec<Token>, DiagnosticBag> {
+        let (tokens, diagnostics) = self.lex_lossy();
+        if diagnostics.has_errors() {
+            Err(diagnostics)
+        } else {
+            Ok(tokens)
+        }
+    }
+
+    pub fn lex_lossy(mut self) -> (Vec<Token>, DiagnosticBag) {
         let mut tokens = Vec::new();
 
         while let Some(ch) = self.peek_char() {
@@ -409,11 +418,7 @@ impl<'a> Lexer<'a> {
             span: TextSpan::new(self.absolute_offset(), self.absolute_offset()),
         });
 
-        if self.diagnostics.has_errors() {
-            Err(self.diagnostics)
-        } else {
-            Ok(tokens)
-        }
+        (tokens, self.diagnostics)
     }
 
     fn lex_string(&mut self, start: usize) -> TokenKind {

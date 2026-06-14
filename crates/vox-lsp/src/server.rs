@@ -38,12 +38,16 @@ fn collect_diagnostics(
     libraries: &LspLibraries,
 ) -> Option<Vec<Diagnostic>> {
     let source_text = SourceText::new(path, 0, source);
-    let result = frontend::analyze_source(&source_text);
+    let analysis = frontend::analyze_source_lossy(&source_text);
 
-    let mut diagnostics = match result {
-        Ok(unit) => collect_semantic_diagnostics(source, &unit, &libraries.manifests),
-        Err(bag) => convert_diagnostics(&source_text.text, bag),
-    };
+    let mut diagnostics = convert_diagnostics(&source_text.text, analysis.diagnostics);
+    if let Some(unit) = analysis.unit.as_ref() {
+        diagnostics.extend(collect_semantic_diagnostics(
+            source,
+            unit,
+            &libraries.manifests,
+        ));
+    }
 
     diagnostics.extend(collect_library_load_diagnostics(source, libraries));
     let doc_warnings = collect_docstring_warnings(source);
@@ -346,7 +350,7 @@ fn collect_docstring_warnings(source: &str) -> Vec<Diagnostic> {
     };
 
     let source_text = SourceText::new("", 0, source);
-    let unit = frontend::analyze_source(&source_text).ok();
+    let unit = frontend::analyze_source_lossy(&source_text).unit;
 
     let mut warnings = Vec::new();
     let mut depth = 0u32;
@@ -531,9 +535,7 @@ const TOKEN_OPERATOR: u32 = 5;
 fn compute_semantic_tokens(source: &str) -> Vec<SemanticToken> {
     use vox_compiler::frontend::lexer::{Lexer, TokenKind};
 
-    let Ok(tokens) = Lexer::new(source, 0).lex() else {
-        return Vec::new();
-    };
+    let (tokens, _) = Lexer::new(source, 0).lex_lossy();
 
     let mut result = Vec::new();
     let mut prev_line: u32 = 0;
@@ -644,7 +646,7 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
     use vox_compiler::frontend::ast::TopLevelItem;
 
     let source_text = SourceText::new("", 0, source);
-    let Ok(unit) = frontend::analyze_source(&source_text) else {
+    let Some(unit) = frontend::analyze_source_lossy(&source_text).unit else {
         return Vec::new();
     };
 
@@ -1836,7 +1838,7 @@ fn find_call_at_offset(
 fn compute_signature_help(source: &str, position: Position) -> Option<SignatureHelp> {
     use vox_compiler::frontend::ast::*;
     let source_text = SourceText::new("", 0, source);
-    let unit = frontend::analyze_source(&source_text).ok()?;
+    let unit = frontend::analyze_source_lossy(&source_text).unit?;
     let offset = position_to_byte_offset(source, position);
     let call_info = find_call_at_offset(&unit, offset)?;
 
@@ -1916,7 +1918,7 @@ fn try_dot_completion(source: &str, position: Position) -> Option<Vec<Completion
     // Try to parse the prefix (source up to the dot, excluding the dot and trailing content)
     // We use the prefix before the dot to avoid the incomplete dot access parsing error
     let source_text = SourceText::new("", 0, prefix_before_dot);
-    let unit = frontend::analyze_source(&source_text).ok()?;
+    let unit = frontend::analyze_source_lossy(&source_text).unit?;
     let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
 
     // Resolve the first segment in bindings
@@ -2048,7 +2050,7 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
     use vox_compiler::frontend::ast::*;
 
     let source_text = SourceText::new("", 0, source);
-    let unit = frontend::analyze_source(&source_text).ok()?;
+    let unit = frontend::analyze_source_lossy(&source_text).unit?;
 
     let mut names: BTreeMap<String, CompletionItemKind> = BTreeMap::new();
 
@@ -2138,7 +2140,7 @@ fn compute_goto_definition(
     position: Position,
 ) -> Option<GotoDefinitionResponse> {
     let source_text = SourceText::new("", 0, source);
-    let unit = frontend::analyze_source(&source_text).ok()?;
+    let unit = frontend::analyze_source_lossy(&source_text).unit?;
     let offset = position_to_byte_offset(source, position);
     let name = find_name_at_offset(&unit, source, offset)?;
     let symbols = build_symbol_table(&unit);
@@ -2151,10 +2153,9 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
     let offset = position_to_byte_offset(source, position);
     let source_text = SourceText::new("", 0, source);
 
-    let (unit, parse_diags) = match frontend::analyze_source(&source_text) {
-        Ok(unit) => (Some(unit), DiagnosticBag::default()),
-        Err(bag) => (None, bag),
-    };
+    let analysis = frontend::analyze_source_lossy(&source_text);
+    let unit = analysis.unit;
+    let parse_diags = analysis.diagnostics;
 
     let env = unit
         .as_ref()
@@ -3045,9 +3046,8 @@ impl LanguageServer for VoxLanguageServer {
         };
 
         let source_text = SourceText::new("", 0, &text);
-        let unit = match frontend::analyze_source(&source_text) {
-            Ok(u) => u,
-            Err(_) => return Ok(None),
+        let Some(unit) = frontend::analyze_source_lossy(&source_text).unit else {
+            return Ok(None);
         };
 
         let offset = position_to_byte_offset(&text, params.text_document_position.position);
