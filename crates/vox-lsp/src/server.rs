@@ -360,7 +360,7 @@ fn collect_docstring_warnings(source: &str) -> Vec<Diagnostic> {
         let token = &tokens[i];
         match &token.kind {
             TokenKind::DocComment(_) => {
-                if is_valid_doc_comment(&tokens, i, depth, &unit) {
+                if is_valid_doc_comment(source, &tokens, i, depth, &unit) {
                     i += 1;
                     continue;
                 }
@@ -384,6 +384,7 @@ fn collect_docstring_warnings(source: &str) -> Vec<Diagnostic> {
 }
 
 fn is_valid_doc_comment(
+    source: &str,
     tokens: &[vox_compiler::frontend::lexer::Token],
     pos: usize,
     depth: u32,
@@ -404,6 +405,20 @@ fn is_valid_doc_comment(
         }
         if is_doc_inside_span(span, &unit.header.span) {
             return true;
+        }
+        for item in &unit.syntax.items {
+            if matches!(
+                item,
+                vox_compiler::frontend::ast::TopLevelItem::Value(_)
+                    | vox_compiler::frontend::ast::TopLevelItem::Param(_)
+            ) {
+                let item_span = item_span(item);
+                if span.start >= item_span.end
+                    && is_same_source_line(source, item_span.end, span.start)
+                {
+                    return true;
+                }
+            }
         }
         if pos == 0 {
             return true;
@@ -450,6 +465,12 @@ fn is_doc_inside_span(
     decl_span: &vox_core::diagnostics::TextSpan,
 ) -> bool {
     doc_span.start >= decl_span.start && doc_span.end <= decl_span.end
+}
+
+fn is_same_source_line(source: &str, left: usize, right: usize) -> bool {
+    let start = left.min(right).min(source.len());
+    let end = left.max(right).min(source.len());
+    !source[start..end].contains('\n')
 }
 
 fn convert_diagnostic(source: &str, diag: vox_core::diagnostics::Diagnostic) -> Diagnostic {
@@ -2503,7 +2524,7 @@ fn build_hover_decls(
     ) {
         match item {
             BlockItem::LocalValue(value) => {
-                declarations.extend(local_value_hover_decl(source, value, env, Vec::new()));
+                declarations.extend(local_value_hover_decl(source, value, env, None));
                 walk_expr(source, &value.initializer, env, declarations);
             }
             BlockItem::Assignment(assignment) => {
@@ -2535,10 +2556,7 @@ fn build_hover_decls(
                         span: function.span.clone(),
                         name_span,
                         signature: function_hover_signature(function, env),
-                        docs: declaration_docs(
-                            function.docs.iter().map(String::as_str),
-                            collect_function_body_docs(source, function),
-                        ),
+                        docs: function_docs(source, function),
                     });
                 }
                 for parameter in &function.parameters {
@@ -2577,10 +2595,7 @@ fn build_hover_decls(
                             parameter.name,
                             parameter.ty.to_source_string()
                         ),
-                        docs: declaration_docs(
-                            parameter.docs.iter().map(String::as_str),
-                            Vec::new(),
-                        ),
+                        docs: declaration_docs_for_span(source, &parameter.span, false),
                     });
                 }
                 if let Some(ref default) = parameter.default {
@@ -2606,10 +2621,7 @@ fn value_hover_decl(
     value: &vox_compiler::frontend::ast::ValueDecl,
     env: Option<&vox_runtime::TypeEnvironment>,
 ) -> Option<HoverDecl> {
-    let docs = declaration_docs(
-        value.docs.iter().map(String::as_str),
-        collect_value_trailing_docs(source, &value.span),
-    );
+    let docs = declaration_docs_for_span(source, &value.span, true);
     local_like_hover_decl(
         source,
         &value.name,
@@ -2624,8 +2636,9 @@ fn local_value_hover_decl(
     source: &str,
     value: &vox_compiler::frontend::ast::LocalValueDecl,
     env: Option<&vox_runtime::TypeEnvironment>,
-    docs: Vec<String>,
+    docs: Option<Vec<String>>,
 ) -> Option<HoverDecl> {
+    let docs = docs.unwrap_or_else(|| declaration_docs_for_span(source, &value.span, true));
     local_like_hover_decl(
         source,
         &value.name,
@@ -2742,26 +2755,6 @@ fn function_hover_signature(
     )
 }
 
-fn declaration_docs<'a>(
-    head_docs: impl IntoIterator<Item = &'a str>,
-    body_docs: Vec<String>,
-) -> Vec<String> {
-    head_docs
-        .into_iter()
-        .map(clean_doc_line)
-        .chain(body_docs.iter().map(|line| clean_doc_line(line)))
-        .filter(|line| !line.is_empty())
-        .collect()
-}
-
-fn clean_doc_line(line: &str) -> String {
-    line.trim()
-        .strip_prefix("///")
-        .unwrap_or_else(|| line.trim())
-        .trim()
-        .to_owned()
-}
-
 fn find_identifier_span_in(
     source: &str,
     span: &vox_core::diagnostics::TextSpan,
@@ -2849,19 +2842,155 @@ fn collect_function_body_docs(
     docs
 }
 
-fn collect_value_trailing_docs(
+fn function_docs(
+    source: &str,
+    function: &vox_compiler::frontend::ast::FunctionDecl,
+) -> Vec<String> {
+    join_doc_blocks([
+        collect_head_doc_block(
+            source,
+            declaration_leading_start(source, function.span.start),
+        ),
+        clean_doc_block(collect_function_body_docs(source, function)),
+    ])
+}
+
+fn declaration_docs_for_span(
+    source: &str,
+    span: &vox_core::diagnostics::TextSpan,
+    include_trailing: bool,
+) -> Vec<String> {
+    let mut blocks = vec![collect_head_doc_block(
+        source,
+        declaration_leading_start(source, span.start),
+    )];
+    if include_trailing {
+        blocks.push(collect_same_line_trailing_doc_block(source, span));
+    }
+    join_doc_blocks(blocks)
+}
+
+fn declaration_leading_start(source: &str, keyword_start: usize) -> usize {
+    use vox_compiler::frontend::lexer::{Lexer, TokenKind};
+
+    let prefix_end = keyword_start.min(source.len());
+    let Ok(tokens) = Lexer::new(&source[..prefix_end], 0).lex() else {
+        return keyword_start;
+    };
+    let Some(previous) = tokens
+        .iter()
+        .rev()
+        .find(|token| !matches!(token.kind, TokenKind::Eof))
+    else {
+        return keyword_start;
+    };
+    let modifier_touches_keyword = source[previous.span.end..prefix_end]
+        .chars()
+        .all(char::is_whitespace);
+
+    if modifier_touches_keyword
+        && matches!(previous.kind, TokenKind::Public | TokenKind::Private)
+        && is_line_leading(source, previous.span.start)
+    {
+        previous.span.start
+    } else {
+        keyword_start
+    }
+}
+
+fn collect_head_doc_block(source: &str, declaration_start: usize) -> Vec<String> {
+    use vox_compiler::frontend::lexer::{Lexer, TokenKind};
+
+    let prefix_end = declaration_start.min(source.len());
+    let Ok(tokens) = Lexer::new(&source[..prefix_end], 0).lex() else {
+        return Vec::new();
+    };
+
+    let mut lines = Vec::new();
+    let mut next_start = prefix_end;
+    for token in tokens
+        .iter()
+        .rev()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof))
+    {
+        let gap = &source[token.span.end..next_start];
+        if !gap.chars().all(char::is_whitespace) || gap.chars().filter(|&c| c == '\n').count() > 1 {
+            break;
+        }
+
+        match &token.kind {
+            TokenKind::DocComment(text) if is_line_leading(source, token.span.start) => {
+                lines.push(text.clone());
+                next_start = token.span.start;
+            }
+            _ => break,
+        }
+    }
+
+    lines.reverse();
+    clean_doc_block(lines)
+}
+
+fn collect_same_line_trailing_doc_block(
     source: &str,
     span: &vox_core::diagnostics::TextSpan,
 ) -> Vec<String> {
-    let decl_str = &source[span.start..span.end];
-    let after_last_semi = decl_str.rfind(';').map(|i| i + 1).unwrap_or(0);
-    let rest = &decl_str[after_last_semi..];
-    let trimmed = rest.trim();
-    if trimmed.starts_with("///") {
-        vec![trimmed.to_string()]
+    let start = span.end.min(source.len());
+    let line_end = source[start..]
+        .find('\n')
+        .map(|relative| start + relative)
+        .unwrap_or(source.len());
+    let rest = &source[start..line_end];
+    let trimmed = rest.trim_start();
+    if let Some(text) = trimmed.strip_prefix("///") {
+        clean_doc_block(vec![text.to_owned()])
     } else {
         Vec::new()
     }
+}
+
+fn clean_doc_block(lines: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut lines = lines
+        .into_iter()
+        .map(|line| clean_doc_line(&line))
+        .collect::<Vec<_>>();
+
+    while lines.first().is_some_and(|line| line.is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+fn clean_doc_line(line: &str) -> String {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("///")
+        .unwrap_or(trimmed)
+        .trim()
+        .to_owned()
+}
+
+fn join_doc_blocks(blocks: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
+    let mut docs: Vec<String> = Vec::new();
+    for block in blocks {
+        if block.is_empty() {
+            continue;
+        }
+        if !docs.is_empty() && docs.last().is_some_and(|line| !line.is_empty()) {
+            docs.push(String::new());
+        }
+        docs.extend(block);
+    }
+    docs
+}
+
+fn is_line_leading(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
+    source[line_start..offset].chars().all(char::is_whitespace)
 }
 
 #[tower_lsp::async_trait]
