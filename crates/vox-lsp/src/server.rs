@@ -2163,26 +2163,11 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(ref unit) = unit {
-        if let Some(hover_line) = build_decl_hover_line(source, unit, offset) {
-            parts.push(format!("```vox\n{}\n```", hover_line));
-        }
-    }
-
-    let head_docs = unit
-        .as_ref()
-        .and_then(|u| find_head_docs_at_offset(u, offset));
-    let body_docs = unit
-        .as_ref()
-        .and_then(|u| find_body_docs(source, u, offset));
-
-    if let Some(ref docs) = head_docs {
-        for line in docs {
-            parts.push(line.clone());
-        }
-    }
-    if let Some(ref docs) = body_docs {
-        for line in docs {
-            parts.push(line.clone());
+        if let Some(decl) = find_hover_decl(source, unit, env.as_ref(), offset) {
+            parts.push(format!("```vox\n{}\n```", decl.signature));
+            for line in decl.docs {
+                parts.push(line);
+            }
         }
     }
 
@@ -2283,71 +2268,551 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
     })
 }
 
+#[derive(Debug, Clone)]
+struct HoverDecl {
+    name: String,
+    span: vox_core::diagnostics::TextSpan,
+    name_span: vox_core::diagnostics::TextSpan,
+    signature: String,
+    docs: Vec<String>,
+}
+
+fn find_hover_decl(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    env: Option<&vox_runtime::TypeEnvironment>,
+    offset: usize,
+) -> Option<HoverDecl> {
+    let declarations = build_hover_decls(source, unit, env);
+
+    if let Some(decl) = declarations
+        .iter()
+        .find(|decl| offset >= decl.name_span.start && offset < decl.name_span.end)
+    {
+        return Some(decl.clone());
+    }
+
+    let name = find_name_at_offset(unit, source, offset)?;
+    let symbols = build_symbol_table(unit);
+    let target_span = symbols.get(&name)?;
+
+    declarations
+        .into_iter()
+        .find(|decl| decl.name == name && spans_equal(&decl.span, target_span))
+}
+
+fn build_hover_decls(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    env: Option<&vox_runtime::TypeEnvironment>,
+) -> Vec<HoverDecl> {
+    use vox_compiler::frontend::ast::*;
+
+    let mut declarations = Vec::new();
+
+    fn walk_expr(
+        source: &str,
+        expr: &Expr,
+        env: Option<&vox_runtime::TypeEnvironment>,
+        declarations: &mut Vec<HoverDecl>,
+    ) {
+        match &expr.kind {
+            ExprKind::Block(block) => walk_block(source, block, env, declarations),
+            ExprKind::If(if_expr) => {
+                for branch in &if_expr.branches {
+                    walk_expr(source, &branch.condition, env, declarations);
+                    walk_block(source, &branch.body, env, declarations);
+                }
+                if let Some(ref else_branch) = if_expr.else_branch {
+                    walk_block(source, else_branch, env, declarations);
+                }
+            }
+            ExprKind::When(when_expr) => {
+                walk_expr(source, &when_expr.subject, env, declarations);
+                for arm in &when_expr.arms {
+                    if let Some(ref binding) = arm.binding {
+                        if let Some(name_span) = find_identifier_span_in(source, &arm.span, binding)
+                        {
+                            let ty = env
+                                .and_then(|env| env.find_type_at_offset(arm.body.span.start))
+                                .map(|ty| ty.render())
+                                .unwrap_or_else(|| "Unknown".to_owned());
+                            declarations.push(HoverDecl {
+                                name: binding.clone(),
+                                span: arm.span.clone(),
+                                name_span,
+                                signature: format!("val {binding}: {ty}"),
+                                docs: Vec::new(),
+                            });
+                        }
+                    }
+                    walk_expr(source, &arm.body, env, declarations);
+                }
+                if let Some(ref else_arm) = when_expr.else_arm {
+                    walk_expr(source, else_arm, env, declarations);
+                }
+            }
+            ExprKind::For(for_expr) => {
+                use vox_compiler::frontend::ast::ForHeader;
+                if let Some(ref init) = for_expr.init {
+                    walk_block_item(source, init.as_ref(), env, declarations);
+                }
+                match &for_expr.header {
+                    ForHeader::In { pattern, iterable } => {
+                        walk_expr(source, iterable, env, declarations);
+                        if let Some(name_span) =
+                            find_identifier_span_in(source, &for_expr.span, pattern)
+                        {
+                            let ty = env
+                                .and_then(|env| env.find_type_at_offset(iterable.span.start))
+                                .map(|ty| ty.render())
+                                .unwrap_or_else(|| "Unknown".to_owned());
+                            declarations.push(HoverDecl {
+                                name: pattern.clone(),
+                                span: for_expr.body.span.clone(),
+                                name_span,
+                                signature: format!("val {pattern}: {ty}"),
+                                docs: Vec::new(),
+                            });
+                        }
+                    }
+                    ForHeader::Condition(condition) => {
+                        walk_expr(source, condition, env, declarations)
+                    }
+                }
+                walk_block(source, &for_expr.body, env, declarations);
+            }
+            ExprKind::Lambda(lambda) => {
+                for parameter in &lambda.parameters {
+                    if let Some(name_span) =
+                        find_identifier_span_in(source, &parameter.span, &parameter.name)
+                    {
+                        let ty = parameter
+                            .ty
+                            .as_ref()
+                            .map(TypeSyntax::to_source_string)
+                            .unwrap_or_else(|| "Unknown".to_owned());
+                        declarations.push(HoverDecl {
+                            name: parameter.name.clone(),
+                            span: parameter.span.clone(),
+                            name_span,
+                            signature: format!("param {}: {ty}", parameter.name),
+                            docs: Vec::new(),
+                        });
+                    }
+                }
+                walk_expr(source, &lambda.body, env, declarations);
+            }
+            ExprKind::Call { callee, arguments } => {
+                walk_expr(source, callee, env, declarations);
+                for argument in arguments {
+                    walk_argument(source, argument, env, declarations);
+                }
+            }
+            ExprKind::ReceiverCall {
+                receiver,
+                arguments,
+                ..
+            } => {
+                walk_expr(source, receiver, env, declarations);
+                for argument in arguments {
+                    walk_argument(source, argument, env, declarations);
+                }
+            }
+            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                for item in items {
+                    walk_expr(source, item, env, declarations);
+                }
+            }
+            ExprKind::Record(fields) => {
+                for field in fields {
+                    walk_expr(source, &field.value, env, declarations);
+                }
+            }
+            ExprKind::Index { target, index } => {
+                walk_expr(source, target, env, declarations);
+                walk_expr(source, index, env, declarations);
+            }
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::NonNull { target } => walk_expr(source, target, env, declarations),
+            ExprKind::Unary { expr: inner, .. } => walk_expr(source, inner, env, declarations),
+            ExprKind::Binary { left, right, .. } => {
+                walk_expr(source, left, env, declarations);
+                walk_expr(source, right, env, declarations);
+            }
+            ExprKind::Range(range) => {
+                if let Some(ref start) = range.start {
+                    walk_expr(source, start, env, declarations);
+                }
+                if let Some(ref end) = range.end {
+                    walk_expr(source, end, env, declarations);
+                }
+            }
+            ExprKind::Intrinsic(intr) => match intr {
+                IntrinsicExpr::Updated(updated) => {
+                    walk_expr(source, &updated.target, env, declarations);
+                    for update in &updated.updates {
+                        walk_expr(source, &update.value, env, declarations);
+                    }
+                }
+                IntrinsicExpr::Econ(econ) => walk_block(source, &econ.body, env, declarations),
+            },
+            ExprKind::Name(_)
+            | ExprKind::Integer(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::String(_) => {}
+        }
+    }
+
+    fn walk_argument(
+        source: &str,
+        argument: &Argument,
+        env: Option<&vox_runtime::TypeEnvironment>,
+        declarations: &mut Vec<HoverDecl>,
+    ) {
+        match argument {
+            Argument::Positional(expr) | Argument::Named { value: expr, .. } => {
+                walk_expr(source, expr, env, declarations);
+            }
+        }
+    }
+
+    fn walk_block(
+        source: &str,
+        block: &BlockExpr,
+        env: Option<&vox_runtime::TypeEnvironment>,
+        declarations: &mut Vec<HoverDecl>,
+    ) {
+        for item in &block.items {
+            walk_block_item(source, item, env, declarations);
+        }
+        if let Some(ref trailing) = block.trailing {
+            walk_expr(source, trailing, env, declarations);
+        }
+    }
+
+    fn walk_block_item(
+        source: &str,
+        item: &BlockItem,
+        env: Option<&vox_runtime::TypeEnvironment>,
+        declarations: &mut Vec<HoverDecl>,
+    ) {
+        match item {
+            BlockItem::LocalValue(value) => {
+                declarations.extend(local_value_hover_decl(source, value, env, Vec::new()));
+                walk_expr(source, &value.initializer, env, declarations);
+            }
+            BlockItem::Assignment(assignment) => {
+                walk_expr(source, &assignment.value, env, declarations)
+            }
+            BlockItem::CompoundAssignment(assignment) => {
+                walk_expr(source, &assignment.value, env, declarations)
+            }
+            BlockItem::Return(statement) => {
+                if let Some(ref value) = statement.value {
+                    walk_expr(source, value, env, declarations);
+                }
+            }
+            BlockItem::Panic(_) | BlockItem::Break(_) | BlockItem::Continue(_) => {}
+            BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
+                walk_expr(source, expr, env, declarations);
+            }
+        }
+    }
+
+    for item in &unit.syntax.items {
+        match item {
+            TopLevelItem::Function(function) => {
+                if let Some(name_span) =
+                    find_identifier_span_in(source, &function.span, &function.name)
+                {
+                    declarations.push(HoverDecl {
+                        name: function.name.clone(),
+                        span: function.span.clone(),
+                        name_span,
+                        signature: function_hover_signature(function, env),
+                        docs: declaration_docs(
+                            function.docs.iter().map(String::as_str),
+                            collect_function_body_docs(source, function),
+                        ),
+                    });
+                }
+                for parameter in &function.parameters {
+                    if let Some(name_span) =
+                        find_identifier_span_in(source, &parameter.span, &parameter.name)
+                    {
+                        let ty = parameter.ty.to_source_string();
+                        declarations.push(HoverDecl {
+                            name: parameter.name.clone(),
+                            span: parameter.span.clone(),
+                            name_span,
+                            signature: format!("param {}: {ty}", parameter.name),
+                            docs: Vec::new(),
+                        });
+                    }
+                    if let Some(ref default) = parameter.default {
+                        walk_expr(source, default, env, &mut declarations);
+                    }
+                }
+                walk_expr(source, &function.body, env, &mut declarations);
+            }
+            TopLevelItem::Value(value) => {
+                declarations.extend(value_hover_decl(source, value, env));
+                walk_expr(source, &value.initializer, env, &mut declarations);
+            }
+            TopLevelItem::Param(parameter) => {
+                if let Some(name_span) =
+                    find_identifier_span_in(source, &parameter.span, &parameter.name)
+                {
+                    declarations.push(HoverDecl {
+                        name: parameter.name.clone(),
+                        span: parameter.span.clone(),
+                        name_span,
+                        signature: format!(
+                            "param {}: {}",
+                            parameter.name,
+                            parameter.ty.to_source_string()
+                        ),
+                        docs: declaration_docs(
+                            parameter.docs.iter().map(String::as_str),
+                            Vec::new(),
+                        ),
+                    });
+                }
+                if let Some(ref default) = parameter.default {
+                    walk_expr(source, default, env, &mut declarations);
+                }
+            }
+            TopLevelItem::Import(_) => {}
+            TopLevelItem::Statement(statement) => {
+                walk_block_item(source, statement, env, &mut declarations);
+            }
+        }
+    }
+
+    if let Some(ref result) = unit.syntax.result {
+        walk_expr(source, result, env, &mut declarations);
+    }
+
+    declarations
+}
+
+fn value_hover_decl(
+    source: &str,
+    value: &vox_compiler::frontend::ast::ValueDecl,
+    env: Option<&vox_runtime::TypeEnvironment>,
+) -> Option<HoverDecl> {
+    let docs = declaration_docs(
+        value.docs.iter().map(String::as_str),
+        collect_value_trailing_docs(source, &value.span),
+    );
+    local_like_hover_decl(
+        source,
+        &value.name,
+        &value.span,
+        value.mutability,
+        env,
+        docs,
+    )
+}
+
+fn local_value_hover_decl(
+    source: &str,
+    value: &vox_compiler::frontend::ast::LocalValueDecl,
+    env: Option<&vox_runtime::TypeEnvironment>,
+    docs: Vec<String>,
+) -> Option<HoverDecl> {
+    local_like_hover_decl(
+        source,
+        &value.name,
+        &value.span,
+        value.mutability,
+        env,
+        docs,
+    )
+}
+
+fn local_like_hover_decl(
+    source: &str,
+    name: &str,
+    span: &vox_core::diagnostics::TextSpan,
+    mutability: vox_compiler::frontend::ast::Mutability,
+    env: Option<&vox_runtime::TypeEnvironment>,
+    docs: Vec<String>,
+) -> Option<HoverDecl> {
+    let name_span = find_identifier_span_in(source, span, name)?;
+    let ty = env
+        .and_then(|env| env.find_type_at_offset(span.start))
+        .map(|ty| ty.render())
+        .unwrap_or_else(|| "Unknown".to_owned());
+    let keyword = match mutability {
+        vox_compiler::frontend::ast::Mutability::Val => "val",
+        vox_compiler::frontend::ast::Mutability::Var => "var",
+    };
+
+    Some(HoverDecl {
+        name: name.to_owned(),
+        span: span.clone(),
+        name_span,
+        signature: format!("{keyword} {name}: {ty}"),
+        docs,
+    })
+}
+
+fn function_hover_signature(
+    function: &vox_compiler::frontend::ast::FunctionDecl,
+    env: Option<&vox_runtime::TypeEnvironment>,
+) -> String {
+    if let Some(summary) =
+        env.and_then(|env| env.functions.iter().find(|f| f.name == function.name))
+    {
+        let generics = if summary.generic_parameters.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "[{}]",
+                summary
+                    .generic_parameters
+                    .iter()
+                    .map(|parameter| format!("{}: {}", parameter.name, parameter.bound))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let parameters = summary
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let default = if parameter.has_default { " = ..." } else { "" };
+                format!("{}: {}{default}", parameter.name, parameter.ty.render())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let effect = if summary.evil { "evil " } else { "" };
+        return format!(
+            "{effect}fun {}{generics}({parameters}) -> {}",
+            summary.name,
+            summary.return_type.render()
+        );
+    }
+
+    let generics = if function.generic_parameters.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "[{}]",
+            function
+                .generic_parameters
+                .iter()
+                .map(|parameter| format!("{}: {}", parameter.name, parameter.bound))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let parameters = function
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let default = if parameter.default.is_some() {
+                " = ..."
+            } else {
+                ""
+            };
+            format!(
+                "{}: {}{default}",
+                parameter.name,
+                parameter.ty.to_source_string()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let effect = if function.evil { "evil " } else { "" };
+    let result = function
+        .return_type
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string)
+        .unwrap_or_else(|| "Unknown".to_owned());
+    format!(
+        "{effect}fun {}{generics}({parameters}) -> {result}",
+        function.name
+    )
+}
+
+fn declaration_docs<'a>(
+    head_docs: impl IntoIterator<Item = &'a str>,
+    body_docs: Vec<String>,
+) -> Vec<String> {
+    head_docs
+        .into_iter()
+        .map(clean_doc_line)
+        .chain(body_docs.iter().map(|line| clean_doc_line(line)))
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn clean_doc_line(line: &str) -> String {
+    line.trim()
+        .strip_prefix("///")
+        .unwrap_or_else(|| line.trim())
+        .trim()
+        .to_owned()
+}
+
+fn find_identifier_span_in(
+    source: &str,
+    span: &vox_core::diagnostics::TextSpan,
+    name: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::lexer::{Lexer, TokenKind};
+
+    let end = span.end.min(source.len());
+    let mut search_start = span.start.min(end);
+
+    if let Ok(tokens) = Lexer::new(&source[search_start..end], search_start).lex() {
+        for token in tokens {
+            if let TokenKind::Identifier(identifier) = token.kind {
+                if identifier == name {
+                    return Some(token.span);
+                }
+            }
+        }
+    }
+
+    while let Some(relative) = source[search_start..end].find(name) {
+        let start = search_start + relative;
+        let candidate_end = start + name.len();
+        let before = start
+            .checked_sub(1)
+            .and_then(|idx| source.as_bytes().get(idx))
+            .copied();
+        let after = source.as_bytes().get(candidate_end).copied();
+        let before_ok = before.is_none_or(|b| !is_ident_byte(b));
+        let after_ok = after.is_none_or(|b| !is_ident_byte(b));
+        if before_ok && after_ok {
+            return Some(vox_core::diagnostics::TextSpan::new(start, candidate_end));
+        }
+        search_start = candidate_end;
+    }
+
+    None
+}
+
+fn spans_equal(
+    left: &vox_core::diagnostics::TextSpan,
+    right: &vox_core::diagnostics::TextSpan,
+) -> bool {
+    left.start == right.start && left.end == right.end
+}
+
 fn severity_label(severity: vox_core::diagnostics::Severity) -> &'static str {
     match severity {
         vox_core::diagnostics::Severity::Note => "Note",
         vox_core::diagnostics::Severity::Warning => "Warning",
         vox_core::diagnostics::Severity::Error => "Error",
     }
-}
-
-fn build_decl_hover_line(
-    source: &str,
-    unit: &vox_compiler::frontend::ast::FrontendUnit,
-    offset: usize,
-) -> Option<String> {
-    use vox_compiler::frontend::ast::*;
-
-    for item in &unit.syntax.items {
-        match item {
-            TopLevelItem::Function(f) => {
-                if offset >= f.span.start && offset < f.span.end {
-                    return Some(extract_source_line(source, f.span.start, f.span.end));
-                }
-            }
-            TopLevelItem::Value(v) => {
-                if offset >= v.span.start && offset < v.span.end {
-                    return Some(extract_source_line(source, v.span.start, v.span.end));
-                }
-            }
-            TopLevelItem::Param(p) => {
-                if offset >= p.span.start && offset < p.span.end {
-                    return Some(extract_source_line(source, p.span.start, p.span.end));
-                }
-            }
-            TopLevelItem::Import(i) => {
-                if offset >= i.span.start && offset < i.span.end {
-                    return Some(extract_source_line(source, i.span.start, i.span.end));
-                }
-            }
-            TopLevelItem::Statement(s) => {
-                let span = block_item_span(s);
-                if offset >= span.start && offset < span.end {
-                    return Some(extract_source_line(source, span.start, span.end));
-                }
-            }
-        }
-    }
-
-    if offset >= unit.header.span.start && offset < unit.header.span.end {
-        return Some(extract_source_line(
-            source,
-            unit.header.span.start,
-            unit.header.span.end,
-        ));
-    }
-
-    if let Some(ref result) = unit.syntax.result {
-        if offset >= result.span.start && offset < result.span.end {
-            return Some(extract_source_line(
-                source,
-                result.span.start,
-                result.span.end,
-            ));
-        }
-    }
-
-    None
 }
 
 fn block_item_span(
@@ -2364,90 +2829,6 @@ fn block_item_span(
         BlockItem::Continue(c) => c.span.clone(),
         BlockItem::BlockStatement(e) | BlockItem::Expr(e) => e.span.clone(),
     }
-}
-
-fn extract_source_line(source: &str, start: usize, end: usize) -> String {
-    let start = start.min(source.len());
-    let end = end.min(source.len());
-
-    let line_start = source[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line_end = source[end..]
-        .find('\n')
-        .map(|i| end + i)
-        .unwrap_or(source.len());
-
-    source[line_start..line_end].trim_end().to_string()
-}
-
-fn find_head_docs_at_offset(
-    unit: &vox_compiler::frontend::ast::FrontendUnit,
-    offset: usize,
-) -> Option<Vec<String>> {
-    use vox_compiler::frontend::ast::*;
-
-    for item in &unit.syntax.items {
-        match item {
-            TopLevelItem::Function(f) => {
-                if offset >= f.span.start && offset < f.span.end && !f.docs.is_empty() {
-                    return Some(f.docs.iter().map(|d| d.trim_end().to_string()).collect());
-                }
-            }
-            TopLevelItem::Value(v) => {
-                if offset >= v.span.start && offset < v.span.end && !v.docs.is_empty() {
-                    return Some(v.docs.iter().map(|d| d.trim_end().to_string()).collect());
-                }
-            }
-            TopLevelItem::Param(p) => {
-                if offset >= p.span.start && offset < p.span.end && !p.docs.is_empty() {
-                    return Some(p.docs.iter().map(|d| d.trim_end().to_string()).collect());
-                }
-            }
-            TopLevelItem::Import(i) => {
-                if offset >= i.span.start && offset < i.span.end && !i.docs.is_empty() {
-                    return Some(i.docs.iter().map(|d| d.trim_end().to_string()).collect());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if offset >= unit.header.span.start && offset < unit.header.span.end && !unit.docs.is_empty() {
-        return Some(unit.docs.iter().map(|d| d.trim_end().to_string()).collect());
-    }
-
-    None
-}
-
-fn find_body_docs(
-    source: &str,
-    unit: &vox_compiler::frontend::ast::FrontendUnit,
-    offset: usize,
-) -> Option<Vec<String>> {
-    use vox_compiler::frontend::ast::*;
-
-    for item in &unit.syntax.items {
-        match item {
-            TopLevelItem::Function(f) => {
-                if offset >= f.span.start && offset < f.span.end {
-                    let body_docs = collect_function_body_docs(source, f);
-                    if !body_docs.is_empty() {
-                        return Some(body_docs);
-                    }
-                }
-            }
-            TopLevelItem::Value(v) => {
-                if offset >= v.span.start && offset < v.span.end {
-                    let trailing = collect_value_trailing_docs(source, &v.span);
-                    if !trailing.is_empty() {
-                        return Some(trailing);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
 }
 
 fn collect_function_body_docs(

@@ -367,7 +367,7 @@ impl Parser {
         let start = self.current().span.start;
         self.expect_simple(TokenKind::Param, "expected `param`")?;
         let (name, _) = self.expect_identifier("expected parameter name")?;
-        self.expect_simple(TokenKind::Colon, "expected `:` after parameter name")?;
+        self.expect_simple(TokenKind::Colon, "parameters must be explicitedly typed")?;
         let ty = self.parse_type()?;
         let default = if self.consume(TokenKind::Assign) {
             Some(self.parse_expr()?)
@@ -531,7 +531,7 @@ impl Parser {
         while !self.at(TokenKind::RParen) {
             let start = self.current().span.start;
             let (name, _) = self.expect_identifier("expected parameter name")?;
-            self.expect_simple(TokenKind::Colon, "expected `:` after parameter name")?;
+            self.expect_simple(TokenKind::Colon, "parameters must be explicitedly typed")?;
             let ty = self.parse_type()?;
             let default = if self.consume(TokenKind::Assign) {
                 Some(self.parse_expr()?)
