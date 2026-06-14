@@ -6,17 +6,21 @@ use std::{
 use vox_core::{
     diagnostics::DiagnosticBag,
     external_library::{ExternalLibraryHeader, MINIMAL_WASM_MODULE, encode_external_library_file},
-    host::{HostRegistry, PackageManifest, Purity},
+    host::{
+        FunctionExportKind, FunctionSpec, HostRegistry, PackageManifest, ParameterSpec, Purity,
+        ValueSpec,
+    },
     ids::ArtifactId,
     opt::{OptimizationLevel, OptimizationSubject},
     plan::{CompiledArtifact, DependencyFingerprint, ExecutablePlan},
-    source::SourceText,
+    source::{ModulePath, SourceText},
+    types::VoxType,
 };
 
 use crate::backend::BackendPipeline;
+use crate::frontend::ast::{FunctionDecl, TopLevelItem, ValueDecl, Visibility};
 use crate::frontend::{FrontendUnit, analyze_source};
-use crate::frontend::ast::TopLevelItem;
-use crate::imports::{resolve_imports, ImportResolution};
+use crate::imports::{ImportResolution, resolve_imports};
 use crate::mir::{MirPassFn, check_return_type_inference, lower_mir};
 use crate::optimization::{OptimizationPipeline, derive_rankings};
 use crate::treewalk::TreewalkScript;
@@ -167,17 +171,101 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
         .map(|wasm| wasm.bytes.clone())
         .unwrap_or_else(|| MINIMAL_WASM_MODULE.to_vec());
 
-    let manifest = PackageManifest {
-        package: artifact.module.clone(),
-        types: Vec::new(),
-        traits: Vec::new(),
-        functions: Vec::new(),
-        trait_impls: BTreeMap::new(),
-    };
+    let frontend = result
+        .frontend
+        .as_ref()
+        .expect("successful compilation should produce a frontend unit");
+    let manifest = package_manifest_from_frontend(frontend);
     let header = ExternalLibraryHeader {
         manifest,
         wasm_bytes,
         metadata: None,
     };
     encode_external_library_file(&header).map_err(|error| error.to_string())
+}
+
+fn package_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifest {
+    PackageManifest {
+        package: frontend.header.module.clone(),
+        reexports: public_reexports(frontend),
+        types: Vec::new(),
+        traits: Vec::new(),
+        functions: frontend
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Function(function)
+                    if matches!(function.visibility, Visibility::Public) =>
+                {
+                    Some(function_spec_from_decl(function))
+                }
+                _ => None,
+            })
+            .collect(),
+        values: frontend
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Value(value) if matches!(value.visibility, Visibility::Public) => {
+                    Some(value_spec_from_decl(value))
+                }
+                _ => None,
+            })
+            .collect(),
+        trait_impls: BTreeMap::new(),
+    }
+}
+
+fn public_reexports(frontend: &FrontendUnit) -> Vec<ModulePath> {
+    frontend
+        .syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Import(import) if matches!(import.visibility, Visibility::Public) => {
+                ModulePath::parse(&import.module.to_source_string()).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn function_spec_from_decl(function: &FunctionDecl) -> FunctionSpec {
+    FunctionSpec {
+        name: function.name.clone(),
+        parameters: function
+            .parameters
+            .iter()
+            .map(|parameter| ParameterSpec {
+                name: parameter.name.clone(),
+                ty: VoxType::opaque_surface(parameter.ty.to_source_string()),
+                has_default: parameter.default.is_some(),
+            })
+            .collect(),
+        return_type: function
+            .return_type
+            .as_ref()
+            .map(|ty| VoxType::opaque_surface(ty.to_source_string()))
+            .unwrap_or_else(|| VoxType::opaque_surface(format!("{} return type", function.name))),
+        purity: if function.evil {
+            Purity::Evil
+        } else {
+            Purity::Pure
+        },
+        export: FunctionExportKind::Function,
+    }
+}
+
+fn value_spec_from_decl(value: &ValueDecl) -> ValueSpec {
+    ValueSpec {
+        name: value.name.clone(),
+        ty: value
+            .ty
+            .as_ref()
+            .map(|ty| VoxType::opaque_surface(ty.to_source_string()))
+            .unwrap_or_else(|| VoxType::opaque_surface(format!("{} type", value.name))),
+        purity: Purity::Pure,
+    }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use tower_lsp::jsonrpc::Result;
@@ -6,11 +7,19 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use vox_compiler::frontend;
 use vox_core::diagnostics::DiagnosticBag;
+use vox_core::host::PackageManifest;
 use vox_core::source::SourceText;
 
 pub struct VoxLanguageServer {
     client: Client,
     documents: Mutex<HashMap<Url, String>>,
+    libraries: Mutex<LspLibraries>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LspLibraries {
+    manifests: Vec<PackageManifest>,
+    load_errors: Vec<String>,
 }
 
 impl VoxLanguageServer {
@@ -18,19 +27,25 @@ impl VoxLanguageServer {
         Self {
             client,
             documents: Mutex::new(HashMap::new()),
+            libraries: Mutex::new(LspLibraries::default()),
         }
     }
 }
 
-fn collect_diagnostics(path: &str, source: &str) -> Option<Vec<Diagnostic>> {
+fn collect_diagnostics(
+    path: &str,
+    source: &str,
+    libraries: &LspLibraries,
+) -> Option<Vec<Diagnostic>> {
     let source_text = SourceText::new(path, 0, source);
     let result = frontend::analyze_source(&source_text);
 
     let mut diagnostics = match result {
-        Ok(_) => Vec::new(),
+        Ok(unit) => collect_semantic_diagnostics(source, &unit, &libraries.manifests),
         Err(bag) => convert_diagnostics(&source_text.text, bag),
     };
 
+    diagnostics.extend(collect_library_load_diagnostics(source, libraries));
     let doc_warnings = collect_docstring_warnings(source);
     diagnostics.extend(doc_warnings);
 
@@ -42,6 +57,284 @@ fn convert_diagnostics(source: &str, bag: DiagnosticBag) -> Vec<Diagnostic> {
         .into_iter()
         .map(|diag| convert_diagnostic(source, diag))
         .collect()
+}
+
+fn collect_semantic_diagnostics(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    manifests: &[PackageManifest],
+) -> Vec<Diagnostic> {
+    match vox_runtime::infer_environment(&unit.syntax, manifests) {
+        Ok(_) => Vec::new(),
+        Err(message) => {
+            let span = semantic_error_span(source, unit, &message)
+                .unwrap_or_else(|| unit.syntax.span.clone());
+            vec![Diagnostic {
+                range: byte_span_to_range(source, span.start, span.end),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("vox".to_string()),
+                message,
+                ..Default::default()
+            }]
+        }
+    }
+}
+
+fn collect_library_load_diagnostics(source: &str, libraries: &LspLibraries) -> Vec<Diagnostic> {
+    libraries
+        .load_errors
+        .iter()
+        .map(|message| Diagnostic {
+            range: byte_span_to_range(source, 0, source.len().min(1)),
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("vox-lsp".to_string()),
+            message: message.clone(),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn load_libraries(paths: &[PathBuf]) -> LspLibraries {
+    let mut runtime = vox_runtime::Runtime::default();
+    let mut load_errors = Vec::new();
+
+    for path in paths {
+        if !path.exists() {
+            load_errors.push(format!("library path `{}` does not exist", path.display()));
+            continue;
+        }
+
+        let result = if path.is_dir() {
+            mount_lsp_library_dir(&mut runtime, path)
+        } else {
+            mount_lsp_library_file(&mut runtime, path).map(|_| ())
+        };
+
+        if let Err(error) = result {
+            load_errors.push(format!(
+                "failed to load library `{}`: {error}",
+                path.display()
+            ));
+        }
+    }
+
+    LspLibraries {
+        manifests: runtime.package_manifests(),
+        load_errors,
+    }
+}
+
+fn mount_lsp_library_dir(
+    runtime: &mut vox_runtime::Runtime,
+    dir: &Path,
+) -> std::result::Result<(), String> {
+    let mut files = Vec::new();
+    collect_library_files(dir, &mut files)?;
+    files.sort();
+
+    for file in files {
+        mount_lsp_library_file(runtime, &file)?;
+    }
+
+    Ok(())
+}
+
+fn collect_library_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::result::Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("directory read error: {error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_library_files(&path, files)?;
+        } else if is_lsp_library_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_lsp_library_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("vox") | Some("voxlib")
+    )
+}
+
+fn mount_lsp_library_file(
+    runtime: &mut vox_runtime::Runtime,
+    path: &Path,
+) -> std::result::Result<vox_core::ids::LibraryId, String> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("vox") => runtime.mount_vox_file(path),
+        Some("voxlib") => runtime.mount_voxlib_file(path),
+        other => Err(format!(
+            "unsupported library file extension for `{}`: {:?}",
+            path.display(),
+            other
+        )),
+    }
+}
+
+fn library_paths_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(options) = &params.initialization_options {
+        collect_library_paths_from_value(options, &mut paths);
+    }
+
+    if let Ok(env_paths) = std::env::var("VOX_LSP_LIBRARIES") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for item in env_paths
+            .split(separator)
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            paths.push(PathBuf::from(item));
+        }
+    }
+
+    paths
+}
+
+fn collect_library_paths_from_value(value: &serde_json::Value, paths: &mut Vec<PathBuf>) {
+    match value {
+        serde_json::Value::String(path) => paths.push(PathBuf::from(path)),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_library_paths_from_value(item, paths);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "libraries",
+                "libraryPaths",
+                "library_paths",
+                "voxLibraries",
+                "vox_libraries",
+            ] {
+                if let Some(value) = map.get(key) {
+                    collect_library_paths_from_value(value, paths);
+                }
+            }
+            for key in ["library", "libraryPath", "library_path", "path"] {
+                if let Some(serde_json::Value::String(path)) = map.get(key) {
+                    paths.push(PathBuf::from(path));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn semantic_error_span(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    message: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    if let Some(package) = message
+        .strip_prefix("imported package `")
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        .or_else(|| {
+            message
+                .strip_prefix("package `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+    {
+        if let Some(span) = import_module_span(unit, package) {
+            return Some(span);
+        }
+        return source_substring_span(source, package);
+    }
+
+    if let Some(name) = message
+        .strip_prefix("unknown qualified name `")
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+    {
+        return qualified_name_span(source, unit, name)
+            .or_else(|| source_substring_span(source, name));
+    }
+
+    if let Some(name) = message
+        .strip_prefix("unknown name `")
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        .or_else(|| {
+            message
+                .strip_prefix("unknown local `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+        .or_else(|| {
+            message
+                .strip_prefix("ambiguous name `")
+                .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        })
+    {
+        let spans = collect_references(unit, source, name);
+        if let Some(span) = spans.into_iter().next() {
+            return Some(span);
+        }
+        return identifier_substring_span(source, name);
+    }
+
+    None
+}
+
+fn import_module_span(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    package: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::ast::TopLevelItem;
+
+    unit.syntax.items.iter().find_map(|item| match item {
+        TopLevelItem::Import(import) if import.module.to_source_string() == package => {
+            Some(import.module.span.clone())
+        }
+        _ => None,
+    })
+}
+
+fn qualified_name_span(
+    source: &str,
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    name: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    source_substring_span(&source[unit.syntax.span.start..unit.syntax.span.end], name).map(|span| {
+        vox_core::diagnostics::TextSpan {
+            start: span.start + unit.syntax.span.start,
+            end: span.end + unit.syntax.span.start,
+        }
+    })
+}
+
+fn source_substring_span(source: &str, needle: &str) -> Option<vox_core::diagnostics::TextSpan> {
+    source
+        .find(needle)
+        .map(|start| vox_core::diagnostics::TextSpan {
+            start,
+            end: start + needle.len(),
+        })
+}
+
+fn identifier_substring_span(
+    source: &str,
+    needle: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    let mut search_start = 0usize;
+    while let Some(relative) = source[search_start..].find(needle) {
+        let start = search_start + relative;
+        let end = start + needle.len();
+        let before = start
+            .checked_sub(1)
+            .and_then(|idx| source.as_bytes().get(idx))
+            .copied();
+        let after = source.as_bytes().get(end).copied();
+        let before_ok = before.is_none_or(|b| !is_ident_byte(b));
+        let after_ok = after.is_none_or(|b| !is_ident_byte(b));
+        if before_ok && after_ok {
+            return Some(vox_core::diagnostics::TextSpan { start, end });
+        }
+        search_start = end;
+    }
+    None
 }
 
 fn collect_docstring_warnings(source: &str) -> Vec<Diagnostic> {
@@ -148,7 +441,10 @@ fn item_span(item: &vox_compiler::frontend::ast::TopLevelItem) -> vox_core::diag
     }
 }
 
-fn is_doc_inside_span(doc_span: &vox_core::diagnostics::TextSpan, decl_span: &vox_core::diagnostics::TextSpan) -> bool {
+fn is_doc_inside_span(
+    doc_span: &vox_core::diagnostics::TextSpan,
+    decl_span: &vox_core::diagnostics::TextSpan,
+) -> bool {
     doc_span.start >= decl_span.start && doc_span.end <= decl_span.end
 }
 
@@ -205,7 +501,11 @@ fn position_to_byte_offset(source: &str, position: Position) -> usize {
     source.len()
 }
 
-fn segment_at_offset(_source: &str, qname: &vox_compiler::frontend::ast::QualifiedName, offset: usize) -> Option<String> {
+fn segment_at_offset(
+    _source: &str,
+    qname: &vox_compiler::frontend::ast::QualifiedName,
+    offset: usize,
+) -> Option<String> {
     if offset < qname.span.start || offset >= qname.span.end {
         return None;
     }
@@ -355,7 +655,11 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
             TopLevelItem::Function(f) => (f.name.clone(), SymbolKind::FUNCTION, f.span.clone()),
             TopLevelItem::Value(v) => (v.name.clone(), SymbolKind::VARIABLE, v.span.clone()),
             TopLevelItem::Param(p) => (p.name.clone(), SymbolKind::VARIABLE, p.span.clone()),
-            TopLevelItem::Import(i) => (i.module.to_source_string(), SymbolKind::MODULE, i.span.clone()),
+            TopLevelItem::Import(i) => (
+                i.module.to_source_string(),
+                SymbolKind::MODULE,
+                i.span.clone(),
+            ),
             TopLevelItem::Statement(_) => continue,
         };
 
@@ -376,7 +680,9 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
     symbols
 }
 
-fn build_symbol_table(unit: &vox_compiler::frontend::ast::FrontendUnit) -> HashMap<String, vox_core::diagnostics::TextSpan> {
+fn build_symbol_table(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+) -> HashMap<String, vox_core::diagnostics::TextSpan> {
     use vox_compiler::frontend::ast::*;
     let mut symbols = HashMap::new();
 
@@ -465,7 +771,11 @@ fn build_symbol_table(unit: &vox_compiler::frontend::ast::FrontendUnit) -> HashM
                     }
                 }
             }
-            ExprKind::ReceiverCall { receiver, arguments, .. } => {
+            ExprKind::ReceiverCall {
+                receiver,
+                arguments,
+                ..
+            } => {
                 walk_expr(receiver, symbols);
                 for arg in arguments {
                     match arg {
@@ -841,8 +1151,8 @@ fn find_name_at_offset(
             | ExprKind::String(_) => {}
         }
 
-    None
-}
+        None
+    }
 
     fn find_in_block_item(item: &BlockItem, source: &str, offset: usize) -> Option<String> {
         match item {
@@ -933,7 +1243,11 @@ fn collect_references(
     use vox_compiler::frontend::ast::*;
     let mut spans = Vec::new();
 
-    fn collect_type_syntax(ty: &TypeSyntax, target: &str, spans: &mut Vec<vox_core::diagnostics::TextSpan>) {
+    fn collect_type_syntax(
+        ty: &TypeSyntax,
+        target: &str,
+        spans: &mut Vec<vox_core::diagnostics::TextSpan>,
+    ) {
         match &ty.kind {
             TypeKind::Function { parameters, result } => {
                 for param in parameters {
@@ -969,14 +1283,22 @@ fn collect_references(
         }
     }
 
-    fn collect_in_expr(expr: &Expr, target: &str, spans: &mut Vec<vox_core::diagnostics::TextSpan>) {
+    fn collect_in_expr(
+        expr: &Expr,
+        target: &str,
+        spans: &mut Vec<vox_core::diagnostics::TextSpan>,
+    ) {
         match &expr.kind {
             ExprKind::Name(qname) => {
                 if qname.segments.last().map(|s| s.as_str()) == Some(target) {
                     spans.push(qname.span.clone());
                 }
             }
-            ExprKind::ReceiverCall { receiver, callee, arguments } => {
+            ExprKind::ReceiverCall {
+                receiver,
+                callee,
+                arguments,
+            } => {
                 if callee.segments.last().map(|s| s.as_str()) == Some(target) {
                     spans.push(callee.span.clone());
                 }
@@ -1233,7 +1555,9 @@ fn find_call_at_offset(
                             BlockItem::Panic(_) => {}
                             BlockItem::Break(_) => {}
                             BlockItem::Continue(_) => {}
-                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => {
+                                walk_expr(e, offset, best)
+                            }
                         }
                     }
                     if let Some(ref trailing) = block.trailing {
@@ -1245,9 +1569,13 @@ fn find_call_at_offset(
                         walk_expr(&branch.condition, offset, best);
                         for item in &branch.body.items {
                             match item {
-                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::LocalValue(lv) => {
+                                    walk_expr(&lv.initializer, offset, best)
+                                }
                                 BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
-                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => {
+                                    walk_expr(&ca.value, offset, best)
+                                }
                                 BlockItem::Return(r) => {
                                     if let Some(ref val) = r.value {
                                         walk_expr(val, offset, best);
@@ -1256,7 +1584,9 @@ fn find_call_at_offset(
                                 BlockItem::Panic(_) => {}
                                 BlockItem::Break(_) => {}
                                 BlockItem::Continue(_) => {}
-                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => {
+                                    walk_expr(e, offset, best)
+                                }
                             }
                         }
                         if let Some(ref trailing) = branch.body.trailing {
@@ -1266,9 +1596,13 @@ fn find_call_at_offset(
                     if let Some(ref else_branch) = if_expr.else_branch {
                         for item in &else_branch.items {
                             match item {
-                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::LocalValue(lv) => {
+                                    walk_expr(&lv.initializer, offset, best)
+                                }
                                 BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
-                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => {
+                                    walk_expr(&ca.value, offset, best)
+                                }
                                 BlockItem::Return(r) => {
                                     if let Some(ref val) = r.value {
                                         walk_expr(val, offset, best);
@@ -1277,7 +1611,9 @@ fn find_call_at_offset(
                                 BlockItem::Panic(_) => {}
                                 BlockItem::Break(_) => {}
                                 BlockItem::Continue(_) => {}
-                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => {
+                                    walk_expr(e, offset, best)
+                                }
                             }
                         }
                         if let Some(ref trailing) = else_branch.trailing {
@@ -1329,7 +1665,9 @@ fn find_call_at_offset(
                             BlockItem::Panic(_) => {}
                             BlockItem::Break(_) => {}
                             BlockItem::Continue(_) => {}
-                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                            BlockItem::BlockStatement(e) | BlockItem::Expr(e) => {
+                                walk_expr(e, offset, best)
+                            }
                         }
                     }
                     if let Some(ref trailing) = body.trailing {
@@ -1346,7 +1684,11 @@ fn find_call_at_offset(
                         }
                     }
                 }
-                ExprKind::ReceiverCall { receiver, callee: _, arguments } => {
+                ExprKind::ReceiverCall {
+                    receiver,
+                    callee: _,
+                    arguments,
+                } => {
                     walk_expr(receiver, offset, best);
                     for arg in arguments {
                         match arg {
@@ -1395,9 +1737,13 @@ fn find_call_at_offset(
                     IntrinsicExpr::Econ(e) => {
                         for item in &e.body.items {
                             match item {
-                                BlockItem::LocalValue(lv) => walk_expr(&lv.initializer, offset, best),
+                                BlockItem::LocalValue(lv) => {
+                                    walk_expr(&lv.initializer, offset, best)
+                                }
                                 BlockItem::Assignment(a) => walk_expr(&a.value, offset, best),
-                                BlockItem::CompoundAssignment(ca) => walk_expr(&ca.value, offset, best),
+                                BlockItem::CompoundAssignment(ca) => {
+                                    walk_expr(&ca.value, offset, best)
+                                }
                                 BlockItem::Return(r) => {
                                     if let Some(ref val) = r.value {
                                         walk_expr(val, offset, best);
@@ -1406,7 +1752,9 @@ fn find_call_at_offset(
                                 BlockItem::Panic(_) => {}
                                 BlockItem::Break(_) => {}
                                 BlockItem::Continue(_) => {}
-                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => walk_expr(e, offset, best),
+                                BlockItem::BlockStatement(e) | BlockItem::Expr(e) => {
+                                    walk_expr(e, offset, best)
+                                }
                             }
                         }
                         if let Some(ref trailing) = e.body.trailing {
@@ -1440,7 +1788,9 @@ fn find_call_at_offset(
                 }
                 walk_children(expr, offset, best);
             }
-            ExprKind::ReceiverCall { callee, arguments, .. } => {
+            ExprKind::ReceiverCall {
+                callee, arguments, ..
+            } => {
                 for (i, arg) in arguments.iter().enumerate() {
                     let arg_span = match arg {
                         Argument::Positional(e) => e.span.clone(),
@@ -1583,12 +1933,10 @@ fn try_dot_completion(source: &str, position: Position) -> Option<Vec<Completion
     // Walk remaining segments as field accesses on record types
     for segment in chain.iter().skip(1) {
         current_type = match current_type {
-            Some(ReplType::Record(fields)) => {
-                fields
-                    .iter()
-                    .find(|f| f.name == *segment)
-                    .map(|f| f.ty.clone())
-            }
+            Some(ReplType::Record(fields)) => fields
+                .iter()
+                .find(|f| f.name == *segment)
+                .map(|f| f.ty.clone()),
             Some(ReplType::Nullable(inner)) => match *inner {
                 ReplType::Record(fields) => fields
                     .iter()
@@ -1680,7 +2028,11 @@ fn extract_receiver_chain(prefix: &str) -> Option<Vec<String>> {
     }
 
     segments.reverse();
-    if segments.is_empty() { None } else { Some(segments) }
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments)
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -1704,14 +2056,13 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
         names.entry(kw).or_insert(CompletionItemKind::KEYWORD);
     }
 
-    fn collect_block(
-        items: &[BlockItem],
-        names: &mut BTreeMap<String, CompletionItemKind>,
-    ) {
+    fn collect_block(items: &[BlockItem], names: &mut BTreeMap<String, CompletionItemKind>) {
         for item in items {
             match item {
                 BlockItem::LocalValue(lv) => {
-                    names.entry(lv.name.clone()).or_insert(CompletionItemKind::VARIABLE);
+                    names
+                        .entry(lv.name.clone())
+                        .or_insert(CompletionItemKind::VARIABLE);
                 }
                 _ => {}
             }
@@ -1721,30 +2072,44 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
     for item in &unit.syntax.items {
         match item {
             TopLevelItem::Function(f) => {
-                names.entry(f.name.clone()).or_insert(CompletionItemKind::FUNCTION);
+                names
+                    .entry(f.name.clone())
+                    .or_insert(CompletionItemKind::FUNCTION);
                 for p in &f.parameters {
-                    names.entry(p.name.clone()).or_insert(CompletionItemKind::VARIABLE);
+                    names
+                        .entry(p.name.clone())
+                        .or_insert(CompletionItemKind::VARIABLE);
                 }
                 if let ExprKind::Block(ref block) = f.body.kind {
                     collect_block(&block.items, &mut names);
                 }
             }
             TopLevelItem::Value(v) => {
-                names.entry(v.name.clone()).or_insert(CompletionItemKind::VARIABLE);
+                names
+                    .entry(v.name.clone())
+                    .or_insert(CompletionItemKind::VARIABLE);
             }
             TopLevelItem::Param(p) => {
-                names.entry(p.name.clone()).or_insert(CompletionItemKind::VARIABLE);
+                names
+                    .entry(p.name.clone())
+                    .or_insert(CompletionItemKind::VARIABLE);
             }
             TopLevelItem::Statement(s) => {
                 if let BlockItem::LocalValue(lv) = s {
-                    names.entry(lv.name.clone()).or_insert(CompletionItemKind::VARIABLE);
+                    names
+                        .entry(lv.name.clone())
+                        .or_insert(CompletionItemKind::VARIABLE);
                 }
             }
             TopLevelItem::Import(i) => {
                 if let Some(last) = i.module.segments.last() {
-                    names.entry(last.clone()).or_insert(CompletionItemKind::MODULE);
+                    names
+                        .entry(last.clone())
+                        .or_insert(CompletionItemKind::MODULE);
                 }
-                names.entry(i.module.to_source_string()).or_insert(CompletionItemKind::MODULE);
+                names
+                    .entry(i.module.to_source_string())
+                    .or_insert(CompletionItemKind::MODULE);
             }
         }
     }
@@ -1767,7 +2132,11 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
     Some(completions)
 }
 
-fn compute_goto_definition(source: &str, uri: Url, position: Position) -> Option<GotoDefinitionResponse> {
+fn compute_goto_definition(
+    source: &str,
+    uri: Url,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
     let source_text = SourceText::new("", 0, source);
     let unit = frontend::analyze_source(&source_text).ok()?;
     let offset = position_to_byte_offset(source, position);
@@ -1802,7 +2171,9 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
     let head_docs = unit
         .as_ref()
         .and_then(|u| find_head_docs_at_offset(u, offset));
-    let body_docs = unit.as_ref().and_then(|u| find_body_docs(source, u, offset));
+    let body_docs = unit
+        .as_ref()
+        .and_then(|u| find_body_docs(source, u, offset));
 
     if let Some(ref docs) = head_docs {
         for line in docs {
@@ -1889,7 +2260,11 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
         let diag_offset = diag.span.as_ref().map(|s| s.start).unwrap_or(0);
         let diag_end = diag.span.as_ref().map(|s| s.end).unwrap_or(0);
         if diag_offset <= offset && offset < diag_end {
-            parts.push(format!("---\n*{}:* {}", severity_label(diag.severity), diag.message));
+            parts.push(format!(
+                "---\n*{}:* {}",
+                severity_label(diag.severity),
+                diag.message
+            ));
         }
     }
 
@@ -1902,7 +2277,10 @@ fn compute_hover(source: &str, position: Position) -> Option<Hover> {
         value: parts.join("\n"),
     });
 
-    Some(Hover { contents, range: None })
+    Some(Hover {
+        contents,
+        range: None,
+    })
 }
 
 fn severity_label(severity: vox_core::diagnostics::Severity) -> &'static str {
@@ -1961,14 +2339,20 @@ fn build_decl_hover_line(
 
     if let Some(ref result) = unit.syntax.result {
         if offset >= result.span.start && offset < result.span.end {
-            return Some(extract_source_line(source, result.span.start, result.span.end));
+            return Some(extract_source_line(
+                source,
+                result.span.start,
+                result.span.end,
+            ));
         }
     }
 
     None
 }
 
-fn block_item_span(item: &vox_compiler::frontend::ast::BlockItem) -> vox_core::diagnostics::TextSpan {
+fn block_item_span(
+    item: &vox_compiler::frontend::ast::BlockItem,
+) -> vox_core::diagnostics::TextSpan {
     use vox_compiler::frontend::ast::*;
     match item {
         BlockItem::LocalValue(lv) => lv.span.clone(),
@@ -1987,7 +2371,10 @@ fn extract_source_line(source: &str, start: usize, end: usize) -> String {
     let end = end.min(source.len());
 
     let line_start = source[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line_end = source[end..].find('\n').map(|i| end + i).unwrap_or(source.len());
+    let line_end = source[end..]
+        .find('\n')
+        .map(|i| end + i)
+        .unwrap_or(source.len());
 
     source[line_start..line_end].trim_end().to_string()
 }
@@ -2002,42 +2389,22 @@ fn find_head_docs_at_offset(
         match item {
             TopLevelItem::Function(f) => {
                 if offset >= f.span.start && offset < f.span.end && !f.docs.is_empty() {
-                    return Some(
-                        f.docs
-                            .iter()
-                            .map(|d| d.trim_end().to_string())
-                            .collect(),
-                    );
+                    return Some(f.docs.iter().map(|d| d.trim_end().to_string()).collect());
                 }
             }
             TopLevelItem::Value(v) => {
                 if offset >= v.span.start && offset < v.span.end && !v.docs.is_empty() {
-                    return Some(
-                        v.docs
-                            .iter()
-                            .map(|d| d.trim_end().to_string())
-                            .collect(),
-                    );
+                    return Some(v.docs.iter().map(|d| d.trim_end().to_string()).collect());
                 }
             }
             TopLevelItem::Param(p) => {
                 if offset >= p.span.start && offset < p.span.end && !p.docs.is_empty() {
-                    return Some(
-                        p.docs
-                            .iter()
-                            .map(|d| d.trim_end().to_string())
-                            .collect(),
-                    );
+                    return Some(p.docs.iter().map(|d| d.trim_end().to_string()).collect());
                 }
             }
             TopLevelItem::Import(i) => {
                 if offset >= i.span.start && offset < i.span.end && !i.docs.is_empty() {
-                    return Some(
-                        i.docs
-                            .iter()
-                            .map(|d| d.trim_end().to_string())
-                            .collect(),
-                    );
+                    return Some(i.docs.iter().map(|d| d.trim_end().to_string()).collect());
                 }
             }
             _ => {}
@@ -2117,29 +2484,40 @@ fn collect_value_trailing_docs(
 
 #[tower_lsp::async_trait]
 impl LanguageServer for VoxLanguageServer {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let library_paths = library_paths_from_initialize(&params);
+        let libraries = load_libraries(&library_paths);
+        let load_errors = libraries.load_errors.clone();
+        *self.libraries.lock().unwrap() = libraries;
+
+        for error in load_errors {
+            self.client.show_message(MessageType::ERROR, error).await;
+        }
+
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
                 semantic_tokens_provider: Some(
-                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
-                        work_done_progress_options: Default::default(),
-                        legend: SemanticTokensLegend {
-                            token_types: vec![
-                                "keyword".into(),
-                                "variable".into(),
-                                "string".into(),
-                                "number".into(),
-                                "comment".into(),
-                                "operator".into(),
-                            ],
-                            token_modifiers: vec![],
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            work_done_progress_options: Default::default(),
+                            legend: SemanticTokensLegend {
+                                token_types: vec![
+                                    "keyword".into(),
+                                    "variable".into(),
+                                    "string".into(),
+                                    "number".into(),
+                                    "comment".into(),
+                                    "operator".into(),
+                                ],
+                                token_modifiers: vec![],
+                            },
+                            range: Some(false),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
                         },
-                        range: Some(false),
-                        full: Some(SemanticTokensFullOptions::Bool(true)),
-                    }),
+                    ),
                 ),
                 document_symbol_provider: Some(OneOf::Right(DocumentSymbolOptions {
                     work_done_progress_options: Default::default(),
@@ -2170,13 +2548,17 @@ impl LanguageServer for VoxLanguageServer {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        self.documents
-            .lock()
-            .unwrap()
-            .insert(params.text_document.uri.clone(), params.text_document.text.clone());
-        let diagnostics =
-            collect_diagnostics(params.text_document.uri.as_str(), &params.text_document.text)
-                .unwrap_or_default();
+        self.documents.lock().unwrap().insert(
+            params.text_document.uri.clone(),
+            params.text_document.text.clone(),
+        );
+        let libraries = self.libraries.lock().unwrap().clone();
+        let diagnostics = collect_diagnostics(
+            params.text_document.uri.as_str(),
+            &params.text_document.text,
+            &libraries,
+        )
+        .unwrap_or_default();
         self.client
             .publish_diagnostics(params.text_document.uri, diagnostics, None)
             .await;
@@ -2188,8 +2570,9 @@ impl LanguageServer for VoxLanguageServer {
                 .lock()
                 .unwrap()
                 .insert(params.text_document.uri.clone(), change.text.clone());
+            let libraries = self.libraries.lock().unwrap().clone();
             let diagnostics =
-                collect_diagnostics(params.text_document.uri.as_str(), &change.text)
+                collect_diagnostics(params.text_document.uri.as_str(), &change.text, &libraries)
                     .unwrap_or_default();
             self.client
                 .publish_diagnostics(params.text_document.uri, diagnostics, None)
@@ -2198,7 +2581,10 @@ impl LanguageServer for VoxLanguageServer {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents.lock().unwrap().remove(&params.text_document.uri);
+        self.documents
+            .lock()
+            .unwrap()
+            .remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, Vec::new(), None)
             .await;
@@ -2268,17 +2654,9 @@ impl LanguageServer for VoxLanguageServer {
         }
     }
 
-    async fn references(
-        &self,
-        params: ReferenceParams,
-    ) -> Result<Option<Vec<Location>>> {
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri.clone();
-        let source = self
-            .documents
-            .lock()
-            .unwrap()
-            .get(&uri)
-            .cloned();
+        let source = self.documents.lock().unwrap().get(&uri).cloned();
 
         let text = match source {
             Some(t) => t,
@@ -2337,10 +2715,7 @@ impl LanguageServer for VoxLanguageServer {
         }
     }
 
-    async fn signature_help(
-        &self,
-        params: SignatureHelpParams,
-    ) -> Result<Option<SignatureHelp>> {
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let source = self
             .documents
             .lock()
@@ -2357,10 +2732,7 @@ impl LanguageServer for VoxLanguageServer {
         }
     }
 
-    async fn completion(
-        &self,
-        params: CompletionParams,
-    ) -> Result<Option<CompletionResponse>> {
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let source = self
             .documents
             .lock()
@@ -2370,10 +2742,7 @@ impl LanguageServer for VoxLanguageServer {
 
         match source {
             Some(text) => {
-                let items = compute_completion(
-                    &text,
-                    params.text_document_position.position,
-                );
+                let items = compute_completion(&text, params.text_document_position.position);
                 Ok(items.map(CompletionResponse::Array))
             }
             None => Ok(None),

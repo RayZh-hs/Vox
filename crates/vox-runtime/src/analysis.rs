@@ -8,7 +8,7 @@ use vox_compiler::frontend::ast::{
     UpdatedPathSegment, ValueDecl, WhenExpr,
 };
 use vox_core::{
-    host::{FunctionSpec, PackageManifest},
+    host::{FunctionSpec, PackageManifest, ValueSpec},
     source::{ModuleKind, ModulePath},
 };
 
@@ -433,11 +433,42 @@ impl<'a> TypeEngine<'a> {
                 self.imports.insert(
                     name.clone(),
                     ImportedPackage {
-                        manifest: Some(manifest),
-                        selective,
+                        manifest: Some(manifest.clone()),
+                        selective: selective.clone(),
                     },
                 );
+
+                if selective.is_none() {
+                    let mut seen = BTreeSet::new();
+                    seen.insert(name.clone());
+                    self.collect_reexported_imports(&name, &manifest, &mut seen)?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    fn collect_reexported_imports(
+        &mut self,
+        source_package: &str,
+        manifest: &PackageManifest,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        for module in &manifest.reexports {
+            let name = module.as_str();
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let reexport = self.manifests.get(&name).cloned().ok_or_else(|| {
+                format!("re-exported package `{name}` from `{source_package}` is not mounted")
+            })?;
+            self.imports
+                .entry(name.clone())
+                .or_insert_with(|| ImportedPackage {
+                    manifest: Some(reexport.clone()),
+                    selective: None,
+                });
+            self.collect_reexported_imports(&name, &reexport, seen)?;
         }
         Ok(())
     }
@@ -915,17 +946,14 @@ impl<'a> TypeEngine<'a> {
                                 .values
                                 .get(&assignment.name)
                                 .cloned()
-                                .ok_or_else(|| {
-                                    format!("unknown local `{}`", assignment.name)
-                                })?;
+                                .ok_or_else(|| format!("unknown local `{}`", assignment.name))?;
                             if !current.mutable {
                                 return Err(format!(
                                     "cannot assign to immutable local `{}`",
                                     assignment.name
                                 ));
                             }
-                            let next =
-                                self.infer_expr(&assignment.value, &mut loop_scope)?;
+                            let next = self.infer_expr(&assignment.value, &mut loop_scope)?;
                             if !next.is_assignable_to(&current.ty) {
                                 return Err(format!(
                                     "cannot assign `{}` to `{}`",
@@ -939,38 +967,26 @@ impl<'a> TypeEngine<'a> {
                                 .values
                                 .get(&assignment.name)
                                 .cloned()
-                                .ok_or_else(|| {
-                                    format!("unknown local `{}`", assignment.name)
-                                })?;
+                                .ok_or_else(|| format!("unknown local `{}`", assignment.name))?;
                             if !current.mutable {
                                 return Err(format!(
                                     "cannot assign to immutable local `{}`",
                                     assignment.name
                                 ));
                             }
-                            let rhs =
-                                self.infer_expr(&assignment.value, &mut loop_scope)?;
-                            self.infer_compound_assignment(
-                                &current.ty,
-                                &rhs,
-                                assignment.op,
-                            )?;
+                            let rhs = self.infer_expr(&assignment.value, &mut loop_scope)?;
+                            self.infer_compound_assignment(&current.ty, &rhs, assignment.op)?;
                         }
                         BlockItem::Expr(expr) => {
                             self.infer_expr(expr, &mut loop_scope)?;
                         }
                         _ => {
-                            return Err(
-                                "unsupported statement in `for` header".to_owned()
-                            );
+                            return Err("unsupported statement in `for` header".to_owned());
                         }
                     }
                 }
                 match &expr.header {
-                    ForHeader::In {
-                        pattern,
-                        iterable,
-                    } => {
+                    ForHeader::In { pattern, iterable } => {
                         let iterable = self.infer_expr(iterable, &mut loop_scope)?;
                         match iterable {
                             ReplType::List(item) | ReplType::Range(item) => {
@@ -1172,7 +1188,7 @@ impl<'a> TypeEngine<'a> {
                 }
                 BlockItem::Panic(_) => return Ok(ReplType::Unknown("Never".to_owned())),
                 BlockItem::Break(_) | BlockItem::Continue(_) => {
-                    return Ok(ReplType::Unknown("Never".to_owned()))
+                    return Ok(ReplType::Unknown("Never".to_owned()));
                 }
                 BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
                     self.infer_expr(expr, &mut nested)?;
@@ -1236,9 +1252,7 @@ impl<'a> TypeEngine<'a> {
                 Err("`return` may only be used inside a function body".to_owned())
             }
             BlockItem::Panic(_) => Ok(()),
-            BlockItem::Break(_) => {
-                Err("`break` may only be used inside a `for` loop".to_owned())
-            }
+            BlockItem::Break(_) => Err("`break` may only be used inside a `for` loop".to_owned()),
             BlockItem::Continue(_) => {
                 Err("`continue` may only be used inside a `for` loop".to_owned())
             }
@@ -1630,29 +1644,38 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn resolve_unqualified_name(&self, local: &str) -> Result<Option<ReplType>, String> {
-        let mut candidates: Vec<(String, &FunctionSpec)> = Vec::new();
+        enum ImportedSymbol<'a> {
+            Function(&'a FunctionSpec),
+            Value(&'a ValueSpec),
+        }
+
+        let mut candidates: Vec<(String, ImportedSymbol<'_>)> = Vec::new();
         for (import_path, imported) in &self.imports {
             if let Some(manifest) = &imported.manifest {
                 if let Some(selective) = &imported.selective {
                     for (name, alias) in selective {
                         let effective = alias.as_ref().unwrap_or(name);
                         if effective == local {
-                            if let Some(func) = manifest
-                                .functions
-                                .iter()
-                                .find(|f| &f.name == name)
+                            if let Some(function) =
+                                manifest.functions.iter().find(|f| &f.name == name)
                             {
-                                candidates.push((import_path.clone(), func));
+                                candidates.push((
+                                    import_path.clone(),
+                                    ImportedSymbol::Function(function),
+                                ));
+                            }
+                            if let Some(value) = manifest.values.iter().find(|v| &v.name == name) {
+                                candidates
+                                    .push((import_path.clone(), ImportedSymbol::Value(value)));
                             }
                         }
                     }
                 } else {
-                    if let Some(func) = manifest
-                        .functions
-                        .iter()
-                        .find(|f| f.name == local)
-                    {
-                        candidates.push((import_path.clone(), func));
+                    if let Some(function) = manifest.functions.iter().find(|f| f.name == local) {
+                        candidates.push((import_path.clone(), ImportedSymbol::Function(function)));
+                    }
+                    if let Some(value) = manifest.values.iter().find(|v| v.name == local) {
+                        candidates.push((import_path.clone(), ImportedSymbol::Value(value)));
                     }
                 }
             }
@@ -1661,14 +1684,10 @@ impl<'a> TypeEngine<'a> {
         match candidates.len() {
             0 => Ok(None),
             1 => {
-                let (_path, func) = candidates.into_iter().next().unwrap();
-                Ok(Some(ReplType::Function {
-                    parameters: func
-                        .parameters
-                        .iter()
-                        .map(|p| from_vox_host_type(&p.ty))
-                        .collect(),
-                    result: Box::new(from_vox_host_type(&func.return_type)),
+                let (_path, symbol) = candidates.into_iter().next().unwrap();
+                Ok(Some(match symbol {
+                    ImportedSymbol::Function(function) => self.function_type_from_spec(function),
+                    ImportedSymbol::Value(value) => from_vox_host_type(&value.ty),
                 }))
             }
             _ => {
@@ -1724,14 +1743,10 @@ impl<'a> TypeEngine<'a> {
                     .iter()
                     .find(|function| &function.name == symbol)
                 {
-                    return Ok(ReplType::Function {
-                        parameters: function
-                            .parameters
-                            .iter()
-                            .map(|parameter| from_vox_host_type(&parameter.ty))
-                            .collect(),
-                        result: Box::new(from_vox_host_type(&function.return_type)),
-                    });
+                    return Ok(self.function_type_from_spec(function));
+                }
+                if let Some(value) = manifest.values.iter().find(|value| &value.name == symbol) {
+                    return Ok(from_vox_host_type(&value.ty));
                 }
                 if manifest.types.iter().any(|ty| ty.name.name == *symbol) {
                     return Err(type_name_used_as_value_error(
@@ -1769,14 +1784,7 @@ impl<'a> TypeEngine<'a> {
                             .iter()
                             .find(|function| function.name == method.lowered_by)
                         {
-                            return Ok(ReplType::Function {
-                                parameters: function
-                                    .parameters
-                                    .iter()
-                                    .map(|parameter| from_vox_host_type(&parameter.ty))
-                                    .collect(),
-                                result: Box::new(from_vox_host_type(&function.return_type)),
-                            });
+                            return Ok(self.function_type_from_spec(function));
                         }
 
                         let mut parameters = vec![ReplType::DynTrait(format!(
@@ -1820,6 +1828,17 @@ impl<'a> TypeEngine<'a> {
                 parameters,
                 result,
             }
+        }
+    }
+
+    fn function_type_from_spec(&self, function: &FunctionSpec) -> ReplType {
+        ReplType::Function {
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| from_vox_host_type(&parameter.ty))
+                .collect(),
+            result: Box::new(from_vox_host_type(&function.return_type)),
         }
     }
 }
@@ -2012,10 +2031,7 @@ impl<'a> CaptureNameCollector<'a> {
                     }
                 }
                 match &expr.header {
-                    ForHeader::In {
-                        iterable,
-                        pattern,
-                    } => {
+                    ForHeader::In { iterable, pattern } => {
                         self.visit_expr(iterable);
                         self.push_scope();
                         self.bind_name(pattern);
@@ -2569,8 +2585,16 @@ pub fn extend_manifest_symbols(symbols: &mut Vec<String>, manifest: &PackageMani
     let package = manifest.package.as_str();
     symbols.push(package.clone());
 
+    for reexport in &manifest.reexports {
+        symbols.push(reexport.as_str());
+    }
+
     for function in &manifest.functions {
         symbols.push(format!("{package}.{}", function.name));
+    }
+
+    for value in &manifest.values {
+        symbols.push(format!("{package}.{}", value.name));
     }
 
     for ty in &manifest.types {

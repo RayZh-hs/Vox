@@ -6,6 +6,7 @@ use std::{
 
 use vox_compiler::{CompileRequest, Compiler, FrontendUnit};
 use vox_core::{
+    VoxExport,
     external_library::ExternalLibrary,
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, HostRegistry, PackageManifest, ParameterSpec,
@@ -14,7 +15,7 @@ use vox_core::{
     opt::OptimizationLevel,
     source::{ModulePath, SourceText},
     types::{QualifiedTypeName, VoxType},
-    VoxExport, vox_fn,
+    vox_fn,
 };
 use vox_runtime::infer_environment;
 
@@ -259,22 +260,19 @@ fn test_external_library_manifest_generation() {
         .map(|t| (t.name.name.as_str(), t))
         .collect();
 
-    let point = types.get("TestPoint").expect("TestPoint should be registered");
+    let point = types
+        .get("TestPoint")
+        .expect("TestPoint should be registered");
     assert_eq!(point.name.module, package);
-    assert_eq!(
-        point.fields.len(),
-        2,
-        "TestPoint should have 2 fields"
-    );
-    let fields: BTreeMap<&str, &FieldSpec> = point
-        .fields
-        .iter()
-        .map(|f| (f.name.as_str(), f))
-        .collect();
+    assert_eq!(point.fields.len(), 2, "TestPoint should have 2 fields");
+    let fields: BTreeMap<&str, &FieldSpec> =
+        point.fields.iter().map(|f| (f.name.as_str(), f)).collect();
     assert_eq!(fields.get("x").map(|f| &f.ty), Some(&VoxType::Int));
     assert_eq!(fields.get("y").map(|f| &f.ty), Some(&VoxType::Int));
 
-    let empty = types.get("TestEmpty").expect("TestEmpty should be registered");
+    let empty = types
+        .get("TestEmpty")
+        .expect("TestEmpty should be registered");
     assert!(empty.fields.is_empty(), "TestEmpty should have no fields");
 
     let functions: BTreeMap<&str, &FunctionSpec> = manifest
@@ -341,10 +339,7 @@ fn test_external_library_manifest_generation() {
     );
 
     let t = functions.get("tags").expect("tags should be registered");
-    assert_eq!(
-        t.return_type,
-        VoxType::List(Box::new(VoxType::String))
-    );
+    assert_eq!(t.return_type, VoxType::List(Box::new(VoxType::String)));
 }
 
 // =========================================================================
@@ -399,8 +394,8 @@ fn extern_fixtures_pass_semantic_inference() {
 
 #[test]
 fn voxlib_file_compile_write_and_mount_round_trip() {
-    let source = "package fixtures.roundtrip; public fun add(a: Int, b: Int): Int = a + b;"
-        .to_owned();
+    let source =
+        "package fixtures.roundtrip; public fun add(a: Int, b: Int): Int = a + b;".to_owned();
     let module = ModulePath::parse("fixtures.roundtrip").expect("valid package path");
 
     let request = CompileRequest {
@@ -461,6 +456,7 @@ fn host_manifest() -> PackageManifest {
     let package = ModulePath::parse("fixtures.host").expect("valid host package path");
     PackageManifest {
         package: package.clone(),
+        reexports: Vec::new(),
         types: vec![TypeSpec {
             name: QualifiedTypeName {
                 module: package.clone(),
@@ -487,6 +483,7 @@ fn host_manifest() -> PackageManifest {
             purity: Purity::Pure,
             export: FunctionExportKind::Function,
         }],
+        values: Vec::new(),
         trait_impls: BTreeMap::new(),
     }
 }
@@ -494,9 +491,11 @@ fn host_manifest() -> PackageManifest {
 fn tools_manifest() -> PackageManifest {
     PackageManifest {
         package: ModulePath::parse("fixtures.tools").expect("valid tools package path"),
+        reexports: Vec::new(),
         types: Vec::new(),
         traits: Vec::new(),
         functions: Vec::new(),
+        values: Vec::new(),
         trait_impls: BTreeMap::new(),
     }
 }
@@ -508,6 +507,7 @@ fn image_manifest() -> PackageManifest {
 
     PackageManifest {
         package: package.clone(),
+        reexports: Vec::new(),
         types: vec![
             TypeSpec {
                 name: qualified_type(&package, "Image"),
@@ -660,6 +660,7 @@ fn image_manifest() -> PackageManifest {
                 export: FunctionExportKind::Function,
             },
         ],
+        values: Vec::new(),
         trait_impls: {
             let mut impls = BTreeMap::new();
             impls.insert(

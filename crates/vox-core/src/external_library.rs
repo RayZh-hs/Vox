@@ -9,14 +9,14 @@ use crate::{
     external_export::{collect_registered_docstrings, extend_manifest_with_registered_exports},
     host::{
         FieldSpec, FunctionExportKind, FunctionSpec, PackageManifest, ParameterSpec, Purity,
-        TraitMethodSpec, TraitSpec, TypeSpec,
+        TraitMethodSpec, TraitSpec, TypeSpec, ValueSpec,
     },
     source::ModulePath,
     types::{QualifiedTypeName, RecordField, VoxType},
 };
 
 pub const EXTERNAL_LIBRARY_MAGIC: [u8; 4] = *b"VXLH";
-pub const EXTERNAL_LIBRARY_VERSION: u16 = 3;
+pub const EXTERNAL_LIBRARY_VERSION: u16 = 4;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,9 +54,11 @@ impl ExternalLibrary {
         Ok(Self {
             manifest: PackageManifest {
                 package: ModulePath::parse(package)?,
+                reexports: Vec::new(),
                 types: Vec::new(),
                 traits: Vec::new(),
                 functions: Vec::new(),
+                values: Vec::new(),
                 trait_impls: BTreeMap::new(),
             },
         })
@@ -155,7 +157,7 @@ impl From<io::Error> for ExternalLibraryFormatError {
 }
 
 // =============================================================================
-// .voxlib binary format (version 3)
+// .voxlib binary format (version 4)
 //
 // Layout:  magic(4B) | version(u16) | reserved(u16)
 //        | manifest(len+bytes) | wasm(len+bytes)
@@ -232,6 +234,11 @@ pub fn encode_package_manifest(
     let mut writer = BinaryWriter::new();
     writer.write_string(&manifest.package.as_str())?;
 
+    writer.write_len(manifest.reexports.len(), "re-export list")?;
+    for module in &manifest.reexports {
+        writer.write_string(&module.as_str())?;
+    }
+
     writer.write_len(manifest.types.len(), "type list")?;
     for ty in &manifest.types {
         encode_qualified_type_name(&mut writer, &ty.name)?;
@@ -270,6 +277,13 @@ pub fn encode_package_manifest(
         encode_function_export_kind(&mut writer, &function.export)?;
     }
 
+    writer.write_len(manifest.values.len(), "value list")?;
+    for value in &manifest.values {
+        writer.write_string(&value.name)?;
+        encode_vox_type(&mut writer, &value.ty)?;
+        encode_purity(&mut writer, value.purity);
+    }
+
     writer.write_len(manifest.trait_impls.len(), "trait impls")?;
     for (trait_name, impls) in &manifest.trait_impls {
         encode_qualified_type_name(&mut writer, trait_name)?;
@@ -288,6 +302,15 @@ pub fn decode_package_manifest(
     let mut reader = BinaryReader::new(bytes);
     let package = ModulePath::parse(&reader.read_string()?)
         .map_err(|diagnostic| ExternalLibraryFormatError::Message(diagnostic.message))?;
+
+    let reexport_count = reader.read_u32()? as usize;
+    let mut reexports = Vec::with_capacity(reexport_count);
+    for _ in 0..reexport_count {
+        reexports.push(
+            ModulePath::parse(&reader.read_string()?)
+                .map_err(|diagnostic| ExternalLibraryFormatError::Message(diagnostic.message))?,
+        );
+    }
 
     let type_count = reader.read_u32()? as usize;
     let mut types = Vec::with_capacity(type_count);
@@ -352,6 +375,16 @@ pub fn decode_package_manifest(
         });
     }
 
+    let value_count = reader.read_u32()? as usize;
+    let mut values = Vec::with_capacity(value_count);
+    for _ in 0..value_count {
+        values.push(ValueSpec {
+            name: reader.read_string()?,
+            ty: decode_vox_type(&mut reader)?,
+            purity: decode_purity(&mut reader)?,
+        });
+    }
+
     let trait_impls_count = reader.read_u32()? as usize;
     let mut trait_impls = BTreeMap::new();
     for _ in 0..trait_impls_count {
@@ -367,9 +400,11 @@ pub fn decode_package_manifest(
     reader.finish()?;
     Ok(PackageManifest {
         package,
+        reexports,
         types,
         traits,
         functions,
+        values,
         trait_impls,
     })
 }

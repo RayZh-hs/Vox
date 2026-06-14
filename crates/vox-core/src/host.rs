@@ -28,6 +28,13 @@ pub struct FunctionSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueSpec {
+    pub name: String,
+    pub ty: VoxType,
+    pub purity: Purity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FunctionExportKind {
     Function,
     LoweredTraitMethod {
@@ -72,9 +79,11 @@ pub struct TraitSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageManifest {
     pub package: ModulePath,
+    pub reexports: Vec<ModulePath>,
     pub types: Vec<TypeSpec>,
     pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
+    pub values: Vec<ValueSpec>,
     pub trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>>,
 }
 

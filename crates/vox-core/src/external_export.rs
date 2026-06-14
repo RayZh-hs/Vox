@@ -87,6 +87,7 @@ pub struct CollectedPackageExports {
     pub types: Vec<TypeSpec>,
     pub traits: Vec<TraitSpec>,
     pub functions: Vec<FunctionSpec>,
+    pub values: Vec<crate::host::ValueSpec>,
     pub trait_impls: BTreeMap<QualifiedTypeName, BTreeSet<QualifiedTypeName>>,
 }
 
@@ -96,9 +97,11 @@ pub fn extend_manifest_with_registered_exports(
     let collected = collect_registered_package_exports(&manifest)?;
     Ok(PackageManifest {
         package: manifest.package.clone(),
+        reexports: manifest.reexports,
         types: collected.types,
         traits: collected.traits,
         functions: collected.functions,
+        values: collected.values,
         trait_impls: collected.trait_impls,
     })
 }
@@ -288,6 +291,7 @@ pub fn collect_registered_package_exports(
         types,
         traits,
         functions,
+        values: manifest.values.clone(),
         trait_impls: collect_trait_impls(package, &surface_registry),
     })
 }
