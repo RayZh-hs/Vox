@@ -16,6 +16,7 @@ use vox_compiler::{
     TreewalkScript,
 };
 use vox_core::{
+    diagnostics::TextSpan,
     host::{FunctionSpec, PackageManifest},
     ids::ArtifactId,
     mir::MirBodyKind,
@@ -978,7 +979,23 @@ impl<'a> EvalContext<'a> {
                 .map(Value::Tuple),
             ExprKind::Record(fields) => self.eval_record_literal(fields),
             ExprKind::Name(name) => self.resolve_name(name),
-            ExprKind::Call { callee, arguments } => self.eval_call(callee, arguments),
+            ExprKind::Call { callee, arguments } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if let Some(qualified) = expr_as_qualified_name(callee) {
+                        if let Ok(value) = self.resolve_name(&qualified) {
+                            let Value::Function(function) = value else {
+                                return Err(EvalError::Message(
+                                    "attempted to call a non-function value".to_owned(),
+                                ));
+                            };
+                            let evaled_args = self.eval_arguments(arguments)?;
+                            return function.call(self.runtime, evaled_args);
+                        }
+                    }
+                    return self.eval_method_call(target, name, arguments);
+                }
+                self.eval_call(callee, arguments)
+            }
             ExprKind::Intrinsic(intrinsic) => self.eval_intrinsic(intrinsic),
             ExprKind::Index { target, index } => self.eval_index(target, index),
             ExprKind::Field { target, name } => {
@@ -1147,6 +1164,71 @@ impl<'a> EvalContext<'a> {
             .collect::<Result<Vec<_>, _>>()?;
 
         function.call(self.runtime, evaluated_args)
+    }
+
+    fn eval_method_call(
+        &mut self,
+        receiver: &Expr,
+        method_name: &str,
+        arguments: &[Argument],
+    ) -> Result<Value, EvalError> {
+        let receiver_val = self.eval_expr(receiver)?;
+
+        let qualified_name = QualifiedName {
+            segments: vec![method_name.to_owned()],
+            span: TextSpan::new(0, 0),
+        };
+
+        let function = if let Some(function) = self.module.resolve_function(method_name) {
+            Some(Rc::new(function))
+        } else if let Some(host_fn) = self
+            .module
+            .resolve_imported_host_function(self.runtime, &qualified_name)
+            .map_err(EvalError::Message)?
+        {
+            Some(Rc::new(FunctionValue::Host(host_fn)))
+        } else {
+            None
+        };
+
+        if let Some(function) = function {
+            let mut evaled_args = Vec::with_capacity(arguments.len() + 1);
+            evaled_args.push(CallArgument::Positional(receiver_val));
+            for argument in arguments {
+                match argument {
+                    Argument::Positional(expr) => {
+                        evaled_args.push(CallArgument::Positional(self.eval_expr(expr)?));
+                    }
+                    Argument::Named { name, value, .. } => {
+                        evaled_args
+                            .push(CallArgument::Named(name.clone(), self.eval_expr(value)?));
+                    }
+                }
+            }
+            return function.call(self.runtime, evaled_args);
+        }
+
+        let field_val = self.eval_field(receiver_val, method_name)?;
+        let Value::Function(f) = field_val else {
+            return Err(EvalError::Message(format!(
+                "`{method_name}` is not a callable value on `{}`",
+                field_val.type_name()
+            )));
+        };
+        let evaled_args = self.eval_arguments(arguments)?;
+        f.call(self.runtime, evaled_args)
+    }
+
+    fn eval_arguments(&mut self, arguments: &[Argument]) -> Result<Vec<CallArgument>, EvalError> {
+        arguments
+            .iter()
+            .map(|argument| match argument {
+                Argument::Positional(expr) => self.eval_expr(expr).map(CallArgument::Positional),
+                Argument::Named { name, value, .. } => self
+                    .eval_expr(value)
+                    .map(|value| CallArgument::Named(name.clone(), value)),
+            })
+            .collect::<Result<Vec<_>, _>>()
     }
 
     fn eval_updated(&mut self, updated: &UpdatedIntrinsic) -> Result<Value, EvalError> {

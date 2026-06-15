@@ -186,6 +186,30 @@ Rules:
 - `a!!` asserts that `a` is non-null;
 - `value.(pkg.fun)(x, y)` is sugar for `pkg.fun(value, x, y)`.
 
+### 4.1 Method Calls
+
+When a postfix `.identifier` is immediately followed by a call suffix (i.e.,
+`value.fun(args)`), the compiler resolves `fun` as a *method* if a function
+named `fun` exists whose first parameter type is assignable from the type of
+`value`. The call is then rewritten to `fun(value, args)`.
+
+Resolution order for `a.b` lookup:
+
+1. record field access — if `a` is a record type and has a field `b`;
+2. method resolution — if a function `b` exists whose first parameter matches
+   the type of `a`;
+3. qualified name resolution — if `a.b` is a valid qualified name (e.g., an
+   imported package member).
+
+For external libraries, struct types expose trait methods as methods when the
+struct implements the corresponding trait. These are resolved through the
+package manifest's `trait_impls` during method resolution.
+
+If a function definition would shadow an existing method (a function with the
+same name and a compatible first parameter), the LSP reports a warning.
+Defining two functions with the same name and indistinguishable parameter
+types (same count and same types at each position) is a compile-time error.
+
 ## 5. `if` Expressions
 
 ```ebnf

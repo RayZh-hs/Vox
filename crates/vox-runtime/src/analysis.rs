@@ -88,6 +88,7 @@ pub struct TypeEnvironment {
     pub functions: Vec<FunctionSummary>,
     pub result: Option<ReplType>,
     pub expr_type_map: BTreeMap<usize, (usize, ReplType)>,
+    pub warnings: Vec<String>,
 }
 
 impl TypeEnvironment {
@@ -334,6 +335,7 @@ struct TypeEngine<'a> {
     values: BTreeMap<String, ValueInfo>,
     functions: BTreeMap<String, FunctionInfo>,
     expr_types: RefCell<BTreeMap<usize, (usize, ReplType)>>,
+    warnings: RefCell<Vec<String>>,
 }
 
 impl<'a> TypeEngine<'a> {
@@ -351,6 +353,7 @@ impl<'a> TypeEngine<'a> {
             values: BTreeMap::new(),
             functions: BTreeMap::new(),
             expr_types: RefCell::new(BTreeMap::new()),
+            warnings: RefCell::new(Vec::new()),
         }
     }
 
@@ -381,6 +384,7 @@ impl<'a> TypeEngine<'a> {
                 .collect(),
             result,
             expr_type_map: self.expr_types.borrow().clone(),
+            warnings: self.warnings.borrow().clone(),
         })
     }
 
@@ -474,6 +478,8 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn collect_function_headers(&mut self) -> Result<(), String> {
+        let mut seen_by_name: BTreeMap<String, Vec<FunctionSummary>> = BTreeMap::new();
+
         for item in &self.unit.items {
             if let TopLevelItem::Function(function) = item {
                 let generic_parameters = generic_parameter_scope(&function.generic_parameters);
@@ -491,27 +497,92 @@ impl<'a> TypeEngine<'a> {
                     .map(|ty| self.type_from_syntax_checked(ty, &generic_parameters))
                     .transpose()?
                     .unwrap_or_else(|| ReplType::Unknown(format!("{} return type", function.name)));
+                let summary = FunctionSummary {
+                    name: function.name.clone(),
+                    generic_parameters: function
+                        .generic_parameters
+                        .iter()
+                        .map(|parameter| GenericParameterSummary {
+                            name: parameter.name.clone(),
+                            bound: parameter.bound.clone(),
+                        })
+                        .collect(),
+                    parameters,
+                    return_type,
+                    evil: function.evil,
+                };
+
+                if let Some(existing) = seen_by_name.get(&function.name) {
+                    for prior in existing {
+                        if functions_indistinguishable(&summary, prior) {
+                            return Err(format!(
+                                "ambiguous function `{}`: has multiple definitions with the same parameter types",
+                                function.name
+                            ));
+                        }
+                    }
+                }
+
+                seen_by_name
+                    .entry(function.name.clone())
+                    .or_default()
+                    .push(summary.clone());
                 self.functions.insert(
                     function.name.clone(),
-                    FunctionInfo {
-                        summary: FunctionSummary {
-                            name: function.name.clone(),
-                            generic_parameters: function
-                                .generic_parameters
-                                .iter()
-                                .map(|parameter| GenericParameterSummary {
-                                    name: parameter.name.clone(),
-                                    bound: parameter.bound.clone(),
-                                })
-                                .collect(),
-                            parameters,
-                            return_type,
-                            evil: function.evil,
-                        },
-                    },
+                    FunctionInfo { summary },
                 );
+
+                let fn_name = &function.name;
+                let fn_first_param_ty = function
+                    .parameters
+                    .first()
+                    .map(|p| self.type_from_syntax_checked(&p.ty, &generic_parameters))
+                    .transpose()?;
+
+                if let Some(first_ty) = fn_first_param_ty {
+                    for (import_path, imported) in &self.imports {
+                        if let Some(manifest) = &imported.manifest {
+                            if let Some(selective) = &imported.selective {
+                                for (imported_name, alias) in selective {
+                                    let effective = alias.as_ref().unwrap_or(imported_name);
+                                    if effective != fn_name {
+                                        continue;
+                                    }
+                                    if let Some(host_fn) =
+                                        manifest.functions.iter().find(|f| &f.name == imported_name)
+                                    {
+                                        if let Some(host_first) = host_fn.parameters.first() {
+                                            let host_ty = from_vox_host_type(&host_first.ty);
+                                            if first_ty.is_assignable_to(&host_ty)
+                                                || host_ty.is_assignable_to(&first_ty)
+                                            {
+                                                self.warnings.borrow_mut().push(format!(
+                                                    "function `{fn_name}` may shadow method from `{import_path}`"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(host_fn) =
+                                manifest.functions.iter().find(|f| f.name == *fn_name)
+                            {
+                                if let Some(host_first) = host_fn.parameters.first() {
+                                    let host_ty = from_vox_host_type(&host_first.ty);
+                                    if first_ty.is_assignable_to(&host_ty)
+                                        || host_ty.is_assignable_to(&first_ty)
+                                    {
+                                        self.warnings.borrow_mut().push(format!(
+                                            "function `{fn_name}` may shadow method from `{import_path}`"
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+
         Ok(())
     }
 
@@ -829,6 +900,36 @@ impl<'a> TypeEngine<'a> {
                 .map(ReplType::Record),
             ExprKind::Name(name) => self.resolve_name_type(name, scope),
             ExprKind::Call { callee, arguments } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if let Some(qualified) = expr_as_qualified_name(callee) {
+                        if let Ok(callee_type) = self.resolve_name_type(&qualified, scope) {
+                            return self.infer_call(callee_type, arguments, scope);
+                        }
+                    }
+                    if let Ok(receiver_type) = self.infer_expr(target, scope) {
+                        if let Some(method_type) =
+                            self.resolve_method_name_type(&receiver_type, name, scope)
+                        {
+                            let mut method_args = Vec::with_capacity(arguments.len() + 1);
+                            method_args.push(CallArgumentType::Positional(receiver_type));
+                            for argument in arguments {
+                                match argument {
+                                    Argument::Positional(expr) => {
+                                        method_args.push(CallArgumentType::Positional(
+                                            self.infer_expr(expr, scope)?,
+                                        ));
+                                    }
+                                    Argument::Named { value, .. } => {
+                                        method_args.push(CallArgumentType::Named(
+                                            self.infer_expr(value, scope)?,
+                                        ));
+                                    }
+                                }
+                            }
+                            return self.apply_call(method_type, method_args);
+                        }
+                    }
+                }
                 let callee_type = self.infer_expr(callee, scope)?;
                 self.infer_call(callee_type, arguments, scope)
             }
@@ -1912,6 +2013,117 @@ impl<'a> TypeEngine<'a> {
         ))
     }
 
+    fn resolve_method_name_type(
+        &self,
+        target_type: &ReplType,
+        method_name: &str,
+        _scope: &TypeScope,
+    ) -> Option<ReplType> {
+        if let Some(function) = self.functions.get(method_name) {
+            if let Some(first_param) = function.summary.parameters.first() {
+                if target_type.is_assignable_to(&first_param.ty) {
+                    return Some(self.function_repl_type(&function.summary));
+                }
+            }
+        }
+
+        for (_, imported) in &self.imports {
+            if let Some(manifest) = &imported.manifest {
+                if let Some(selective) = &imported.selective {
+                    for (fn_name, alias) in selective {
+                        let effective = alias.as_ref().unwrap_or(fn_name);
+                        if effective == method_name {
+                            if let Some(function) =
+                                manifest.functions.iter().find(|f| &f.name == fn_name)
+                            {
+                                if let Some(first_param) = function.parameters.first() {
+                                    let param_ty = from_vox_host_type(&first_param.ty);
+                                    if target_type.is_assignable_to(&param_ty) {
+                                        return Some(self.function_type_from_spec(function));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(function) =
+                    manifest.functions.iter().find(|f| f.name == method_name)
+                {
+                    if let Some(first_param) = function.parameters.first() {
+                        let param_ty = from_vox_host_type(&first_param.ty);
+                        if target_type.is_assignable_to(&param_ty) {
+                            return Some(self.function_type_from_spec(function));
+                        }
+                    }
+                }
+            }
+        }
+
+        self.resolve_trait_method(target_type, method_name)
+    }
+
+    fn resolve_trait_method(
+        &self,
+        target_type: &ReplType,
+        method_name: &str,
+    ) -> Option<ReplType> {
+        let target_name = match target_type {
+            ReplType::Named { name, .. } => name,
+            ReplType::DynTrait(name) => name,
+            _ => return None,
+        };
+
+        for manifest in self.manifests.values() {
+            for (trait_qt, impls) in &manifest.trait_impls {
+                for impl_qt in impls {
+                    let full_impl = format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
+                    if full_impl == *target_name || impl_qt.name == *target_name {
+                        if let Some(trait_spec) = manifest
+                            .traits
+                            .iter()
+                            .find(|t| &t.name == trait_qt)
+                        {
+                            if let Some(method) = trait_spec
+                                .methods
+                                .iter()
+                                .find(|m| m.name == method_name)
+                            {
+                                if let Some(function) = manifest
+                                    .functions
+                                    .iter()
+                                    .find(|f| f.name == method.lowered_by)
+                                {
+                                    return Some(self.function_type_from_spec(function));
+                                }
+
+                                let trait_full = format!(
+                                    "{}.{}",
+                                    trait_spec.name.module.as_str(),
+                                    trait_spec.name.name
+                                );
+                                let mut parameters =
+                                    vec![ReplType::DynTrait(trait_full)];
+                                parameters.extend(
+                                    method
+                                        .parameters
+                                        .iter()
+                                        .map(|p| from_vox_host_type(&p.ty)),
+                                );
+                                return Some(ReplType::Function {
+                                    parameters,
+                                    result: Box::new(from_vox_host_type(
+                                        &method.return_type,
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn function_repl_type(&self, summary: &FunctionSummary) -> ReplType {
         let parameters = summary
             .parameters
@@ -2257,6 +2469,16 @@ fn render_function_set(functions: &BTreeSet<String>) -> String {
         [single] => format!("function {single}"),
         _ => format!("functions {}", names.join(", ")),
     }
+}
+
+fn functions_indistinguishable(a: &FunctionSummary, b: &FunctionSummary) -> bool {
+    if a.parameters.len() != b.parameters.len() {
+        return false;
+    }
+    a.parameters
+        .iter()
+        .zip(b.parameters.iter())
+        .all(|(pa, pb)| pa.ty == pb.ty)
 }
 
 fn addition_result(left: &ReplType, right: &ReplType) -> Option<ReplType> {

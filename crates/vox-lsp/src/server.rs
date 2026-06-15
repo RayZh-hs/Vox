@@ -68,20 +68,33 @@ fn collect_semantic_diagnostics(
     unit: &vox_compiler::frontend::ast::FrontendUnit,
     manifests: &[PackageManifest],
 ) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
     match vox_runtime::infer_environment(&unit.syntax, manifests) {
-        Ok(_) => Vec::new(),
+        Ok(env) => {
+            for warning in &env.warnings {
+                let span = unit.syntax.span.clone();
+                diagnostics.push(Diagnostic {
+                    range: byte_span_to_range(source, span.start, span.end),
+                    severity: Some(DiagnosticSeverity::WARNING),
+                    source: Some("vox".to_string()),
+                    message: warning.clone(),
+                    ..Default::default()
+                });
+            }
+        }
         Err(message) => {
             let span = semantic_error_span(source, unit, &message)
                 .unwrap_or_else(|| unit.syntax.span.clone());
-            vec![Diagnostic {
+            diagnostics.push(Diagnostic {
                 range: byte_span_to_range(source, span.start, span.end),
                 severity: Some(DiagnosticSeverity::ERROR),
                 source: Some("vox".to_string()),
                 message,
                 ..Default::default()
-            }]
+            });
         }
     }
+    diagnostics
 }
 
 fn collect_library_load_diagnostics(source: &str, libraries: &LspLibraries) -> Vec<Diagnostic> {

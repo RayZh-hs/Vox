@@ -1,0 +1,13 @@
+script fixtures.compile_ok.methods;
+
+param input: Int = 1;
+
+fun addOne(x: Int): Int = x + 1;
+
+fun addTwo(x: Int, y: Int): Int = x + y;
+
+val local: Int = input.addOne();
+val twoArg: Int = input.addTwo(2);
+val chained: Int = input.addOne().addTwo(3);
+
+chained

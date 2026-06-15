@@ -88,15 +88,22 @@ Common expression forms:
 - lists use `[1, 2, 3]`.
 - records use `{ name = "vox", version = 1 }`.
 - `value.updated(field = next)` copies an immutable value with selected changes.
+- `value.fun(args)` calls a function as a method — sugar for `fun(value, args)`.
 
 ```vox
-val config = {
-    cache: { enabled: true, ttlSeconds: 60 },
-    retries: [1, 2, 3],
-};
+val i: Int = 1;
 
-val next = config.updated(cache.ttlSeconds = 120, retries.#1 = 5);
+fun add(x: Int, y: Int): Int = x + y;
+
+val result: Int = i.add(2);  // sugar for add(i, 2)
 ```
+
+For external libraries, struct methods from trait implementations are also
+available via this syntax.
+
+Method resolution order: fields, then methods, then qualified names. Defining
+two functions with the same name and identical parameter types is a compile-time
+error.
 
 ## Nullability
 

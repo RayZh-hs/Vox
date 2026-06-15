@@ -581,6 +581,20 @@ impl BodyBuilder {
             }
             ExprKind::Name(name) => self.lower_name(name, Some(expr.span.clone())),
             ExprKind::Call { callee, arguments } => {
+                if let ExprKind::Field { target, name } = &callee.kind {
+                    if is_method_styled_call(target, callee, self) {
+                        let mut args = vec![self.lower_expr(target)];
+                        args.extend(self.lower_arguments(arguments));
+                        return self.emit_op(
+                            MirOpKind::Call {
+                                callee: name.clone(),
+                                purity: Purity::Pure,
+                            },
+                            args,
+                            Some(expr.span.clone()),
+                        );
+                    }
+                }
                 let args = self.lower_arguments(arguments);
                 let resolved = self.resolve_callee_label(callee);
                 self.emit_op(
@@ -2706,6 +2720,19 @@ impl BodyBuilder {
             }
         }
         None
+    }
+}
+
+fn is_method_styled_call(target: &Expr, _callee: &Expr, lowerer: &BodyBuilder) -> bool {
+    match &target.kind {
+        ExprKind::Name(name) => {
+            let label = name.to_source_string();
+            lowerer.resolve_binding(&label).is_some()
+        }
+        _ => {
+            let label = callee_label(target);
+            lowerer.resolve_binding(&label).is_some()
+        }
     }
 }
 

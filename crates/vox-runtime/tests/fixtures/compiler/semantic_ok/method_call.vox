@@ -1,0 +1,15 @@
+script fixtures.method_call;
+
+import fixtures.host;
+
+param input: Int = 1;
+
+fun addOne(x: Int): Int = x + 1;
+
+fun addTwo(x: Int, y: Int): Int = x + y;
+
+val localMethod: Int = input.addOne();
+val localTwoArg: Int = input.addTwo(2);
+val hostMethod: Int = input.add(2);
+
+localMethod

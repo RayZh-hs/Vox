@@ -1,0 +1,7 @@
+script fixtures.method_shadow;
+
+fun foo(x: Int): Int = x + 1;
+
+fun foo(x: Int): Int = x + 2;
+
+1
