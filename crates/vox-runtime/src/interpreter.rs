@@ -6,7 +6,6 @@ use std::{
 };
 
 use vox_compiler::{
-    TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
@@ -14,10 +13,12 @@ use vox_compiler::{
         TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
         ValueDecl,
     },
+    TreewalkScript,
 };
 use vox_core::{
     host::{FunctionSpec, PackageManifest},
     ids::ArtifactId,
+    mir::MirBodyKind,
     plan::CompiledArtifact,
     source::ModulePath,
     types::VoxType,
@@ -260,6 +261,7 @@ struct ModuleState {
     result: Option<Expr>,
     values: BTreeMap<String, ValueDecl>,
     functions: BTreeMap<String, FunctionDecl>,
+    function_return_types: BTreeMap<String, ReplType>,
     parameter_values: RefCell<BTreeMap<String, Value>>,
     script_bindings: RefCell<BTreeMap<String, Binding>>,
     function_captures: RefCell<BTreeMap<String, BTreeMap<String, Value>>>,
@@ -275,6 +277,21 @@ impl ModuleState {
             .cloned()
             .map(|function| (function.name.clone(), function))
             .collect::<BTreeMap<_, _>>();
+        let function_return_types = artifact
+            .mir
+            .as_ref()
+            .map(|mir| {
+                mir.bodies
+                    .iter()
+                    .filter(|body| matches!(body.kind, MirBodyKind::Function))
+                    .filter_map(|body| {
+                        body.result_type
+                            .as_ref()
+                            .map(|ty| (body.name.clone(), runtime_type_from_host_type(ty)))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         Self {
             artifact_id,
@@ -290,6 +307,7 @@ impl ModuleState {
                 .map(|value| (value.name.clone(), value))
                 .collect(),
             functions,
+            function_return_types,
             parameter_values: RefCell::new(BTreeMap::new()),
             script_bindings: RefCell::new(BTreeMap::new()),
             function_captures: RefCell::new(BTreeMap::new()),
@@ -406,6 +424,16 @@ impl ModuleState {
         self.functions.get(name).cloned().map(|decl| {
             let type_scope = runtime_generic_type_scope(&decl.generic_parameters);
             if decl.generic_parameters.is_empty() {
+                let return_type = self
+                    .function_return_types
+                    .get(&decl.name)
+                    .cloned()
+                    .or_else(|| {
+                        decl.return_type
+                            .as_ref()
+                            .map(|ty| runtime_type_from_syntax(ty, &type_scope))
+                    })
+                    .unwrap_or_else(|| ReplType::Unknown(format!("{} return type", decl.name)));
                 FunctionValue::User(UserFunction {
                     name: Some(decl.name.clone()),
                     module: self.clone(),
@@ -414,6 +442,7 @@ impl ModuleState {
                         .into_iter()
                         .map(|parameter| CallableParameter::from_parameter(parameter, &type_scope))
                         .collect(),
+                    return_type,
                     body: decl.body,
                     captured: self.function_capture(&decl.name),
                 })
@@ -1006,6 +1035,7 @@ impl<'a> EvalContext<'a> {
                             .cloned()
                             .map(CallableParameter::from_lambda_parameter)
                             .collect(),
+                        return_type: ReplType::Unknown("<lambda> return type".to_owned()),
                         body: (*lambda.body).clone(),
                         captured,
                     },
@@ -2315,6 +2345,7 @@ pub(crate) struct UserFunction {
     name: Option<String>,
     module: Rc<ModuleState>,
     parameters: Vec<CallableParameter>,
+    return_type: ReplType,
     body: Expr,
     captured: BTreeMap<String, Value>,
 }
@@ -2366,12 +2397,7 @@ impl UserFunction {
     }
 
     fn return_type(&self) -> ReplType {
-        ReplType::Unknown(
-            self.name
-                .clone()
-                .map(|name| format!("{name} return type"))
-                .unwrap_or_else(|| "<lambda> return type".to_owned()),
-        )
+        self.return_type.clone()
     }
 }
 
