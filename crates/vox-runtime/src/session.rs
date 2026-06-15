@@ -258,6 +258,15 @@ impl<R: RuntimeRunner> SessionState<R> {
     }
 
     pub fn run_script_text(&mut self, path: &str, raw: &str) -> Result<RuntimeValue, SessionError> {
+        self.run_script_text_with_args(path, raw, &[])
+    }
+
+    pub fn run_script_text_with_args(
+        &mut self,
+        path: &str,
+        raw: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, SessionError> {
         let parsed = parse_external_script(path, raw)?;
         let items = merge_items(&self.items, parsed.items);
         let source = self.synthetic_source(&items, None, parsed.result_source.as_deref());
@@ -266,7 +275,7 @@ impl<R: RuntimeRunner> SessionState<R> {
             .map_err(|diagnostics| compile_error(diagnostics.to_string()))?;
         self.validate_environment(&frontend.syntax)?;
 
-        self.evaluate_script_source(&source)
+        self.evaluate_script_source_with_args(&source, args)
     }
 
     pub fn drop_item(&mut self, raw: &str) -> Result<bool, SessionError> {
@@ -660,6 +669,14 @@ impl<R: RuntimeRunner> SessionState<R> {
     }
 
     fn evaluate_script_source(&mut self, source: &str) -> Result<RuntimeValue, SessionError> {
+        self.evaluate_script_source_with_args(source, &[])
+    }
+
+    fn evaluate_script_source_with_args(
+        &mut self,
+        source: &str,
+        extra_args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, SessionError> {
         let revision = self.next_revision();
         let compiled = SourceText::new("<repl-eval>", revision, source);
         let settings = self.optimization_settings();
@@ -674,11 +691,12 @@ impl<R: RuntimeRunner> SessionState<R> {
             artifact_id
         };
 
-        let arguments = self
+        let mut arguments: Vec<RuntimeValue> = self
             .live_bindings
             .values()
             .map(|binding| binding.value.clone())
-            .collect::<Vec<_>>();
+            .collect();
+        arguments.extend(extra_args.iter().cloned());
         self.runner
             .run_script(artifact_id, &arguments)
             .map_err(SessionError::from)
@@ -1013,9 +1031,14 @@ impl<R: RuntimeRunner> InteractiveSession<R> {
         self.eval(raw)
     }
 
-    pub fn run_script_text(&mut self, path: &str, raw: &str) -> Result<RuntimeValue, SessionError> {
+    pub fn run_script_text(
+        &mut self,
+        path: &str,
+        raw: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, SessionError> {
         self.runner
-            .run_session_script_text(self.session_id, path, raw)
+            .run_session_script_text_with_args(self.session_id, path, raw, args)
             .map_err(SessionError::from)
     }
 

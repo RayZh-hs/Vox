@@ -77,6 +77,17 @@ pub trait RuntimeRunner: Clone + Send + Sync + 'static {
         raw: &str,
     ) -> Result<RuntimeValue, RunnerError>;
 
+    fn run_session_script_text_with_args(
+        &self,
+        session: SessionId,
+        path: &str,
+        raw: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, RunnerError> {
+        let _ = args;
+        self.run_session_script_text(session, path, raw)
+    }
+
     fn transfer_session_binding(
         &self,
         source: SessionId,
@@ -460,6 +471,21 @@ impl RuntimeRunner for EmbeddedRunner {
             state
                 .state
                 .run_script_text(path, raw)
+                .map_err(map_session_error)
+        })
+    }
+
+    fn run_session_script_text_with_args(
+        &self,
+        session: SessionId,
+        path: &str,
+        raw: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, RunnerError> {
+        self.with_session(session, |state| {
+            state
+                .state
+                .run_script_text_with_args(path, raw, args)
                 .map_err(map_session_error)
         })
     }

@@ -7,32 +7,52 @@ It can either:
 - run with an embedded runtime in the same process;
 - connect to a separate `vox-runtime` server.
 
-## Starting a REPL
+## CLI Arguments
 
-Start an embedded REPL thus:
-
-```sh
-cargo run -p vox-repl
+```text
+vox-repl [OPTIONS] [SCRIPT] [-- SCRIPT_ARGS...]
 ```
 
-You can also start a shared runtime first, then attach the REPL to it:
+When run without arguments, `vox-repl` starts an interactive REPL session.
+When given a script file, it runs the file and prints the trailing expression
+value to stderr.
+
+| Flag | Description |
+|------|-------------|
+| `-i`, `--interactive` | Drop into REPL after running the script |
+| `-s`, `--silent` | Suppress stderr output of trailing expressions |
+| `--connect ADDR` | Connect to a remote runtime (`host:port[@session]`) |
+| `--new` | Create session if missing (requires `--connect`) |
+| `-h`, `--help` | Show help message |
+
+Script arguments after `--` are converted to Vox values and passed as
+positional parameters to the script:
+
+| Input | Vox type |
+|-------|----------|
+| Integer literal | `Int` |
+| Float literal | `Float` |
+| `true` / `false` | `Bool` |
+| `null` | `Null` |
+| Everything else | `String` |
+
+### Examples
 
 ```sh
-cargo run -p vox-runtime -- --listen 127.0.0.1:4545
-cargo run -p vox-repl -- --connect 127.0.0.1:4545
-```
+# Run a script, printing its result to stderr
+vox-repl hello.vox
 
-To attach to an existing remote session, append `@session`:
+# Run a script, then drop into the REPL
+vox-repl -i hello.vox
 
-```sh
-cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared
-cargo run -p vox-repl -- --connect 127.0.0.1:4545@12
-```
+# Run silently (no trailing expression output), then REPL
+vox-repl -i -s hello.vox
 
-Use `--new` with a named target to create it if it does not already exist:
+# Pass arguments to a parameterised script
+vox-repl greet.vox -- "Alice" 42
 
-```sh
-cargo run -p vox-repl -- --connect 127.0.0.1:4545@shared --new
+# Connect to a remote runtime
+vox-repl --connect 127.0.0.1:4545@shared
 ```
 
 ## What the REPL Owns

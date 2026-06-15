@@ -1,7 +1,60 @@
 # Compiler
 
-`vox-compiler` turns Vox source into compiled metadata that `vox-runtime` can
-load and execute.
+`vox-compiler` turns Vox source into compiled artifacts that `vox-runtime` can
+load and execute.  It also serves as a standalone CLI tool for producing wasm
+and `.voxlib` files.
+
+## CLI Usage
+
+```text
+vox-compiler [OPTIONS] FILE
+```
+
+Compile a `.vox` source file.  The output format is chosen automatically:
+scripts produce raw wasm, and packages produce `.voxlib` artifacts.
+
+| Flag | Description |
+|------|-------------|
+| `--mount PATH` | Mount a library directory, `.vox`, or `.voxlib` file as a dependency (repeatable) |
+| `-o OUTPUT` | Output file path (default: input stem with `.wasm` or `.voxlib`) |
+| `--package` | Force `.voxlib` output even for script sources |
+| `-h`, `--help` | Show help message |
+
+### Examples
+
+```sh
+# Compile a script to wasm
+vox-compiler hello.vox                    # → hello.wasm
+
+# Compile a script with library dependencies
+vox-compiler --mount ./lib/ app.vox       # → app.wasm
+
+# Compile a package to .voxlib (auto-detected)
+vox-compiler mylib.vox                    # → mylib.voxlib
+
+# Force .voxlib output
+vox-compiler --package script.vox         # → script.voxlib
+
+# Custom output path
+vox-compiler -o out.wasm hello.vox
+```
+
+### Auto-detection
+
+The compiler inspects the source to decide the output format:
+
+- Sources starting with `package` → `.voxlib` (compiled via `compile_to_voxlib`)
+- All other sources → raw wasm bytes
+
+Use `--package` to override auto-detection and force `.voxlib` output.
+
+### Library Mounting
+
+`--mount PATH` supports:
+
+- `.voxlib` files: decoded and registered in the compilation host registry.
+- Directories: scanned for `.voxlib` files (non-recursive).
+- `.vox` files: not supported directly; compile to `.voxlib` first.
 
 ## Pipeline
 

@@ -69,6 +69,21 @@ impl<R: RuntimeRunner> ReplSession<R> {
         Self { runner, runtime }
     }
 
+    pub fn run_script_text(
+        &mut self,
+        path: &str,
+        text: &str,
+        args: &[RuntimeValue],
+    ) -> Result<RuntimeValue, String> {
+        self.runtime
+            .run_script_text(path, text, args)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn render_value(&self, value: &RuntimeValue) -> String {
+        self.render_runtime_value(value)
+    }
+
     pub fn handle_line(&mut self, line: &str) -> ReplOutput {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -314,7 +329,7 @@ impl<R: RuntimeRunner> ReplSession<R> {
             Err(error) => return ReplOutput::error(error.to_string()),
         };
 
-        match self.runtime.run_script_text(path, &text) {
+        match self.runtime.run_script_text(path, &text, &[]) {
             Ok(value) => ReplOutput::message(self.render_runtime_value(&value)),
             Err(error) => ReplOutput::error(error.to_string()),
         }

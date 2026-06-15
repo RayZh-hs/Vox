@@ -1,9 +1,56 @@
-use std::{env, error::Error};
+//! `vox-repl` — Interactive read-eval-print loop for the Vox language.
+//!
+//! ## Usage
+//!
+//! ```text
+//! vox-repl [OPTIONS] [SCRIPT] [-- SCRIPT_ARGS...]
+//! ```
+//!
+//! When run without arguments, starts an interactive REPL session.
+//! When given a script file, runs it and prints the trailing expression
+//! value to stderr.  Use `-i` to drop into the REPL after the script has
+//! run, and `-s` to suppress the trailing-expression output.
+//!
+//! Script arguments after `--` are converted to Vox values (integers,
+//! floats, booleans, `null`, or strings) and passed as the script's
+//! positional parameters.
+//!
+//! ### Options
+//!
+//! | Flag | Description |
+//! |------|-------------|
+//! | `-i`, `--interactive` | Drop into REPL after running the script |
+//! | `-s`, `--silent` | Suppress stderr output of trailing expressions |
+//! | `--connect ADDR` | Connect to a remote vox-runtime instance (host:port\[@session\]) |
+//! | `--new` | Create session if missing (requires `--connect`) |
+//! | `-h`, `--help` | Show help message |
+//!
+//! ### Examples
+//!
+//! ```sh
+//! # Start an interactive REPL
+//! vox-repl
+//!
+//! # Run a script, showing its result on stderr
+//! vox-repl hello.vox
+//!
+//! # Run a script, then drop into the REPL
+//! vox-repl -i hello.vox
+//!
+//! # Run a script silently (no stderr output), then REPL
+//! vox-repl -i -s hello.vox
+//!
+//! # Pass arguments to a parameterised script
+//! vox-repl greet.vox -- "Alice" 42
+//! ```
+
+use std::{env, error::Error, fs};
 
 use rustyline::{
     Cmd, ConditionalEventHandler, Config, Editor, Event, EventContext, EventHandler, KeyCode,
     KeyEvent, Modifiers, Movement, RepeatCount, history::DefaultHistory,
 };
+use vox_core::value::{InlineValue, RuntimeValue};
 use vox_repl::{CompletionUi, ReplHelper, ReplOutput, ReplSession, TabCompletion};
 use vox_runtime::{
     EmbeddedRunner, RemoteRunner, RuntimeRunner, SessionOpenMode, SessionOpenRequest,
@@ -15,19 +62,48 @@ const CONTINUATION_PROMPT: &str = "... ";
 const INDENT: &str = "    ";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let runner = match parse_connect_spec()? {
+    let CliArgs { connect, script_path, interactive, silent, script_args } = parse_cli_args()?;
+    let runner = match connect {
         Some(spec) => RunnerChoice::Remote {
             runner: RemoteRunner::connect(spec.addr)?,
             session: spec.session,
         },
         None => RunnerChoice::Embedded(EmbeddedRunner::default()),
     };
+
+    let should_repl = interactive || script_path.is_none();
     match runner {
-        RunnerChoice::Embedded(runner) => run_repl(ReplSession::with_runner(runner)),
-        RunnerChoice::Remote { runner, session } => {
-            run_repl(ReplSession::with_session_request(runner, session))
+        RunnerChoice::Embedded(runner) => {
+            let mut session = ReplSession::with_runner(runner);
+            if let Some(ref path) = script_path {
+                if let Err(error) = run_script_file(&mut session, path, silent, &script_args) {
+                    eprintln!("error: {error}");
+                    if !interactive {
+                        return Err(error);
+                    }
+                }
+            }
+            if should_repl {
+                run_repl(session)?;
+            }
+        }
+        RunnerChoice::Remote { runner, session: session_req } => {
+            let mut session = ReplSession::with_session_request(runner, session_req);
+            if let Some(ref path) = script_path {
+                if let Err(error) = run_script_file(&mut session, path, silent, &script_args) {
+                    eprintln!("error: {error}");
+                    if !interactive {
+                        return Err(error);
+                    }
+                }
+            }
+            if should_repl {
+                run_repl(session)?;
+            }
         }
     }
+
+    Ok(())
 }
 
 fn run_repl<R: RuntimeRunner>(mut session: ReplSession<R>) -> Result<(), Box<dyn Error>> {
@@ -115,6 +191,36 @@ fn run_repl<R: RuntimeRunner>(mut session: ReplSession<R>) -> Result<(), Box<dyn
     Ok(())
 }
 
+struct CliArgs {
+    connect: Option<RemoteConnectSpec>,
+    script_path: Option<String>,
+    interactive: bool,
+    silent: bool,
+    script_args: Vec<RuntimeValue>,
+}
+
+fn run_script_file<R: RuntimeRunner>(
+    session: &mut ReplSession<R>,
+    path: &str,
+    silent: bool,
+    args: &[RuntimeValue],
+) -> Result<(), Box<dyn Error>> {
+    let text = fs::read_to_string(path)?;
+    match session.run_script_text(path, &text, args) {
+        Ok(value) => {
+            if !silent && !is_script_noop_result(&value) {
+                eprintln!("{}", session.render_value(&value));
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_script_noop_result(value: &RuntimeValue) -> bool {
+    matches!(value, RuntimeValue::Inline(InlineValue::Tuple(values)) if values.is_empty())
+}
+
 enum RunnerChoice {
     Embedded(EmbeddedRunner),
     Remote {
@@ -128,10 +234,24 @@ struct RemoteConnectSpec {
     session: SessionOpenRequest,
 }
 
-fn parse_connect_spec() -> Result<Option<RemoteConnectSpec>, Box<dyn Error>> {
-    let mut args = env::args().skip(1);
+fn parse_cli_args() -> Result<CliArgs, Box<dyn Error>> {
+    let all_args: Vec<String> = env::args().skip(1).collect();
+    let sep = all_args.iter().position(|arg| arg == "--");
+    let vox_args = match sep {
+        Some(index) => &all_args[..index],
+        None => all_args.as_slice(),
+    };
+    let raw_script_args: &[String] = match sep {
+        Some(index) => &all_args[index + 1..],
+        None => &[],
+    };
+
+    let mut args = vox_args.iter();
     let mut connect = None;
     let mut create_if_missing = false;
+    let mut interactive = false;
+    let mut silent = false;
+    let mut script_path = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -139,27 +259,98 @@ fn parse_connect_spec() -> Result<Option<RemoteConnectSpec>, Box<dyn Error>> {
                 let Some(addr) = args.next() else {
                     return Err("`--connect` requires an address".into());
                 };
-                connect = Some(addr);
+                connect = Some(addr.clone());
             }
             "--new" => create_if_missing = true,
+            "--interactive" | "-i" => interactive = true,
+            "--silent" | "-s" => silent = true,
             "--help" | "-h" => {
-                println!("Usage: vox-repl [--connect host:port[@session]] [--new]");
+                println!("Usage: vox-repl [OPTIONS] [SCRIPT] [-- SCRIPT_ARGS...]");
+                println!();
+                println!("Options:");
+                println!("  -i, --interactive    Drop into REPL after running the script");
+                println!("  -s, --silent         Suppress stderr output of trailing expressions");
+                println!("  --connect ADDR       Connect to a remote vox-runtime instance");
+                println!("  --new                Create session if missing (requires --connect)");
+                println!("  -h, --help           Show this help message");
+                println!();
+                println!("Arguments after `--` are passed to the script as positional parameters:");
+                println!("  integers → Int,  floats → Float,  true/false → Bool,  null → Null");
+                println!("  everything else → String");
                 std::process::exit(0);
             }
             other => {
-                return Err(format!("unrecognized argument `{other}`").into());
+                if other.starts_with('-') {
+                    return Err(format!("unrecognized argument `{other}`").into());
+                }
+                if script_path.is_some() {
+                    return Err("only one script file may be provided".into());
+                }
+                script_path = Some(other.to_owned());
             }
         }
     }
 
-    let Some(connect) = connect else {
-        if create_if_missing {
-            return Err("`--new` requires `--connect host:port@session`".into());
+    let connect = match connect {
+        Some(connect) => {
+            if create_if_missing {
+                let (_addr, selector) = split_connect_target(&connect)?;
+                match selector {
+                    Some(SessionSelector::Id(id)) => {
+                        return Err(format!(
+                            "`--new` cannot create a session with explicit id {}",
+                            id.0
+                        )
+                        .into());
+                    }
+                    _ => {}
+                }
+            }
+            Some(parse_remote_connect_spec(&connect, create_if_missing)?)
         }
-        return Ok(None);
+        None => {
+            if create_if_missing {
+                return Err("`--new` requires `--connect host:port@session`".into());
+            }
+            None
+        }
     };
 
-    let (addr, selector) = split_connect_target(&connect)?;
+    let script_args = raw_script_args
+        .iter()
+        .map(|arg| parse_script_arg(arg))
+        .collect();
+
+    Ok(CliArgs {
+        connect,
+        script_path,
+        interactive,
+        silent,
+        script_args,
+    })
+}
+
+fn parse_script_arg(raw: &str) -> RuntimeValue {
+    if raw == "true" {
+        RuntimeValue::Inline(InlineValue::Bool(true))
+    } else if raw == "false" {
+        RuntimeValue::Inline(InlineValue::Bool(false))
+    } else if raw == "null" {
+        RuntimeValue::Inline(InlineValue::Null)
+    } else if let Ok(value) = raw.parse::<i64>() {
+        RuntimeValue::Inline(InlineValue::Int(value))
+    } else if let Ok(value) = raw.parse::<f64>() {
+        RuntimeValue::Inline(InlineValue::Float(value))
+    } else {
+        RuntimeValue::Inline(InlineValue::String(raw.to_owned()))
+    }
+}
+
+fn parse_remote_connect_spec(
+    raw: &str,
+    create_if_missing: bool,
+) -> Result<RemoteConnectSpec, Box<dyn Error>> {
+    let (addr, selector) = split_connect_target(raw)?;
     let session = match selector {
         Some(SessionSelector::Id(id)) => {
             if create_if_missing {
@@ -185,8 +376,7 @@ fn parse_connect_spec() -> Result<Option<RemoteConnectSpec>, Box<dyn Error>> {
             mode: SessionOpenMode::Create,
         },
     };
-
-    Ok(Some(RemoteConnectSpec { addr, session }))
+    Ok(RemoteConnectSpec { addr, session })
 }
 
 fn split_connect_target(raw: &str) -> Result<(String, Option<SessionSelector>), Box<dyn Error>> {
