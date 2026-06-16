@@ -6,6 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 use vox_compiler::frontend;
+use vox_core::builtins::BuiltinReceiver;
 use vox_core::diagnostics::DiagnosticBag;
 use vox_core::host::PackageManifest;
 use vox_core::source::SourceText;
@@ -1659,6 +1660,66 @@ fn find_name_at_offset(
     None
 }
 
+fn builtin_signature_help(call_info: &CallInfo) -> Option<SignatureHelp> {
+    let candidates = [
+        BuiltinReceiver::Int,
+        BuiltinReceiver::Float,
+        BuiltinReceiver::Bool,
+        BuiltinReceiver::String,
+        BuiltinReceiver::List,
+        BuiltinReceiver::Econ,
+    ];
+    let summary = candidates
+        .iter()
+        .flat_map(|receiver| {
+            let ty = repl_type_for_builtin_receiver(*receiver);
+            vox_runtime::builtin_method_summaries_for_type(&ty)
+        })
+        .find(|summary| summary.name == call_info.callee_name)?;
+    let params = summary
+        .parameters
+        .iter()
+        .skip(1)
+        .map(|param| ParameterInformation {
+            label: ParameterLabel::Simple(format!("{}: {}", param.name, param.ty.render())),
+            documentation: None,
+        })
+        .collect::<Vec<_>>();
+    let active = call_info
+        .active_parameter
+        .min(params.len().saturating_sub(1));
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label: format!(
+                "{}{}",
+                summary.name,
+                format_function_summary_detail(&summary)
+            ),
+            documentation: None,
+            parameters: Some(params),
+            active_parameter: Some(active as u32),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active as u32),
+    })
+}
+
+fn repl_type_for_builtin_receiver(receiver: BuiltinReceiver) -> vox_runtime::ReplType {
+    match receiver {
+        BuiltinReceiver::Int => vox_runtime::ReplType::Int,
+        BuiltinReceiver::Float => vox_runtime::ReplType::Float,
+        BuiltinReceiver::Bool => vox_runtime::ReplType::Bool,
+        BuiltinReceiver::String => vox_runtime::ReplType::String,
+        BuiltinReceiver::List => {
+            vox_runtime::ReplType::List(Box::new(vox_runtime::ReplType::Unknown("T".to_owned())))
+        }
+        BuiltinReceiver::Econ => vox_runtime::ReplType::Named {
+            name: "Econ".to_owned(),
+            arguments: vec![vox_runtime::ReplType::Unknown("T".to_owned())],
+        },
+    }
+}
+
 fn identifier_at_offset(source: &str, offset: usize) -> Option<&str> {
     let bytes = source.as_bytes();
     if offset >= bytes.len() {
@@ -2222,10 +2283,14 @@ fn find_call_at_offset(
                         Argument::Named { value: e, .. } => e.span.clone(),
                     };
                     if offset >= arg_span.start && offset <= arg_span.end {
-                        if let ExprKind::Name(ref qname) = callee.kind {
-                            if !qname.segments.is_empty() {
+                        match &callee.kind {
+                            ExprKind::Name(qname) if !qname.segments.is_empty() => {
                                 *best = Some((qname.to_source_string(), i));
                             }
+                            ExprKind::Field { name, .. } => {
+                                *best = Some((name.clone(), i));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2274,6 +2339,16 @@ fn find_call_at_offset(
         callee_name: name,
         active_parameter: idx,
     })
+}
+
+fn format_function_summary_detail(function: &vox_runtime::FunctionSummary) -> String {
+    let params = function
+        .parameters
+        .iter()
+        .map(|param| format!("{}: {}", param.name, param.ty.render()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({params}) -> {}", function.return_type.render())
 }
 
 fn compute_signature_help(source: &str, position: Position) -> Option<SignatureHelp> {
@@ -2325,6 +2400,10 @@ fn compute_signature_help(source: &str, position: Position) -> Option<SignatureH
                 });
             }
         }
+    }
+
+    if let Some(sig) = builtin_signature_help(&call_info) {
+        return Some(sig);
     }
 
     None
@@ -2391,38 +2470,35 @@ fn try_dot_completion(source: &str, position: Position) -> Option<Vec<Completion
         };
     }
 
-    // Generate completions from the final type's fields
-    match current_type {
-        Some(ReplType::Record(fields)) => Some(
-            fields
-                .iter()
-                .map(|f| CompletionItem {
-                    label: f.name.clone(),
-                    kind: Some(CompletionItemKind::FIELD),
-                    detail: Some(f.ty.render()),
-                    ..Default::default()
-                })
-                .collect(),
-        ),
-        Some(ReplType::Nullable(inner)) => {
-            if let ReplType::Record(fields) = *inner {
-                Some(
-                    fields
-                        .iter()
-                        .map(|f| CompletionItem {
-                            label: f.name.clone(),
-                            kind: Some(CompletionItemKind::FIELD),
-                            detail: Some(f.ty.render()),
-                            ..Default::default()
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        }
+    let current_type = current_type?;
+    let mut items = Vec::new();
+    let field_type = match current_type.clone() {
+        ReplType::Record(fields) => Some(fields),
+        ReplType::Nullable(inner) => match *inner {
+            ReplType::Record(fields) => Some(fields),
+            _ => None,
+        },
         _ => None,
+    };
+    if let Some(fields) = field_type {
+        items.extend(fields.into_iter().map(|f| CompletionItem {
+            label: f.name,
+            kind: Some(CompletionItemKind::FIELD),
+            detail: Some(f.ty.render()),
+            ..Default::default()
+        }));
     }
+    items.extend(
+        vox_runtime::builtin_method_summaries_for_type(&current_type)
+            .into_iter()
+            .map(|method| CompletionItem {
+                label: method.name.clone(),
+                kind: Some(CompletionItemKind::METHOD),
+                detail: Some(format_function_summary_detail(&method)),
+                ..Default::default()
+            }),
+    );
+    if items.is_empty() { None } else { Some(items) }
 }
 
 fn extract_receiver_chain(prefix: &str) -> Option<Vec<String>> {

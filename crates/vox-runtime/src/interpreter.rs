@@ -6,6 +6,7 @@ use std::{
 };
 
 use vox_compiler::{
+    TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
@@ -13,9 +14,9 @@ use vox_compiler::{
         TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
         ValueDecl,
     },
-    TreewalkScript,
 };
 use vox_core::{
+    builtins::{self, BuiltinReceiver},
     diagnostics::TextSpan,
     host::{FunctionSpec, PackageManifest},
     ids::ArtifactId,
@@ -1174,10 +1175,6 @@ impl<'a> EvalContext<'a> {
     ) -> Result<Value, EvalError> {
         let receiver_val = self.eval_expr(receiver)?;
 
-        if method_name == "update" && matches!(receiver_val, Value::Econ(_)) {
-            return self.eval_econ_update(receiver_val, arguments);
-        }
-
         let qualified_name = QualifiedName {
             segments: vec![method_name.to_owned()],
             span: TextSpan::new(0, 0),
@@ -1204,12 +1201,27 @@ impl<'a> EvalContext<'a> {
                         evaled_args.push(CallArgument::Positional(self.eval_expr(expr)?));
                     }
                     Argument::Named { name, value, .. } => {
-                        evaled_args
-                            .push(CallArgument::Named(name.clone(), self.eval_expr(value)?));
+                        evaled_args.push(CallArgument::Named(name.clone(), self.eval_expr(value)?));
                     }
                 }
             }
             return function.call(self.runtime, evaled_args);
+        }
+
+        if let Some(receiver) = builtin_receiver_for_value(&receiver_val) {
+            if builtins::builtin_method(receiver, method_name).is_some() {
+                if receiver == BuiltinReceiver::Econ && method_name == "update" {
+                    return self.eval_econ_update(receiver_val, arguments);
+                }
+                let mut evaled_args = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    match argument {
+                        Argument::Positional(expr) => evaled_args.push(self.eval_expr(expr)?),
+                        Argument::Named { value, .. } => evaled_args.push(self.eval_expr(value)?),
+                    }
+                }
+                return eval_builtin_method(receiver_val, receiver, method_name, evaled_args);
+            }
         }
 
         let field_val = self.eval_field(receiver_val, method_name)?;
@@ -1292,7 +1304,11 @@ impl<'a> EvalContext<'a> {
 
         let (module, body, captured) = {
             let econ = econ.borrow();
-            (econ.module.clone(), econ.body.clone(), econ.captured.clone())
+            (
+                econ.module.clone(),
+                econ.body.clone(),
+                econ.captured.clone(),
+            )
         };
 
         let mut context = EvalContext::new(self.runtime, module);
@@ -3435,6 +3451,365 @@ fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
         }
         _ => None,
     }
+}
+
+fn builtin_receiver_for_value(value: &Value) -> Option<BuiltinReceiver> {
+    match value {
+        Value::Int(_) => Some(BuiltinReceiver::Int),
+        Value::Float(_) => Some(BuiltinReceiver::Float),
+        Value::Bool(_) => Some(BuiltinReceiver::Bool),
+        Value::String(_) => Some(BuiltinReceiver::String),
+        Value::List(_) => Some(BuiltinReceiver::List),
+        Value::Econ(_) => Some(BuiltinReceiver::Econ),
+        _ => None,
+    }
+}
+
+fn eval_builtin_method(
+    receiver_value: Value,
+    receiver: BuiltinReceiver,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    match receiver {
+        BuiltinReceiver::Int => eval_int_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::Float => eval_float_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::Bool => eval_bool_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::String => eval_string_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::List => eval_list_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::Econ => {
+            let _ = arguments;
+            unknown_builtin_method(receiver, method_name)
+        }
+    }
+}
+
+fn eval_int_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    expect_arg_count(method_name, &arguments, 0)?;
+    let Value::Int(value) = receiver else {
+        return Err(EvalError::Message(
+            "Int builtin receiver mismatch".to_owned(),
+        ));
+    };
+    match method_name {
+        "toString" => Ok(Value::String(value.to_string())),
+        "toFloat" => Ok(Value::Float(value as f64)),
+        _ => unknown_builtin_method(BuiltinReceiver::Int, method_name),
+    }
+}
+
+fn eval_float_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    expect_arg_count(method_name, &arguments, 0)?;
+    let Value::Float(value) = receiver else {
+        return Err(EvalError::Message(
+            "Float builtin receiver mismatch".to_owned(),
+        ));
+    };
+    match method_name {
+        "toString" => Ok(Value::String(value.to_string())),
+        "toInt" => float_to_int(value).map(|value| value.map(Value::Int).unwrap_or(Value::Null)),
+        "round" => checked_f64_to_i64((value + 0.5).floor()).map(Value::Int),
+        "floor" => checked_f64_to_i64(value.floor()).map(Value::Int),
+        "ceil" => checked_f64_to_i64(value.ceil()).map(Value::Int),
+        _ => unknown_builtin_method(BuiltinReceiver::Float, method_name),
+    }
+}
+
+fn eval_bool_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    expect_arg_count(method_name, &arguments, 0)?;
+    let Value::Bool(value) = receiver else {
+        return Err(EvalError::Message(
+            "Bool builtin receiver mismatch".to_owned(),
+        ));
+    };
+    match method_name {
+        "toString" => Ok(Value::String(value.to_string())),
+        _ => unknown_builtin_method(BuiltinReceiver::Bool, method_name),
+    }
+}
+
+fn eval_string_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    let Value::String(value) = receiver else {
+        return Err(EvalError::Message(
+            "String builtin receiver mismatch".to_owned(),
+        ));
+    };
+    match method_name {
+        "length" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            i64::try_from(value.chars().count())
+                .map(Value::Int)
+                .map_err(|_| EvalError::Message("string length overflow".to_owned()))
+        }
+        "isEmpty" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::Bool(value.is_empty()))
+        }
+        "toInt" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(value.parse::<i64>().map(Value::Int).unwrap_or(Value::Null))
+        }
+        "toFloat" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(value
+                .parse::<f64>()
+                .map(Value::Float)
+                .unwrap_or(Value::Null))
+        }
+        "startsWith" => Ok(Value::Bool(value.starts_with(&expect_string_arg(
+            method_name,
+            &arguments,
+            0,
+        )?))),
+        "endsWith" => Ok(Value::Bool(value.ends_with(&expect_string_arg(
+            method_name,
+            &arguments,
+            0,
+        )?))),
+        "contains" => Ok(Value::Bool(value.contains(&expect_string_arg(
+            method_name,
+            &arguments,
+            0,
+        )?))),
+        "indexOf" => {
+            let sub = expect_string_arg(method_name, &arguments, 0)?;
+            Ok(value
+                .find(&sub)
+                .map(|byte_index| Value::Int(value[..byte_index].chars().count() as i64))
+                .unwrap_or(Value::Null))
+        }
+        "substring" => {
+            expect_arg_count(method_name, &arguments, 2)?;
+            let start = expect_int(&arguments[0], method_name)?;
+            let end = expect_int(&arguments[1], method_name)?;
+            substring_chars(&value, start, end).map(Value::String)
+        }
+        "replace" => {
+            expect_arg_count(method_name, &arguments, 2)?;
+            let old = expect_string(&arguments[0], method_name)?;
+            let new = expect_string(&arguments[1], method_name)?;
+            Ok(Value::String(value.replace(&old, &new)))
+        }
+        "split" => {
+            let delim = expect_string_arg(method_name, &arguments, 0)?;
+            Ok(Value::List(
+                value
+                    .split(&delim)
+                    .map(|part| Value::String(part.to_owned()))
+                    .collect(),
+            ))
+        }
+        "toLower" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::String(value.to_lowercase()))
+        }
+        "toUpper" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::String(value.to_uppercase()))
+        }
+        "trim" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::String(value.trim().to_owned()))
+        }
+        "repeat" => {
+            let count = expect_int_arg(method_name, &arguments, 0)?;
+            if count < 0 {
+                return Err(EvalError::Message(
+                    "repeat count must be non-negative".to_owned(),
+                ));
+            }
+            Ok(Value::String(value.repeat(count as usize)))
+        }
+        _ => unknown_builtin_method(BuiltinReceiver::String, method_name),
+    }
+}
+
+fn eval_list_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    let Value::List(items) = receiver else {
+        return Err(EvalError::Message(
+            "List builtin receiver mismatch".to_owned(),
+        ));
+    };
+    match method_name {
+        "length" | "size" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            i64::try_from(items.len())
+                .map(Value::Int)
+                .map_err(|_| EvalError::Message("list length overflow".to_owned()))
+        }
+        "isEmpty" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::Bool(items.is_empty()))
+        }
+        "first" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(items.first().cloned().unwrap_or(Value::Null))
+        }
+        "last" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(items.last().cloned().unwrap_or(Value::Null))
+        }
+        "get" => {
+            let index = expect_int_arg(method_name, &arguments, 0)?;
+            Ok(list_get(&items, index).unwrap_or(Value::Null))
+        }
+        "contains" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            Ok(Value::Bool(
+                items.iter().any(|item| item.equals(&arguments[0])),
+            ))
+        }
+        "indexOf" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            Ok(items
+                .iter()
+                .position(|item| item.equals(&arguments[0]))
+                .map(|index| Value::Int(index as i64))
+                .unwrap_or(Value::Null))
+        }
+        "slice" => {
+            expect_arg_count(method_name, &arguments, 2)?;
+            let from = expect_int(&arguments[0], method_name)?;
+            let to = expect_int(&arguments[1], method_name)?;
+            slice_values(&items, from, to).map(Value::List)
+        }
+        "reversed" => {
+            expect_arg_count(method_name, &arguments, 0)?;
+            Ok(Value::List(items.into_iter().rev().collect()))
+        }
+        _ => unknown_builtin_method(BuiltinReceiver::List, method_name),
+    }
+}
+
+fn expect_arg_count(
+    method_name: &str,
+    arguments: &[Value],
+    expected: usize,
+) -> Result<(), EvalError> {
+    if arguments.len() == expected {
+        Ok(())
+    } else {
+        Err(EvalError::Message(format!(
+            "`{method_name}` expects {expected} argument(s), got {}",
+            arguments.len()
+        )))
+    }
+}
+
+fn expect_int_arg(method_name: &str, arguments: &[Value], index: usize) -> Result<i64, EvalError> {
+    expect_arg_count(method_name, arguments, index + 1)?;
+    expect_int(&arguments[index], method_name)
+}
+
+fn expect_string_arg(
+    method_name: &str,
+    arguments: &[Value],
+    index: usize,
+) -> Result<String, EvalError> {
+    expect_arg_count(method_name, arguments, index + 1)?;
+    expect_string(&arguments[index], method_name)
+}
+
+fn expect_int(value: &Value, method_name: &str) -> Result<i64, EvalError> {
+    let Value::Int(value) = value else {
+        return Err(EvalError::Message(format!(
+            "`{method_name}` expected Int argument"
+        )));
+    };
+    Ok(*value)
+}
+
+fn expect_string(value: &Value, method_name: &str) -> Result<String, EvalError> {
+    let Value::String(value) = value else {
+        return Err(EvalError::Message(format!(
+            "`{method_name}` expected String argument"
+        )));
+    };
+    Ok(value.clone())
+}
+
+fn substring_chars(value: &str, start: i64, end: i64) -> Result<String, EvalError> {
+    if start < 0 || end < start {
+        return Err(EvalError::Message(
+            "substring bounds must satisfy 0 <= start <= end".to_owned(),
+        ));
+    }
+    let start = start as usize;
+    let end = end as usize;
+    let len = value.chars().count();
+    if end > len {
+        return Err(EvalError::Message(
+            "substring end is out of bounds".to_owned(),
+        ));
+    }
+    Ok(value.chars().skip(start).take(end - start).collect())
+}
+
+fn list_get(items: &[Value], index: i64) -> Option<Value> {
+    if index < 0 {
+        return None;
+    }
+    items.get(index as usize).cloned()
+}
+
+fn slice_values(items: &[Value], from: i64, to: i64) -> Result<Vec<Value>, EvalError> {
+    if from < 0 || to < from {
+        return Err(EvalError::Message(
+            "slice bounds must satisfy 0 <= from <= to".to_owned(),
+        ));
+    }
+    let from = from as usize;
+    let to = to as usize;
+    if to > items.len() {
+        return Err(EvalError::Message("slice end is out of bounds".to_owned()));
+    }
+    Ok(items[from..to].to_vec())
+}
+
+fn float_to_int(value: f64) -> Result<Option<i64>, EvalError> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Ok(None);
+    }
+    Ok(Some(value.trunc() as i64))
+}
+
+fn checked_f64_to_i64(value: f64) -> Result<i64, EvalError> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err(EvalError::Message(
+            "Float value is out of Int range".to_owned(),
+        ));
+    }
+    Ok(value as i64)
+}
+
+fn unknown_builtin_method(
+    receiver: BuiltinReceiver,
+    method_name: &str,
+) -> Result<Value, EvalError> {
+    Err(EvalError::Message(format!(
+        "unknown builtin method `{}.{method_name}`",
+        receiver.name()
+    )))
 }
 
 pub(crate) fn runtime_value_from_value(

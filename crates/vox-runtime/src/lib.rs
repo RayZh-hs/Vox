@@ -32,8 +32,8 @@ use vox_core::{
 
 pub use analysis::{
     BindingSummary, CallableParameterSummary, FunctionSummary, GenericParameterSummary,
-    RecordFieldType, ReplType, TypeEnvironment, extend_manifest_symbols, infer_environment,
-    language_keywords,
+    RecordFieldType, ReplType, TypeEnvironment, builtin_method_summaries_for_type,
+    extend_manifest_symbols, infer_environment, language_keywords,
 };
 pub use artifact_store::ArtifactStore;
 pub use handles::{

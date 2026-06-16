@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use vox_core::{
+    builtins::{self, BuiltinReceiver},
     host::ParameterSpec,
     ids::ArtifactId,
     mir::{
@@ -354,6 +355,9 @@ impl<'a> MirExecutor<'a> {
             .iter()
             .map(|arg| self.value(*arg))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some((receiver, method)) = builtins::split_builtin_callee(callee) {
+            return self.eval_builtin_call(receiver, method, runtime_args);
+        }
         if let Some(function) = self
             .module
             .bodies
@@ -397,6 +401,66 @@ impl<'a> MirExecutor<'a> {
         }
 
         Err(format!("MIR call target `{callee}` is not executable yet"))
+    }
+
+    fn eval_builtin_call(
+        &mut self,
+        receiver: BuiltinReceiver,
+        method: &str,
+        args: Vec<InlineValue>,
+    ) -> Result<InlineValue, String> {
+        let Some((first, rest)) = args.split_first() else {
+            return Err(format!(
+                "builtin `{}.{method}` expects a receiver",
+                receiver.name()
+            ));
+        };
+        match receiver {
+            BuiltinReceiver::Int => {
+                let InlineValue::Int(value) = first else {
+                    return Err("Int builtin receiver mismatch".to_owned());
+                };
+                expect_builtin_arg_count(method, rest, 0)?;
+                match method {
+                    "toString" => Ok(InlineValue::String(value.to_string())),
+                    "toFloat" => Ok(InlineValue::Float(*value as f64)),
+                    _ => unknown_mir_builtin(receiver, method),
+                }
+            }
+            BuiltinReceiver::Float => {
+                let InlineValue::Float(value) = first else {
+                    return Err("Float builtin receiver mismatch".to_owned());
+                };
+                expect_builtin_arg_count(method, rest, 0)?;
+                match method {
+                    "toString" => Ok(InlineValue::String(value.to_string())),
+                    "toInt" => Ok(float_to_int_inline(*value)),
+                    "round" => checked_f64_to_i64((*value + 0.5).floor()).map(InlineValue::Int),
+                    "floor" => checked_f64_to_i64(value.floor()).map(InlineValue::Int),
+                    "ceil" => checked_f64_to_i64(value.ceil()).map(InlineValue::Int),
+                    _ => unknown_mir_builtin(receiver, method),
+                }
+            }
+            BuiltinReceiver::Bool => {
+                let InlineValue::Bool(value) = first else {
+                    return Err("Bool builtin receiver mismatch".to_owned());
+                };
+                expect_builtin_arg_count(method, rest, 0)?;
+                match method {
+                    "toString" => Ok(InlineValue::String(value.to_string())),
+                    _ => unknown_mir_builtin(receiver, method),
+                }
+            }
+            BuiltinReceiver::String => {
+                let value = inline_string(self.runtime, first)?;
+                eval_string_builtin_inline(self.runtime, &value, method, rest)
+            }
+            BuiltinReceiver::List => {
+                let items = inline_list(self.runtime, first)?;
+                eval_list_builtin_inline(self.runtime, &items, method, rest)
+            }
+            BuiltinReceiver::Econ => unknown_mir_builtin(receiver, method),
+        }
     }
 
     fn eval_iterator(
@@ -974,6 +1038,391 @@ fn op_kind_label(kind: &MirOpKind) -> &'static str {
         MirOpKind::CachePut(_) => "cache_put",
         MirOpKind::Drop => "drop",
         MirOpKind::Unknown(_) => "unknown",
+    }
+}
+
+fn eval_string_builtin_inline(
+    runtime: &mut Runtime,
+    value: &str,
+    method: &str,
+    args: &[InlineValue],
+) -> Result<InlineValue, String> {
+    match method {
+        "length" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::Int(value.chars().count() as i64))
+        }
+        "isEmpty" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::Bool(value.is_empty()))
+        }
+        "toInt" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(value
+                .parse::<i64>()
+                .map(InlineValue::Int)
+                .unwrap_or(InlineValue::Null))
+        }
+        "toFloat" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(value
+                .parse::<f64>()
+                .map(InlineValue::Float)
+                .unwrap_or(InlineValue::Null))
+        }
+        "startsWith" => Ok(InlineValue::Bool(
+            value.starts_with(&expect_string_arg_inline(runtime, method, args, 0)?),
+        )),
+        "endsWith" => Ok(InlineValue::Bool(
+            value.ends_with(&expect_string_arg_inline(runtime, method, args, 0)?),
+        )),
+        "contains" => Ok(InlineValue::Bool(
+            value.contains(&expect_string_arg_inline(runtime, method, args, 0)?),
+        )),
+        "indexOf" => {
+            let sub = expect_string_arg_inline(runtime, method, args, 0)?;
+            Ok(value
+                .find(&sub)
+                .map(|byte_index| InlineValue::Int(value[..byte_index].chars().count() as i64))
+                .unwrap_or(InlineValue::Null))
+        }
+        "substring" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let start = expect_int_inline(&args[0], method)?;
+            let end = expect_int_inline(&args[1], method)?;
+            substring_chars_inline(value, start, end).map(InlineValue::String)
+        }
+        "replace" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let old = inline_string(runtime, &args[0])?;
+            let new = inline_string(runtime, &args[1])?;
+            Ok(InlineValue::String(value.replace(&old, &new)))
+        }
+        "split" => {
+            let delim = expect_string_arg_inline(runtime, method, args, 0)?;
+            Ok(InlineValue::Handle(allocate_handle_data(
+                runtime,
+                "List",
+                HandleData::List(
+                    value
+                        .split(&delim)
+                        .map(|part| HandleData::String(part.to_owned()))
+                        .collect(),
+                ),
+            )))
+        }
+        "toLower" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::String(value.to_lowercase()))
+        }
+        "toUpper" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::String(value.to_uppercase()))
+        }
+        "trim" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::String(value.trim().to_owned()))
+        }
+        "repeat" => {
+            let count = expect_int_arg_inline(method, args, 0)?;
+            if count < 0 {
+                return Err("repeat count must be non-negative".to_owned());
+            }
+            Ok(InlineValue::String(value.repeat(count as usize)))
+        }
+        _ => unknown_mir_builtin(BuiltinReceiver::String, method),
+    }
+}
+
+fn eval_list_builtin_inline(
+    runtime: &mut Runtime,
+    items: &[InlineValue],
+    method: &str,
+    args: &[InlineValue],
+) -> Result<InlineValue, String> {
+    match method {
+        "length" | "size" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::Int(items.len() as i64))
+        }
+        "isEmpty" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(InlineValue::Bool(items.is_empty()))
+        }
+        "first" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(items.first().cloned().unwrap_or(InlineValue::Null))
+        }
+        "last" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(items.last().cloned().unwrap_or(InlineValue::Null))
+        }
+        "get" => {
+            let index = expect_int_arg_inline(method, args, 0)?;
+            Ok(list_get_inline(items, index).unwrap_or(InlineValue::Null))
+        }
+        "contains" => {
+            expect_builtin_arg_count(method, args, 1)?;
+            Ok(InlineValue::Bool(items.iter().any(|item| item == &args[0])))
+        }
+        "indexOf" => {
+            expect_builtin_arg_count(method, args, 1)?;
+            Ok(items
+                .iter()
+                .position(|item| item == &args[0])
+                .map(|index| InlineValue::Int(index as i64))
+                .unwrap_or(InlineValue::Null))
+        }
+        "slice" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let from = expect_int_inline(&args[0], method)?;
+            let to = expect_int_inline(&args[1], method)?;
+            let data = slice_inline(items, from, to)?;
+            Ok(InlineValue::Handle(allocate_handle_data(
+                runtime,
+                "List",
+                HandleData::List(
+                    data.iter()
+                        .map(handle_data_from_inline_value)
+                        .collect::<Result<_, _>>()?,
+                ),
+            )))
+        }
+        "reversed" => Ok(InlineValue::Handle(allocate_handle_data(
+            runtime,
+            "List",
+            HandleData::List(
+                items
+                    .iter()
+                    .rev()
+                    .map(handle_data_from_inline_value)
+                    .collect::<Result<_, _>>()?,
+            ),
+        ))),
+        _ => unknown_mir_builtin(BuiltinReceiver::List, method),
+    }
+}
+
+fn inline_string(runtime: &Runtime, value: &InlineValue) -> Result<String, String> {
+    match value {
+        InlineValue::String(value) => Ok(value.clone()),
+        InlineValue::Handle(handle) => match runtime.get_handle_data(*handle)? {
+            HandleData::String(value) => Ok(value),
+            other => Err(format!(
+                "expected String handle, found {}",
+                handle_data_type(&other)
+            )),
+        },
+        other => Err(format!("expected String, found {}", type_name(other))),
+    }
+}
+
+fn inline_list(runtime: &Runtime, value: &InlineValue) -> Result<Vec<InlineValue>, String> {
+    match value {
+        InlineValue::Handle(handle) => match runtime.get_handle_data(*handle)? {
+            HandleData::List(items) => items.into_iter().map(inline_value_from_data).collect(),
+            other => Err(format!(
+                "expected List handle, found {}",
+                handle_data_type(&other)
+            )),
+        },
+        other => Err(format!("expected List, found {}", type_name(other))),
+    }
+}
+
+fn inline_value_from_data(data: HandleData) -> Result<InlineValue, String> {
+    match data {
+        HandleData::Null => Ok(InlineValue::Null),
+        HandleData::Bool(value) => Ok(InlineValue::Bool(value)),
+        HandleData::Int(value) => Ok(InlineValue::Int(value)),
+        HandleData::Float(value) => Ok(InlineValue::Float(value)),
+        HandleData::String(value) => Ok(InlineValue::String(value)),
+        HandleData::Tuple(values) => values
+            .into_iter()
+            .map(inline_value_from_data)
+            .collect::<Result<Vec<_>, _>>()
+            .map(InlineValue::Tuple),
+        HandleData::Record(fields) => fields
+            .into_iter()
+            .map(|(name, value)| Ok((name, inline_value_from_data(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(InlineValue::Record),
+        HandleData::List(_) => Err("nested List values are not inline in MIR executor".to_owned()),
+    }
+}
+
+fn handle_data_from_inline_value(value: &InlineValue) -> Result<HandleData, String> {
+    match value {
+        InlineValue::Null => Ok(HandleData::Null),
+        InlineValue::Bool(value) => Ok(HandleData::Bool(*value)),
+        InlineValue::Int(value) => Ok(HandleData::Int(*value)),
+        InlineValue::Float(value) => Ok(HandleData::Float(*value)),
+        InlineValue::String(value) => Ok(HandleData::String(value.clone())),
+        InlineValue::Tuple(values) => values
+            .iter()
+            .map(handle_data_from_inline_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(HandleData::Tuple),
+        InlineValue::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), handle_data_from_inline_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()
+            .map(HandleData::Record),
+        InlineValue::Handle(handle) => Err(format!(
+            "cannot copy opaque handle {} into List builtin result",
+            handle.0
+        )),
+    }
+}
+
+fn allocate_handle_data(
+    runtime: &mut Runtime,
+    type_name: &str,
+    data: HandleData,
+) -> vox_core::ids::HandleId {
+    let summary = HandleSummary {
+        type_name: type_name.to_owned(),
+        summary: render_handle_data(&data),
+        bytes: None,
+    };
+    runtime.allocate_serializable_handle(summary, data)
+}
+
+fn expect_builtin_arg_count(
+    method: &str,
+    args: &[InlineValue],
+    expected: usize,
+) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{method}` expects {expected} argument(s), got {}",
+            args.len()
+        ))
+    }
+}
+
+fn expect_int_arg_inline(method: &str, args: &[InlineValue], index: usize) -> Result<i64, String> {
+    expect_builtin_arg_count(method, args, index + 1)?;
+    expect_int_inline(&args[index], method)
+}
+
+fn expect_string_arg_inline(
+    runtime: &Runtime,
+    method: &str,
+    args: &[InlineValue],
+    index: usize,
+) -> Result<String, String> {
+    expect_builtin_arg_count(method, args, index + 1)?;
+    inline_string(runtime, &args[index])
+}
+
+fn expect_int_inline(value: &InlineValue, method: &str) -> Result<i64, String> {
+    let InlineValue::Int(value) = value else {
+        return Err(format!("`{method}` expected Int argument"));
+    };
+    Ok(*value)
+}
+
+fn list_get_inline(items: &[InlineValue], index: i64) -> Option<InlineValue> {
+    if index < 0 {
+        return None;
+    }
+    items.get(index as usize).cloned()
+}
+
+fn slice_inline(items: &[InlineValue], from: i64, to: i64) -> Result<Vec<InlineValue>, String> {
+    if from < 0 || to < from {
+        return Err("slice bounds must satisfy 0 <= from <= to".to_owned());
+    }
+    let from = from as usize;
+    let to = to as usize;
+    if to > items.len() {
+        return Err("slice end is out of bounds".to_owned());
+    }
+    Ok(items[from..to].to_vec())
+}
+
+fn substring_chars_inline(value: &str, start: i64, end: i64) -> Result<String, String> {
+    if start < 0 || end < start {
+        return Err("substring bounds must satisfy 0 <= start <= end".to_owned());
+    }
+    let start = start as usize;
+    let end = end as usize;
+    let len = value.chars().count();
+    if end > len {
+        return Err("substring end is out of bounds".to_owned());
+    }
+    Ok(value.chars().skip(start).take(end - start).collect())
+}
+
+fn float_to_int_inline(value: f64) -> InlineValue {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        InlineValue::Null
+    } else {
+        InlineValue::Int(value.trunc() as i64)
+    }
+}
+
+fn checked_f64_to_i64(value: f64) -> Result<i64, String> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err("Float value is out of Int range".to_owned());
+    }
+    Ok(value as i64)
+}
+
+fn unknown_mir_builtin(receiver: BuiltinReceiver, method: &str) -> Result<InlineValue, String> {
+    Err(format!(
+        "unknown builtin method `{}.{method}`",
+        receiver.name()
+    ))
+}
+
+fn handle_data_type(data: &HandleData) -> &'static str {
+    match data {
+        HandleData::Null => "Null",
+        HandleData::Bool(_) => "Bool",
+        HandleData::Int(_) => "Int",
+        HandleData::Float(_) => "Float",
+        HandleData::String(_) => "String",
+        HandleData::List(_) => "List",
+        HandleData::Tuple(_) => "Tuple",
+        HandleData::Record(_) => "Record",
+    }
+}
+
+fn render_handle_data(value: &HandleData) -> String {
+    match value {
+        HandleData::Null => "null".to_owned(),
+        HandleData::Bool(value) => value.to_string(),
+        HandleData::Int(value) => value.to_string(),
+        HandleData::Float(value) => value.to_string(),
+        HandleData::String(value) => value.clone(),
+        HandleData::List(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(render_handle_data)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HandleData::Tuple(values) => format!(
+            "({})",
+            values
+                .iter()
+                .map(render_handle_data)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        HandleData::Record(fields) => format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", render_handle_data(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 

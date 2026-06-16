@@ -7,13 +7,14 @@ Builtin types come with intrinsic support in the compiler and runtime.
 | Type | Description |
 |------|-------------|
 | `Int` | 32-bit signed integer |
-| `UInt` | 32-bit unsigned integer |
 | `Float` | 32-bit IEEE 754 floating point |
 | `Bool` | Boolean value (`true` or `false`) |
 | `String` | UTF-8 encoded string |
 | `List[T]` | Ordered collection of elements of type `T` |
 | `Tuple[...]` | Collection of compile-time-known fields accessed by index |
 | `Record[...]` | Collection of compile-time-known fields accessed by name |
+
+`UInt` is planned but not implemented in the current runtime type model.
 
 The builtin types in Vox are minimal by design. This is to ensure that the core
 language remains small and easy to embed. The standard library provides additional
@@ -65,15 +66,6 @@ All methods are **pure** unless noted.
 |--------|-----------|------|-------------|
 | `toString` | `(Int) -> String` | Builtin | Decimal string representation |
 | `toFloat` | `(Int) -> Float` | Builtin | Widening conversion |
-| `toUInt` | `(Int) -> UInt?` | Builtin | Reinterpret bits as unsigned; `null` if negative |
-
-### UInt
-
-| Method | Signature | Impl | Description |
-|--------|-----------|------|-------------|
-| `toString` | `(UInt) -> String` | Builtin | Decimal string representation |
-| `toFloat` | `(UInt) -> Float` | Builtin | Widening conversion |
-| `toInt` | `(UInt) -> Int?` | Builtin | Reinterpret bits as signed; `null` if > `Int.max` |
 
 #### Float
 
@@ -213,9 +205,10 @@ resolution. This avoids circularity (the prelude needs `List[T]` and `String`,
 which are defined by the language itself).
 
 Prelude functions that can be expressed in Vox (e.g., `List.isEmpty`) are
-lowered as MIR function bodies so the SOpt WASM path can inline them. They
-are not separately importable as `std.isEmpty` — they exist only for
-method-style resolution on their receiver types.
+registered as synthetic method metadata and implemented by the same runtime
+builtin dispatch as intrinsic methods for now. They are not separately
+importable as `std.isEmpty` — they exist only for method-style resolution on
+their receiver types.
 
 ### `std.containers` module
 
@@ -241,12 +234,9 @@ Builtin methods need support in all three execution paths:
    cases.
 
 3. **WASM backend** (`crates/vox-compiler/src/backend/wasm.rs`):
-   - Trivial conversions (`.toFloat()`, `.toInt()`) lower to inline wasm
-     instructions.
-   - String ops route through the existing `__vox_op` runtime builtin table.
-   - List/Record `.length()` lower to inline wasm memory reads (the
-     collection's count is already stored in the heap layout).
-   - Prelude functions are compiled as regular MIR function bodies.
+   Synthetic builtin callees route through the `__vox_op` runtime builtin
+   table. The WASM executor implements primitive conversions, string
+   operations, and list operations from that dispatch point.
 
 ### Semantic analysis
 

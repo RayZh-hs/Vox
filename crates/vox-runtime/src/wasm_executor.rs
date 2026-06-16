@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use wasmtime::*;
 
 use vox_core::{
+    builtins::{self, BuiltinReceiver},
     ids::HandleId,
     source::ModulePath,
     value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
@@ -252,6 +253,7 @@ fn handle_builtin_op(
         16 => builtin_numeric_checked(runtime, data, &args, &extra),
         17 => builtin_range_new(runtime, data, &args, &extra),
         18 => Err("wasm heap exhausted before stack guard region".to_owned()),
+        19 => builtin_method(runtime, data, &args, &extra),
         _ => Err(format!("unknown builtin op {op_id}")),
     }
 }
@@ -520,6 +522,365 @@ fn builtin_numeric_checked(
             inline_type_name(&left),
             inline_type_name(&right)
         )),
+    }
+}
+
+fn builtin_method(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    args: &[(i32, i64)],
+    extra: &[Vec<u8>],
+) -> Result<(i32, i64), String> {
+    if args.is_empty() || extra.is_empty() {
+        return Err("BuiltinMethod expects a callee name and receiver".to_owned());
+    }
+    let callee = std::str::from_utf8(&extra[0])
+        .map_err(|error| format!("invalid builtin method callee: {error}"))?;
+    let (receiver, method) = builtins::split_builtin_callee(callee)
+        .ok_or_else(|| format!("invalid builtin method callee `{callee}`"))?;
+    match receiver {
+        BuiltinReceiver::Int => {
+            if args[0].0 != TAG_INT {
+                return Err("Int builtin receiver mismatch".to_owned());
+            }
+            expect_builtin_arg_count(method, args, 1)?;
+            match method {
+                "toString" => {
+                    handle_data_result_to_wasm(runtime, HandleData::String(args[0].1.to_string()))
+                }
+                "toFloat" => Ok((TAG_FLOAT, (args[0].1 as f64).to_bits() as i64)),
+                _ => unknown_wasm_builtin(receiver, method),
+            }
+        }
+        BuiltinReceiver::Float => {
+            if args[0].0 != TAG_FLOAT {
+                return Err("Float builtin receiver mismatch".to_owned());
+            }
+            expect_builtin_arg_count(method, args, 1)?;
+            let value = f64::from_bits(args[0].1 as u64);
+            match method {
+                "toString" => {
+                    handle_data_result_to_wasm(runtime, HandleData::String(value.to_string()))
+                }
+                "toInt" => Ok(float_to_int_wasm(value)),
+                "round" => {
+                    checked_f64_to_i64_wasm((value + 0.5).floor()).map(|value| (TAG_INT, value))
+                }
+                "floor" => checked_f64_to_i64_wasm(value.floor()).map(|value| (TAG_INT, value)),
+                "ceil" => checked_f64_to_i64_wasm(value.ceil()).map(|value| (TAG_INT, value)),
+                _ => unknown_wasm_builtin(receiver, method),
+            }
+        }
+        BuiltinReceiver::Bool => {
+            if args[0].0 != TAG_BOOL {
+                return Err("Bool builtin receiver mismatch".to_owned());
+            }
+            expect_builtin_arg_count(method, args, 1)?;
+            match method {
+                "toString" => handle_data_result_to_wasm(
+                    runtime,
+                    HandleData::String((args[0].1 != 0).to_string()),
+                ),
+                _ => unknown_wasm_builtin(receiver, method),
+            }
+        }
+        BuiltinReceiver::String => {
+            let value = wasm_string_arg(runtime, memory, args[0])?;
+            eval_string_builtin_wasm(runtime, memory, &value, method, &args[1..])
+        }
+        BuiltinReceiver::List => {
+            let items = wasm_list_arg(runtime, memory, args[0])?;
+            eval_list_builtin_wasm(runtime, memory, &items, method, &args[1..])
+        }
+        BuiltinReceiver::Econ => unknown_wasm_builtin(receiver, method),
+    }
+}
+
+fn eval_string_builtin_wasm(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    value: &str,
+    method: &str,
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
+    match method {
+        "length" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok((TAG_INT, value.chars().count() as i64))
+        }
+        "isEmpty" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok((TAG_BOOL, value.is_empty() as i64))
+        }
+        "toInt" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(value
+                .parse::<i64>()
+                .map(|value| (TAG_INT, value))
+                .unwrap_or((TAG_NULL, 0)))
+        }
+        "toFloat" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok(value
+                .parse::<f64>()
+                .map(|value| (TAG_FLOAT, value.to_bits() as i64))
+                .unwrap_or((TAG_NULL, 0)))
+        }
+        "startsWith" => {
+            let prefix = wasm_string_method_arg(runtime, memory, method, args, 0)?;
+            Ok((TAG_BOOL, value.starts_with(&prefix) as i64))
+        }
+        "endsWith" => {
+            let suffix = wasm_string_method_arg(runtime, memory, method, args, 0)?;
+            Ok((TAG_BOOL, value.ends_with(&suffix) as i64))
+        }
+        "contains" => {
+            let sub = wasm_string_method_arg(runtime, memory, method, args, 0)?;
+            Ok((TAG_BOOL, value.contains(&sub) as i64))
+        }
+        "indexOf" => {
+            let sub = wasm_string_method_arg(runtime, memory, method, args, 0)?;
+            Ok(value
+                .find(&sub)
+                .map(|byte_index| (TAG_INT, value[..byte_index].chars().count() as i64))
+                .unwrap_or((TAG_NULL, 0)))
+        }
+        "substring" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let start = wasm_int_method_arg(method, args, 0)?;
+            let end = wasm_int_method_arg(method, args, 1)?;
+            handle_data_result_to_wasm(
+                runtime,
+                HandleData::String(substring_chars_wasm(value, start, end)?),
+            )
+        }
+        "replace" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let old = wasm_string_arg(runtime, memory, args[0])?;
+            let new = wasm_string_arg(runtime, memory, args[1])?;
+            handle_data_result_to_wasm(runtime, HandleData::String(value.replace(&old, &new)))
+        }
+        "split" => {
+            let delim = wasm_string_method_arg(runtime, memory, method, args, 0)?;
+            handle_data_result_to_wasm(
+                runtime,
+                HandleData::List(
+                    value
+                        .split(&delim)
+                        .map(|part| HandleData::String(part.to_owned()))
+                        .collect(),
+                ),
+            )
+        }
+        "toLower" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            handle_data_result_to_wasm(runtime, HandleData::String(value.to_lowercase()))
+        }
+        "toUpper" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            handle_data_result_to_wasm(runtime, HandleData::String(value.to_uppercase()))
+        }
+        "trim" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            handle_data_result_to_wasm(runtime, HandleData::String(value.trim().to_owned()))
+        }
+        "repeat" => {
+            let count = wasm_int_method_arg(method, args, 0)?;
+            if count < 0 {
+                return Err("repeat count must be non-negative".to_owned());
+            }
+            handle_data_result_to_wasm(runtime, HandleData::String(value.repeat(count as usize)))
+        }
+        _ => unknown_wasm_builtin(BuiltinReceiver::String, method),
+    }
+}
+
+fn eval_list_builtin_wasm(
+    runtime: &mut Runtime,
+    memory: &[u8],
+    items: &[HandleData],
+    method: &str,
+    args: &[(i32, i64)],
+) -> Result<(i32, i64), String> {
+    match method {
+        "length" | "size" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok((TAG_INT, items.len() as i64))
+        }
+        "isEmpty" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            Ok((TAG_BOOL, items.is_empty() as i64))
+        }
+        "first" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            items
+                .first()
+                .cloned()
+                .map(|item| handle_data_result_to_wasm(runtime, item))
+                .unwrap_or(Ok((TAG_NULL, 0)))
+        }
+        "last" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            items
+                .last()
+                .cloned()
+                .map(|item| handle_data_result_to_wasm(runtime, item))
+                .unwrap_or(Ok((TAG_NULL, 0)))
+        }
+        "get" => {
+            let index = wasm_int_method_arg(method, args, 0)?;
+            if index < 0 {
+                return Ok((TAG_NULL, 0));
+            }
+            items
+                .get(index as usize)
+                .cloned()
+                .map(|item| handle_data_result_to_wasm(runtime, item))
+                .unwrap_or(Ok((TAG_NULL, 0)))
+        }
+        "contains" => {
+            expect_builtin_arg_count(method, args, 1)?;
+            let needle = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
+            Ok((TAG_BOOL, items.iter().any(|item| item == &needle) as i64))
+        }
+        "indexOf" => {
+            expect_builtin_arg_count(method, args, 1)?;
+            let needle = wasm_to_data(runtime, Some(memory), args[0].0, args[0].1)?;
+            Ok(items
+                .iter()
+                .position(|item| item == &needle)
+                .map(|index| (TAG_INT, index as i64))
+                .unwrap_or((TAG_NULL, 0)))
+        }
+        "slice" => {
+            expect_builtin_arg_count(method, args, 2)?;
+            let from = wasm_int_method_arg(method, args, 0)?;
+            let to = wasm_int_method_arg(method, args, 1)?;
+            handle_data_result_to_wasm(runtime, HandleData::List(slice_data(items, from, to)?))
+        }
+        "reversed" => {
+            expect_builtin_arg_count(method, args, 0)?;
+            handle_data_result_to_wasm(
+                runtime,
+                HandleData::List(items.iter().cloned().rev().collect()),
+            )
+        }
+        _ => unknown_wasm_builtin(BuiltinReceiver::List, method),
+    }
+}
+
+fn wasm_string_arg(runtime: &Runtime, memory: &[u8], arg: (i32, i64)) -> Result<String, String> {
+    match wasm_to_data(runtime, Some(memory), arg.0, arg.1)? {
+        HandleData::String(value) => Ok(value),
+        other => Err(format!(
+            "expected String, found {}",
+            handle_data_type(&other)
+        )),
+    }
+}
+
+fn wasm_list_arg(
+    runtime: &Runtime,
+    memory: &[u8],
+    arg: (i32, i64),
+) -> Result<Vec<HandleData>, String> {
+    match wasm_to_data(runtime, Some(memory), arg.0, arg.1)? {
+        HandleData::List(items) => Ok(items),
+        other => Err(format!("expected List, found {}", handle_data_type(&other))),
+    }
+}
+
+fn wasm_string_method_arg(
+    runtime: &Runtime,
+    memory: &[u8],
+    method: &str,
+    args: &[(i32, i64)],
+    index: usize,
+) -> Result<String, String> {
+    expect_builtin_arg_count(method, args, index + 1)?;
+    wasm_string_arg(runtime, memory, args[index])
+}
+
+fn wasm_int_method_arg(method: &str, args: &[(i32, i64)], index: usize) -> Result<i64, String> {
+    expect_builtin_arg_count(method, args, index + 1)?;
+    if args[index].0 != TAG_INT {
+        return Err(format!("`{method}` expected Int argument"));
+    }
+    Ok(args[index].1)
+}
+
+fn expect_builtin_arg_count(
+    method: &str,
+    args: &[(i32, i64)],
+    expected: usize,
+) -> Result<(), String> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{method}` expects {expected} argument(s), got {}",
+            args.len()
+        ))
+    }
+}
+
+fn substring_chars_wasm(value: &str, start: i64, end: i64) -> Result<String, String> {
+    if start < 0 || end < start {
+        return Err("substring bounds must satisfy 0 <= start <= end".to_owned());
+    }
+    let start = start as usize;
+    let end = end as usize;
+    let len = value.chars().count();
+    if end > len {
+        return Err("substring end is out of bounds".to_owned());
+    }
+    Ok(value.chars().skip(start).take(end - start).collect())
+}
+
+fn slice_data(items: &[HandleData], from: i64, to: i64) -> Result<Vec<HandleData>, String> {
+    if from < 0 || to < from {
+        return Err("slice bounds must satisfy 0 <= from <= to".to_owned());
+    }
+    let from = from as usize;
+    let to = to as usize;
+    if to > items.len() {
+        return Err("slice end is out of bounds".to_owned());
+    }
+    Ok(items[from..to].to_vec())
+}
+
+fn float_to_int_wasm(value: f64) -> (i32, i64) {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        (TAG_NULL, 0)
+    } else {
+        (TAG_INT, value.trunc() as i64)
+    }
+}
+
+fn checked_f64_to_i64_wasm(value: f64) -> Result<i64, String> {
+    if !value.is_finite() || value < i64::MIN as f64 || value > i64::MAX as f64 {
+        return Err("Float value is out of Int range".to_owned());
+    }
+    Ok(value as i64)
+}
+
+fn unknown_wasm_builtin(receiver: BuiltinReceiver, method: &str) -> Result<(i32, i64), String> {
+    Err(format!(
+        "unknown builtin method `{}.{method}`",
+        receiver.name()
+    ))
+}
+
+fn handle_data_type(data: &HandleData) -> &'static str {
+    match data {
+        HandleData::Null => "Null",
+        HandleData::Bool(_) => "Bool",
+        HandleData::Int(_) => "Int",
+        HandleData::Float(_) => "Float",
+        HandleData::String(_) => "String",
+        HandleData::List(_) => "List",
+        HandleData::Tuple(_) => "Tuple",
+        HandleData::Record(_) => "Record",
     }
 }
 

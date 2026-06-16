@@ -7,6 +7,7 @@ use wasm_encoder::{
 };
 
 use vox_core::{
+    builtins,
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyId, MirBodyKind, MirModule, MirOpKind,
         MirPathSegment, MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId,
@@ -71,6 +72,7 @@ enum BuiltinOp {
     NumericChecked = 16,
     RangeNew = 17,
     HeapExhausted = 18,
+    BuiltinMethod = 19,
 }
 
 struct Ctx {
@@ -1334,7 +1336,16 @@ fn emit_op(
         }
         MirOpKind::Call { callee, .. } => {
             if let Some(rid) = result {
-                if let Some(&target_func) = ctx.func_map.get(callee) {
+                if builtins::split_builtin_callee(callee).is_some() {
+                    builtin_op_call(
+                        BuiltinOp::BuiltinMethod,
+                        args,
+                        &[callee.as_bytes().to_vec()],
+                        rid,
+                        ctx,
+                        f,
+                    )?;
+                } else if let Some(&target_func) = ctx.func_map.get(callee) {
                     emit_vox_call(args, target_func, rid, ctx, f)?;
                 } else if callee.contains('.') {
                     emit_host_call(callee, args, rid, ctx, f)?;

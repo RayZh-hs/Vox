@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use vox_core::{
+    builtins::{self, BuiltinReceiver},
     diagnostics::{Diagnostic, DiagnosticBag},
     host::Purity,
     mir::{
@@ -583,11 +584,16 @@ impl BodyBuilder {
             ExprKind::Call { callee, arguments } => {
                 if let ExprKind::Field { target, name } = &callee.kind {
                     if is_method_styled_call(target, callee, self) {
-                        let mut args = vec![self.lower_expr(target)];
+                        let receiver = self.lower_expr(target);
+                        let callee = self
+                            .value_type(receiver)
+                            .and_then(|ty| builtin_callee_for_mir_type(ty, name))
+                            .unwrap_or_else(|| name.clone());
+                        let mut args = vec![receiver];
                         args.extend(self.lower_arguments(arguments));
                         return self.emit_op(
                             MirOpKind::Call {
-                                callee: name.clone(),
+                                callee,
                                 purity: Purity::Pure,
                             },
                             args,
@@ -1296,7 +1302,8 @@ impl BodyBuilder {
             MirOpKind::Updated { .. } => {
                 args.first().and_then(|arg| self.value_type(*arg).cloned())
             }
-            MirOpKind::Call { callee, .. } => self.function_return_types.get(callee).cloned(),
+            MirOpKind::Call { callee, .. } => builtin_return_type(callee, &args, self)
+                .or_else(|| self.function_return_types.get(callee).cloned()),
             MirOpKind::Iterator => args
                 .first()
                 .and_then(|arg| self.value_type(*arg))
@@ -2570,6 +2577,51 @@ fn mir_iterator_next_type(ty: &VoxType) -> Option<VoxType> {
         .strip_prefix("Iterator<")
         .and_then(|rest| rest.strip_suffix('>'))?;
     parse_type_key(inner).map(|ty| VoxType::Nullable(Box::new(ty)))
+}
+
+fn builtin_callee_for_mir_type(ty: &VoxType, method_name: &str) -> Option<String> {
+    let receiver = builtins::builtin_receiver_for_type(ty)?;
+    builtins::builtin_method(receiver, method_name)?;
+    Some(builtins::builtin_callee_name(receiver, method_name))
+}
+
+fn builtin_return_type(callee: &str, args: &[MirValueId], body: &BodyBuilder) -> Option<VoxType> {
+    let (receiver, method) = builtins::split_builtin_callee(callee)?;
+    let receiver_ty = args.first().and_then(|arg| body.value_type(*arg));
+    match (receiver, method) {
+        (BuiltinReceiver::Int, "toString")
+        | (BuiltinReceiver::Float, "toString")
+        | (BuiltinReceiver::Bool, "toString")
+        | (BuiltinReceiver::String, "substring")
+        | (BuiltinReceiver::String, "replace")
+        | (BuiltinReceiver::String, "toLower")
+        | (BuiltinReceiver::String, "toUpper")
+        | (BuiltinReceiver::String, "trim")
+        | (BuiltinReceiver::String, "repeat") => Some(VoxType::String),
+        (BuiltinReceiver::Int, "toFloat") => Some(VoxType::Float),
+        (BuiltinReceiver::Float, "toInt")
+        | (BuiltinReceiver::String, "toInt")
+        | (BuiltinReceiver::String, "indexOf")
+        | (BuiltinReceiver::List, "indexOf") => Some(VoxType::Nullable(Box::new(VoxType::Int))),
+        (BuiltinReceiver::Float, "round" | "floor" | "ceil")
+        | (BuiltinReceiver::String, "length")
+        | (BuiltinReceiver::List, "length" | "size") => Some(VoxType::Int),
+        (BuiltinReceiver::String, "toFloat") => Some(VoxType::Nullable(Box::new(VoxType::Float))),
+        (BuiltinReceiver::String, "isEmpty")
+        | (BuiltinReceiver::String, "startsWith" | "endsWith" | "contains")
+        | (BuiltinReceiver::List, "isEmpty" | "contains") => Some(VoxType::Bool),
+        (BuiltinReceiver::String, "split") => Some(VoxType::List(Box::new(VoxType::String))),
+        (BuiltinReceiver::List, "first" | "last" | "get") => receiver_ty.and_then(|ty| {
+            if let VoxType::List(item) = ty {
+                Some(VoxType::Nullable(item.clone()))
+            } else {
+                None
+            }
+        }),
+        (BuiltinReceiver::List, "slice" | "reversed") => receiver_ty.cloned(),
+        (BuiltinReceiver::Econ, "update") => None,
+        _ => None,
+    }
 }
 
 fn merge_mir_types(left: VoxType, right: VoxType) -> Option<VoxType> {

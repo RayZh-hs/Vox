@@ -8,6 +8,7 @@ use vox_compiler::frontend::ast::{
     UpdatedPathSegment, ValueDecl, WhenExpr,
 };
 use vox_core::{
+    builtins::{self, BuiltinReceiver},
     host::{FunctionSpec, PackageManifest, ValueSpec},
     source::{ModuleKind, ModulePath},
 };
@@ -106,6 +107,41 @@ pub fn infer_environment(
 ) -> Result<TypeEnvironment, String> {
     let mut engine = TypeEngine::new(unit, manifests);
     engine.infer()
+}
+
+pub fn builtin_method_summaries_for_type(ty: &ReplType) -> Vec<FunctionSummary> {
+    let Some(receiver) = builtin_receiver_for_repl_type(ty) else {
+        return Vec::new();
+    };
+    builtins::builtin_methods_for_receiver(receiver)
+        .filter_map(|method| {
+            builtin_method_type_for_repl_type(ty, method.name).map(|method_type| {
+                let (parameters, result) = match method_type {
+                    ReplType::Function { parameters, result } => (parameters, *result),
+                    _ => return None,
+                };
+                Some(FunctionSummary {
+                    name: method.name.to_owned(),
+                    generic_parameters: Vec::new(),
+                    parameters: parameters
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, ty)| CallableParameterSummary {
+                            name: if index == 0 {
+                                "self".to_owned()
+                            } else {
+                                format!("arg{index}")
+                            },
+                            ty,
+                            has_default: false,
+                        })
+                        .collect(),
+                    return_type: result,
+                    evil: receiver == BuiltinReceiver::Econ && method.name == "update",
+                })
+            })?
+        })
+        .collect()
 }
 
 impl ReplType {
@@ -527,10 +563,8 @@ impl<'a> TypeEngine<'a> {
                     .entry(function.name.clone())
                     .or_default()
                     .push(summary.clone());
-                self.functions.insert(
-                    function.name.clone(),
-                    FunctionInfo { summary },
-                );
+                self.functions
+                    .insert(function.name.clone(), FunctionInfo { summary });
 
                 let fn_name = &function.name;
                 let fn_first_param_ty = function
@@ -2019,21 +2053,6 @@ impl<'a> TypeEngine<'a> {
         method_name: &str,
         _scope: &TypeScope,
     ) -> Option<ReplType> {
-        if method_name == "update" {
-            if let ReplType::Named { name, arguments } = target_type {
-                if name == "Econ" {
-                    let snapshot = arguments
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| ReplType::Unknown("Unknown".to_owned()));
-                    return Some(ReplType::Function {
-                        parameters: vec![target_type.clone()],
-                        result: Box::new(snapshot),
-                    });
-                }
-            }
-        }
-
         if let Some(function) = self.functions.get(method_name) {
             if let Some(first_param) = function.summary.parameters.first() {
                 if target_type.is_assignable_to(&first_param.ty) {
@@ -2073,14 +2092,14 @@ impl<'a> TypeEngine<'a> {
             }
         }
 
+        if let Some(method_type) = builtin_method_type_for_repl_type(target_type, method_name) {
+            return Some(method_type);
+        }
+
         self.resolve_trait_method(target_type, method_name)
     }
 
-    fn resolve_trait_method(
-        &self,
-        target_type: &ReplType,
-        method_name: &str,
-    ) -> Option<ReplType> {
+    fn resolve_trait_method(&self, target_type: &ReplType, method_name: &str) -> Option<ReplType> {
         let target_name = match target_type {
             ReplType::Named { name, .. } => name,
             ReplType::DynTrait(name) => name,
@@ -2092,15 +2111,11 @@ impl<'a> TypeEngine<'a> {
                 for impl_qt in impls {
                     let full_impl = format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
                     if full_impl == *target_name || impl_qt.name == *target_name {
-                        if let Some(trait_spec) = manifest
-                            .traits
-                            .iter()
-                            .find(|t| &t.name == trait_qt)
+                        if let Some(trait_spec) =
+                            manifest.traits.iter().find(|t| &t.name == trait_qt)
                         {
-                            if let Some(method) = trait_spec
-                                .methods
-                                .iter()
-                                .find(|m| m.name == method_name)
+                            if let Some(method) =
+                                trait_spec.methods.iter().find(|m| m.name == method_name)
                             {
                                 if let Some(function) = manifest
                                     .functions
@@ -2115,19 +2130,13 @@ impl<'a> TypeEngine<'a> {
                                     trait_spec.name.module.as_str(),
                                     trait_spec.name.name
                                 );
-                                let mut parameters =
-                                    vec![ReplType::DynTrait(trait_full)];
+                                let mut parameters = vec![ReplType::DynTrait(trait_full)];
                                 parameters.extend(
-                                    method
-                                        .parameters
-                                        .iter()
-                                        .map(|p| from_vox_host_type(&p.ty)),
+                                    method.parameters.iter().map(|p| from_vox_host_type(&p.ty)),
                                 );
                                 return Some(ReplType::Function {
                                     parameters,
-                                    result: Box::new(from_vox_host_type(
-                                        &method.return_type,
-                                    )),
+                                    result: Box::new(from_vox_host_type(&method.return_type)),
                                 });
                             }
                         }
@@ -2877,6 +2886,109 @@ fn substitute_repl_type(ty: &ReplType, substitutions: &BTreeMap<String, ReplType
             .cloned()
             .unwrap_or_else(|| ty.clone()),
         _ => ty.clone(),
+    }
+}
+
+fn builtin_receiver_for_repl_type(ty: &ReplType) -> Option<BuiltinReceiver> {
+    match ty {
+        ReplType::Int => Some(BuiltinReceiver::Int),
+        ReplType::Float => Some(BuiltinReceiver::Float),
+        ReplType::Bool => Some(BuiltinReceiver::Bool),
+        ReplType::String => Some(BuiltinReceiver::String),
+        ReplType::List(_) => Some(BuiltinReceiver::List),
+        ReplType::Named { name, .. } if name == "Econ" => Some(BuiltinReceiver::Econ),
+        _ => None,
+    }
+}
+
+fn builtin_method_type_for_repl_type(ty: &ReplType, method_name: &str) -> Option<ReplType> {
+    let receiver = builtin_receiver_for_repl_type(ty)?;
+    builtins::builtin_method(receiver, method_name)?;
+
+    let int = ReplType::Int;
+    let float = ReplType::Float;
+    let bool_ty = ReplType::Bool;
+    let string = ReplType::String;
+    let nullable_int = ReplType::Nullable(Box::new(ReplType::Int));
+    let nullable_float = ReplType::Nullable(Box::new(ReplType::Float));
+
+    let signature = match (receiver, method_name) {
+        (BuiltinReceiver::Int, "toString") => (vec![int.clone()], string),
+        (BuiltinReceiver::Int, "toFloat") => (vec![int.clone()], float),
+        (BuiltinReceiver::Float, "toString") => (vec![float.clone()], string),
+        (BuiltinReceiver::Float, "toInt") => (vec![float.clone()], nullable_int),
+        (BuiltinReceiver::Float, "round" | "floor" | "ceil") => (vec![float.clone()], int),
+        (BuiltinReceiver::Bool, "toString") => (vec![bool_ty.clone()], string),
+        (BuiltinReceiver::String, "length") => (vec![string.clone()], int),
+        (BuiltinReceiver::String, "isEmpty") => (vec![string.clone()], bool_ty),
+        (BuiltinReceiver::String, "toInt") => (vec![string.clone()], nullable_int),
+        (BuiltinReceiver::String, "toFloat") => (vec![string.clone()], nullable_float),
+        (BuiltinReceiver::String, "startsWith" | "endsWith" | "contains") => {
+            (vec![string.clone(), string.clone()], bool_ty)
+        }
+        (BuiltinReceiver::String, "indexOf") => (
+            vec![string.clone(), string.clone()],
+            ReplType::Nullable(Box::new(ReplType::Int)),
+        ),
+        (BuiltinReceiver::String, "substring") => {
+            (vec![string.clone(), int.clone(), int.clone()], string)
+        }
+        (BuiltinReceiver::String, "replace") => {
+            (vec![string.clone(), string.clone(), string.clone()], string)
+        }
+        (BuiltinReceiver::String, "split") => (
+            vec![string.clone(), string.clone()],
+            ReplType::List(Box::new(string)),
+        ),
+        (BuiltinReceiver::String, "toLower" | "toUpper" | "trim") => (vec![string.clone()], string),
+        (BuiltinReceiver::String, "repeat") => (vec![string.clone(), int.clone()], string),
+        (BuiltinReceiver::List, "length" | "size") => (vec![ty.clone()], int),
+        (BuiltinReceiver::List, "isEmpty" | "contains") => {
+            let item = list_item_type(ty);
+            let params = if method_name == "contains" {
+                vec![ty.clone(), item]
+            } else {
+                vec![ty.clone()]
+            };
+            (params, bool_ty)
+        }
+        (BuiltinReceiver::List, "first" | "last") => (
+            vec![ty.clone()],
+            ReplType::Nullable(Box::new(list_item_type(ty))),
+        ),
+        (BuiltinReceiver::List, "get") => (
+            vec![ty.clone(), int.clone()],
+            ReplType::Nullable(Box::new(list_item_type(ty))),
+        ),
+        (BuiltinReceiver::List, "indexOf") => (
+            vec![ty.clone(), list_item_type(ty)],
+            ReplType::Nullable(Box::new(ReplType::Int)),
+        ),
+        (BuiltinReceiver::List, "slice") => (vec![ty.clone(), int.clone(), int], ty.clone()),
+        (BuiltinReceiver::List, "reversed") => (vec![ty.clone()], ty.clone()),
+        (BuiltinReceiver::Econ, "update") => {
+            let snapshot = match ty {
+                ReplType::Named { arguments, .. } => arguments
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| ReplType::Unknown("Unknown".to_owned())),
+                _ => ReplType::Unknown("Unknown".to_owned()),
+            };
+            (vec![ty.clone()], snapshot)
+        }
+        _ => return None,
+    };
+
+    Some(ReplType::Function {
+        parameters: signature.0,
+        result: Box::new(signature.1),
+    })
+}
+
+fn list_item_type(ty: &ReplType) -> ReplType {
+    match ty {
+        ReplType::List(item) => (**item).clone(),
+        _ => ReplType::Unknown("Unknown".to_owned()),
     }
 }
 
