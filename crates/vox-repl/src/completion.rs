@@ -9,7 +9,7 @@ use rustyline::{
     highlight::{CmdKind, Highlighter, MatchingBracketHighlighter},
     hint::{Hint, Hinter},
     history::DefaultHistory,
-    validate::{MatchingBracketValidator, ValidationContext, ValidationResult, Validator},
+    validate::{ValidationContext, ValidationResult, Validator},
 };
 
 const MENU_WRAP_COLUMNS: usize = 80;
@@ -251,7 +251,6 @@ impl CompletionUi {
 pub struct ReplHelper {
     completion_ui: CompletionUi,
     highlighter: MatchingBracketHighlighter,
-    validator: MatchingBracketValidator,
 }
 
 impl ReplHelper {
@@ -259,7 +258,6 @@ impl ReplHelper {
         Self {
             completion_ui,
             highlighter: MatchingBracketHighlighter::default(),
-            validator: MatchingBracketValidator::default(),
         }
     }
 
@@ -281,7 +279,41 @@ impl Validator for ReplHelper {
         if ctx.input().trim_start().starts_with(':') {
             return Ok(ValidationResult::Valid(None));
         }
-        self.validator.validate(ctx)
+        Ok(validate_repl_input(ctx.input()))
+    }
+}
+
+fn validate_repl_input(input: &str) -> ValidationResult {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for ch in input.chars() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match ch {
+                '\\' => escape = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    if depth == 0 {
+        ValidationResult::Valid(None)
+    } else {
+        ValidationResult::Incomplete
     }
 }
 

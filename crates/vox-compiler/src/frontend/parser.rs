@@ -1419,7 +1419,11 @@ impl Parser {
             TokenKind::RParen,
             "expected `)` after parenthesized expression",
         )?;
-        Ok(first)
+        let end = self.previous().span.end;
+        Ok(Expr {
+            span: TextSpan::new(start, end),
+            ..first
+        })
     }
 
     fn parse_braced_expr(&mut self) -> Result<Expr, DiagnosticBag> {
