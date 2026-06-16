@@ -36,6 +36,7 @@ const TAG_RECORD: i32 = 5;
 const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
+const TAG_UINT: i32 = 9;
 const TAG_CLOSURE: i32 = 9;
 
 const SCRATCH_OFF: u32 = 0;
@@ -712,6 +713,7 @@ fn validate_wasm_terminator(body: &MirBody, terminator: &MirTerminator) -> Resul
 fn validate_wasm_literal(value: &InlineValue) -> Result<(), String> {
     match value {
         InlineValue::Int(_)
+        | InlineValue::UInt(_)
         | InlineValue::Float(_)
         | InlineValue::Bool(_)
         | InlineValue::String(_)
@@ -854,6 +856,7 @@ fn validate_string_interpolate_op(body: &MirBody, args: &[MirValueId]) -> Result
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WasmScalar {
     Int,
+    UInt,
     Float,
     Bool,
     String,
@@ -864,6 +867,7 @@ impl WasmScalar {
     fn as_str(self) -> &'static str {
         match self {
             Self::Int => "Int",
+            Self::UInt => "UInt",
             Self::Float => "Float",
             Self::Bool => "Bool",
             Self::String => "String",
@@ -919,7 +923,7 @@ fn require_numeric_args(
                 render_mir_type(value_type(body, *arg))
             ));
         };
-        if !matches!(actual, WasmScalar::Int | WasmScalar::Float) {
+        if !matches!(actual, WasmScalar::Int | WasmScalar::UInt | WasmScalar::Float) {
             return Err(format!(
                 "op `{op}` expected numeric operand, found {}",
                 actual.as_str()
@@ -936,7 +940,9 @@ fn require_numeric_args(
 fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
     match ty {
         None => false,
-        Some(VoxType::Int | VoxType::Float | VoxType::Bool | VoxType::String) => true,
+        Some(VoxType::Int | VoxType::UInt | VoxType::Float | VoxType::Bool | VoxType::String) => {
+            true
+        }
         Some(VoxType::Tuple(items)) => items
             .iter()
             .all(|item| is_supported_wasm_value_type(Some(item))),
@@ -947,7 +953,10 @@ fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
             is_supported_wasm_value_type(Some(item))
         }
         Some(VoxType::OpaqueSurface(name)) => {
-            matches!(name.as_str(), "Int" | "Float" | "Bool" | "String" | "Null")
+            matches!(
+                name.as_str(),
+                "Int" | "UInt" | "Float" | "Bool" | "String" | "Null"
+            )
                 || name.starts_with("Iterator<")
         }
         _ => false,
@@ -957,11 +966,13 @@ fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
 fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
     match value_type(body, value) {
         Some(VoxType::Int) => Some(WasmScalar::Int),
+        Some(VoxType::UInt) => Some(WasmScalar::UInt),
         Some(VoxType::Float) => Some(WasmScalar::Float),
         Some(VoxType::Bool) => Some(WasmScalar::Bool),
         Some(VoxType::String) => Some(WasmScalar::String),
         Some(VoxType::OpaqueSurface(name)) => match name.as_str() {
             "Int" => Some(WasmScalar::Int),
+            "UInt" => Some(WasmScalar::UInt),
             "Float" => Some(WasmScalar::Float),
             "Bool" => Some(WasmScalar::Bool),
             "String" => Some(WasmScalar::String),
@@ -1402,6 +1413,12 @@ fn emit_literal(
             i64(f, *v);
             local_set(f, ctx.data_local(rid));
         }
+        InlineValue::UInt(v) => {
+            i32(f, TAG_UINT);
+            local_set(f, ctx.tag_local(rid));
+            i64(f, *v as i64);
+            local_set(f, ctx.data_local(rid));
+        }
         InlineValue::Float(v) => {
             i32(f, TAG_FLOAT);
             local_set(f, ctx.tag_local(rid));
@@ -1736,6 +1753,9 @@ fn emit_value_as_f64(f: &mut Function, ctx: &Ctx, value: MirValueId, ty: WasmSca
         WasmScalar::Int => {
             f.instruction(&Instruction::F64ConvertI64S);
         }
+        WasmScalar::UInt => {
+            f.instruction(&Instruction::F64ConvertI64U);
+        }
         WasmScalar::Float => {
             f.instruction(&Instruction::F64ReinterpretI64);
         }
@@ -1776,11 +1796,13 @@ fn record_known_tag(ctx: &mut Ctx, value: MirValueId, tag: i32) {
 fn primitive_tag_for_type(ty: &VoxType) -> Option<i32> {
     match ty {
         VoxType::Int => Some(TAG_INT),
+        VoxType::UInt => Some(TAG_UINT),
         VoxType::Float => Some(TAG_FLOAT),
         VoxType::Bool => Some(TAG_BOOL),
         VoxType::String => Some(TAG_STRING),
         VoxType::OpaqueSurface(name) => match name.as_str() {
             "Int" => Some(TAG_INT),
+            "UInt" => Some(TAG_UINT),
             "Float" => Some(TAG_FLOAT),
             "Bool" => Some(TAG_BOOL),
             "String" => Some(TAG_STRING),
@@ -1796,6 +1818,8 @@ fn literal_tag(value: &MirValue) -> Option<i32> {
         MirValueDefinition::Literal => match value.ty.as_ref() {
             Some(VoxType::Int) => Some(TAG_INT),
             Some(VoxType::OpaqueSurface(s)) if s == "Int" => Some(TAG_INT),
+            Some(VoxType::UInt) => Some(TAG_UINT),
+            Some(VoxType::OpaqueSurface(s)) if s == "UInt" => Some(TAG_UINT),
             Some(VoxType::Float) => Some(TAG_FLOAT),
             Some(VoxType::OpaqueSurface(s)) if s == "Float" => Some(TAG_FLOAT),
             Some(VoxType::Bool) => Some(TAG_BOOL),
@@ -1853,6 +1877,7 @@ fn track_unary_result_tag(
 fn tag_for_scalar(ty: WasmScalar) -> Result<i32, String> {
     match ty {
         WasmScalar::Int => Ok(TAG_INT),
+        WasmScalar::UInt => Ok(TAG_UINT),
         WasmScalar::Float => Ok(TAG_FLOAT),
         WasmScalar::Bool => Ok(TAG_BOOL),
         WasmScalar::String => Ok(TAG_STRING),

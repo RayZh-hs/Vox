@@ -3,6 +3,7 @@ use crate::source::ModulePath;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoxType {
     Int,
+    UInt,
     Float,
     Bool,
     String,

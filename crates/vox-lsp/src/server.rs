@@ -1663,6 +1663,7 @@ fn find_name_at_offset(
 fn builtin_signature_help(call_info: &CallInfo) -> Option<SignatureHelp> {
     let candidates = [
         BuiltinReceiver::Int,
+        BuiltinReceiver::UInt,
         BuiltinReceiver::Float,
         BuiltinReceiver::Bool,
         BuiltinReceiver::String,
@@ -1707,6 +1708,7 @@ fn builtin_signature_help(call_info: &CallInfo) -> Option<SignatureHelp> {
 fn repl_type_for_builtin_receiver(receiver: BuiltinReceiver) -> vox_runtime::ReplType {
     match receiver {
         BuiltinReceiver::Int => vox_runtime::ReplType::Int,
+        BuiltinReceiver::UInt => vox_runtime::ReplType::UInt,
         BuiltinReceiver::Float => vox_runtime::ReplType::Float,
         BuiltinReceiver::Bool => vox_runtime::ReplType::Bool,
         BuiltinReceiver::String => vox_runtime::ReplType::String,

@@ -2590,6 +2590,7 @@ fn builtin_return_type(callee: &str, args: &[MirValueId], body: &BodyBuilder) ->
     let receiver_ty = args.first().and_then(|arg| body.value_type(*arg));
     match (receiver, method) {
         (BuiltinReceiver::Int, "toString")
+        | (BuiltinReceiver::UInt, "toString")
         | (BuiltinReceiver::Float, "toString")
         | (BuiltinReceiver::Bool, "toString")
         | (BuiltinReceiver::String, "substring")
@@ -2598,7 +2599,11 @@ fn builtin_return_type(callee: &str, args: &[MirValueId], body: &BodyBuilder) ->
         | (BuiltinReceiver::String, "toUpper")
         | (BuiltinReceiver::String, "trim")
         | (BuiltinReceiver::String, "repeat") => Some(VoxType::String),
-        (BuiltinReceiver::Int, "toFloat") => Some(VoxType::Float),
+        (BuiltinReceiver::Int, "toFloat") | (BuiltinReceiver::UInt, "toFloat") => {
+            Some(VoxType::Float)
+        }
+        (BuiltinReceiver::Int, "toUInt") => Some(VoxType::Nullable(Box::new(VoxType::UInt))),
+        (BuiltinReceiver::UInt, "toInt") => Some(VoxType::Nullable(Box::new(VoxType::Int))),
         (BuiltinReceiver::Float, "toInt")
         | (BuiltinReceiver::String, "toInt")
         | (BuiltinReceiver::String, "indexOf")
@@ -2646,6 +2651,7 @@ fn merge_mir_types(left: VoxType, right: VoxType) -> Option<VoxType> {
 fn render_type_key(ty: &VoxType) -> String {
     match ty {
         VoxType::Int => "Int".to_owned(),
+        VoxType::UInt => "UInt".to_owned(),
         VoxType::Float => "Float".to_owned(),
         VoxType::Bool => "Bool".to_owned(),
         VoxType::String => "String".to_owned(),
@@ -2657,6 +2663,7 @@ fn render_type_key(ty: &VoxType) -> String {
 fn parse_type_key(raw: &str) -> Option<VoxType> {
     match raw {
         "Int" => Some(VoxType::Int),
+        "UInt" => Some(VoxType::UInt),
         "Float" => Some(VoxType::Float),
         "Bool" => Some(VoxType::Bool),
         "String" => Some(VoxType::String),
@@ -2791,6 +2798,7 @@ fn is_method_styled_call(target: &Expr, _callee: &Expr, lowerer: &BodyBuilder) -
 fn mir_type_from_literal(value: &InlineValue) -> VoxType {
     match value {
         InlineValue::Int(_) => VoxType::Int,
+        InlineValue::UInt(_) => VoxType::UInt,
         InlineValue::Float(_) => VoxType::Float,
         InlineValue::Bool(_) => VoxType::Bool,
         InlineValue::String(_) => VoxType::String,

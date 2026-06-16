@@ -5,6 +5,7 @@ use crate::ids::HandleId;
 #[derive(Debug, Clone, PartialEq)]
 pub enum InlineValue {
     Int(i64),
+    UInt(u64),
     Float(f64),
     Bool(bool),
     String(String),
@@ -17,6 +18,7 @@ pub enum InlineValue {
 #[derive(Debug, Clone, PartialEq)]
 pub enum HandleData {
     Int(i64),
+    UInt(u64),
     Float(f64),
     Bool(bool),
     String(String),

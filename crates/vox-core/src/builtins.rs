@@ -3,6 +3,7 @@ use crate::types::VoxType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinReceiver {
     Int,
+    UInt,
     Float,
     Bool,
     String,
@@ -32,6 +33,26 @@ pub const BUILTIN_METHODS: &[BuiltinMethod] = &[
     BuiltinMethod {
         receiver: BuiltinReceiver::Int,
         name: "toFloat",
+        implementation: BuiltinImpl::Intrinsic,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::Int,
+        name: "toUInt",
+        implementation: BuiltinImpl::Intrinsic,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::UInt,
+        name: "toString",
+        implementation: BuiltinImpl::Intrinsic,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::UInt,
+        name: "toFloat",
+        implementation: BuiltinImpl::Intrinsic,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::UInt,
+        name: "toInt",
         implementation: BuiltinImpl::Intrinsic,
     },
     BuiltinMethod {
@@ -224,6 +245,7 @@ impl BuiltinReceiver {
     pub fn name(self) -> &'static str {
         match self {
             Self::Int => "Int",
+            Self::UInt => "UInt",
             Self::Float => "Float",
             Self::Bool => "Bool",
             Self::String => "String",
@@ -235,6 +257,7 @@ impl BuiltinReceiver {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "Int" => Some(Self::Int),
+            "UInt" => Some(Self::UInt),
             "Float" => Some(Self::Float),
             "Bool" => Some(Self::Bool),
             "String" => Some(Self::String),
@@ -248,6 +271,7 @@ impl BuiltinReceiver {
 pub fn builtin_receiver_for_type(ty: &VoxType) -> Option<BuiltinReceiver> {
     match ty {
         VoxType::Int => Some(BuiltinReceiver::Int),
+        VoxType::UInt => Some(BuiltinReceiver::UInt),
         VoxType::Float => Some(BuiltinReceiver::Float),
         VoxType::Bool => Some(BuiltinReceiver::Bool),
         VoxType::String => Some(BuiltinReceiver::String),

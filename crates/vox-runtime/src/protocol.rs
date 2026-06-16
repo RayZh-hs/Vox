@@ -501,6 +501,10 @@ pub fn encode_inline_value(
             writer.write_u8(0x02);
             writer.write_i64(*value);
         }
+        InlineValue::UInt(value) => {
+            writer.write_u8(0x09);
+            writer.write_u64(*value);
+        }
         InlineValue::Float(value) => {
             writer.write_u8(0x03);
             writer.write_f64(*value);
@@ -547,6 +551,7 @@ pub fn decode_inline_value(reader: &mut PayloadReader<'_>) -> Result<InlineValue
             _ => return Err(ProtocolError::message("invalid boolean payload")),
         })),
         0x02 => Ok(InlineValue::Int(reader.read_i64()?)),
+        0x09 => Ok(InlineValue::UInt(reader.read_u64()?)),
         0x03 => Ok(InlineValue::Float(reader.read_f64()?)),
         0x04 => Ok(InlineValue::String(reader.read_string()?)),
         0x05 => {
@@ -587,6 +592,10 @@ pub fn encode_handle_data(
         HandleData::Int(value) => {
             writer.write_u8(0x02);
             writer.write_i64(*value);
+        }
+        HandleData::UInt(value) => {
+            writer.write_u8(0x09);
+            writer.write_u64(*value);
         }
         HandleData::Float(value) => {
             writer.write_u8(0x03);
@@ -637,6 +646,7 @@ pub fn decode_handle_data(reader: &mut PayloadReader<'_>) -> Result<HandleData, 
             _ => return Err(ProtocolError::message("invalid boolean payload")),
         })),
         0x02 => Ok(HandleData::Int(reader.read_i64()?)),
+        0x09 => Ok(HandleData::UInt(reader.read_u64()?)),
         0x03 => Ok(HandleData::Float(reader.read_f64()?)),
         0x04 => Ok(HandleData::String(reader.read_string()?)),
         0x05 => {

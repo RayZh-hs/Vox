@@ -377,7 +377,7 @@ fn collect_surface_names(ty: &VoxType, out: &mut BTreeSet<String>) {
         VoxType::DynTrait(name) | VoxType::Named(name) => {
             out.insert(name.name.clone());
         }
-        VoxType::Int
+        VoxType::Int | VoxType::UInt
         | VoxType::Float
         | VoxType::Bool
         | VoxType::String
@@ -411,8 +411,8 @@ fn parse_rust_type(package: &ModulePath, raw: &str) -> Result<VoxType, String> {
     }
 
     match simple_path_name(&normalized)? {
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
-        | "usize" => Ok(VoxType::Int),
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => Ok(VoxType::Int),
+        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" => Ok(VoxType::UInt),
         "f32" | "f64" => Ok(VoxType::Float),
         "bool" => Ok(VoxType::Bool),
         "String" | "str" => Ok(VoxType::String),
@@ -444,6 +444,7 @@ fn parse_vox_type(package: &ModulePath, raw: &str) -> Result<VoxType, String> {
 
     match compact.as_str() {
         "Int" => Ok(VoxType::Int),
+        "UInt" => Ok(VoxType::UInt),
         "Float" => Ok(VoxType::Float),
         "Bool" => Ok(VoxType::Bool),
         "String" => Ok(VoxType::String),

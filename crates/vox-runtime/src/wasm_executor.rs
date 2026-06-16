@@ -23,6 +23,7 @@ const TAG_RECORD: i32 = 5;
 const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
+const TAG_UINT: i32 = 9;
 const TAG_INVALID: i32 = -1;
 const STRDATA_OFF: i64 = 32768;
 const WASM_PAGE_SIZE: u32 = 65536;
@@ -549,6 +550,28 @@ fn builtin_method(
                     handle_data_result_to_wasm(runtime, HandleData::String(args[0].1.to_string()))
                 }
                 "toFloat" => Ok((TAG_FLOAT, (args[0].1 as f64).to_bits() as i64)),
+                "toUInt" => Ok(if args[0].1 < 0 {
+                    (TAG_NULL, 0)
+                } else {
+                    (TAG_UINT, args[0].1)
+                }),
+                _ => unknown_wasm_builtin(receiver, method),
+            }
+        }
+        BuiltinReceiver::UInt => {
+            if args[0].0 != TAG_UINT {
+                return Err("UInt builtin receiver mismatch".to_owned());
+            }
+            expect_builtin_arg_count(method, args, 1)?;
+            let value = args[0].1 as u64;
+            match method {
+                "toString" => {
+                    handle_data_result_to_wasm(runtime, HandleData::String(value.to_string()))
+                }
+                "toFloat" => Ok((TAG_FLOAT, (value as f64).to_bits() as i64)),
+                "toInt" => Ok(i64::try_from(value)
+                    .map(|value| (TAG_INT, value))
+                    .unwrap_or((TAG_NULL, 0))),
                 _ => unknown_wasm_builtin(receiver, method),
             }
         }
@@ -876,6 +899,7 @@ fn handle_data_type(data: &HandleData) -> &'static str {
         HandleData::Null => "Null",
         HandleData::Bool(_) => "Bool",
         HandleData::Int(_) => "Int",
+        HandleData::UInt(_) => "UInt",
         HandleData::Float(_) => "Float",
         HandleData::String(_) => "String",
         HandleData::List(_) => "List",
@@ -1143,6 +1167,7 @@ fn to_wasm_entry(
 ) -> Result<(i32, i64), String> {
     match value {
         RuntimeValue::Inline(InlineValue::Int(value)) => Ok((TAG_INT, *value)),
+        RuntimeValue::Inline(InlineValue::UInt(value)) => Ok((TAG_UINT, *value as i64)),
         RuntimeValue::Inline(InlineValue::Float(value)) => Ok((TAG_FLOAT, value.to_bits() as i64)),
         RuntimeValue::Inline(InlineValue::Bool(value)) => Ok((TAG_BOOL, *value as i64)),
         RuntimeValue::Inline(InlineValue::Null) => Ok((TAG_NULL, 0)),
@@ -1174,6 +1199,7 @@ fn write_handle_data_to_memory(
         HandleData::Null => Ok((TAG_NULL, 0)),
         HandleData::Bool(value) => Ok((TAG_BOOL, *value as i64)),
         HandleData::Int(value) => Ok((TAG_INT, *value)),
+        HandleData::UInt(value) => Ok((TAG_UINT, *value as i64)),
         HandleData::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
         HandleData::String(value) => {
             let bytes = value.as_bytes();
@@ -1448,6 +1474,7 @@ fn memory_or_inline_to_handle_data(
 ) -> Result<HandleData, String> {
     match tag {
         TAG_INT => Ok(HandleData::Int(val)),
+        TAG_UINT => Ok(HandleData::UInt(val as u64)),
         TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(HandleData::Bool(val != 0)),
         TAG_NULL => Ok(HandleData::Null),
@@ -1475,7 +1502,7 @@ fn handle_data_to_runtime_handle(
             }
         }
         TAG_LIST | TAG_HANDLE => Ok(RuntimeValue::Handle(HandleId(val as u64))),
-        TAG_INT | TAG_FLOAT | TAG_BOOL | TAG_NULL => from_wasm(runtime, None, tag, val),
+        TAG_INT | TAG_UINT | TAG_FLOAT | TAG_BOOL | TAG_NULL => from_wasm(runtime, None, tag, val),
         _ => Err(format!("unknown wasm result tag {tag}")),
     }
 }
@@ -1488,6 +1515,7 @@ fn from_wasm(
 ) -> Result<RuntimeValue, String> {
     match tag {
         TAG_INT => Ok(RuntimeValue::Inline(InlineValue::Int(val))),
+        TAG_UINT => Ok(RuntimeValue::Inline(InlineValue::UInt(val as u64))),
         TAG_FLOAT => Ok(RuntimeValue::Inline(InlineValue::Float(f64::from_bits(
             val as u64,
         )))),
@@ -1526,6 +1554,7 @@ fn wasm_to_inline(
 ) -> Result<InlineValue, String> {
     match tag {
         TAG_INT => Ok(InlineValue::Int(val)),
+        TAG_UINT => Ok(InlineValue::UInt(val as u64)),
         TAG_FLOAT => Ok(InlineValue::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(InlineValue::Bool(val != 0)),
         TAG_NULL => Ok(InlineValue::Null),
@@ -1554,6 +1583,7 @@ fn wasm_to_inline(
 fn inline_result_to_wasm(runtime: &mut Runtime, value: InlineValue) -> Result<(i32, i64), String> {
     match value {
         InlineValue::Int(value) => Ok((TAG_INT, value)),
+        InlineValue::UInt(value) => Ok((TAG_UINT, value as i64)),
         InlineValue::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
         InlineValue::Bool(value) => Ok((TAG_BOOL, value as i64)),
         InlineValue::Null => Ok((TAG_NULL, 0)),
@@ -1608,6 +1638,7 @@ fn wasm_to_data(
 ) -> Result<HandleData, String> {
     match tag {
         TAG_INT => Ok(HandleData::Int(val)),
+        TAG_UINT => Ok(HandleData::UInt(val as u64)),
         TAG_FLOAT => Ok(HandleData::Float(f64::from_bits(val as u64))),
         TAG_BOOL => Ok(HandleData::Bool(val != 0)),
         TAG_NULL => Ok(HandleData::Null),
@@ -1634,6 +1665,7 @@ fn handle_data_result_to_wasm(
         HandleData::Null => Ok((TAG_NULL, 0)),
         HandleData::Bool(value) => Ok((TAG_BOOL, value as i64)),
         HandleData::Int(value) => Ok((TAG_INT, value)),
+        HandleData::UInt(value) => Ok((TAG_UINT, value as i64)),
         HandleData::Float(value) => Ok((TAG_FLOAT, value.to_bits() as i64)),
         HandleData::String(value) => {
             let summary = HandleSummary {
@@ -1682,6 +1714,7 @@ fn handle_data_to_inline(data: HandleData) -> Result<InlineValue, String> {
         HandleData::Null => Ok(InlineValue::Null),
         HandleData::Bool(value) => Ok(InlineValue::Bool(value)),
         HandleData::Int(value) => Ok(InlineValue::Int(value)),
+        HandleData::UInt(value) => Ok(InlineValue::UInt(value)),
         HandleData::Float(value) => Ok(InlineValue::Float(value)),
         HandleData::String(value) => Ok(InlineValue::String(value)),
         HandleData::Tuple(values) => values
@@ -1703,6 +1736,7 @@ fn handle_data_from_inline(value: &InlineValue) -> Result<HandleData, String> {
         InlineValue::Null => Ok(HandleData::Null),
         InlineValue::Bool(value) => Ok(HandleData::Bool(*value)),
         InlineValue::Int(value) => Ok(HandleData::Int(*value)),
+        InlineValue::UInt(value) => Ok(HandleData::UInt(*value)),
         InlineValue::Float(value) => Ok(HandleData::Float(*value)),
         InlineValue::String(value) => Ok(HandleData::String(value.clone())),
         InlineValue::Tuple(values) => values
@@ -1731,6 +1765,7 @@ fn wasm_matches_type(
 ) -> bool {
     match (ty, tag) {
         ("Int", TAG_INT)
+        | ("UInt", TAG_UINT)
         | ("Float", TAG_FLOAT)
         | ("Bool", TAG_BOOL)
         | ("String", TAG_STRING)
@@ -1788,6 +1823,7 @@ fn wasm_matches_type(
 fn primitive_type_tag(ty: &str) -> Option<i32> {
     match ty {
         "Int" => Some(TAG_INT),
+        "UInt" => Some(TAG_UINT),
         "Float" => Some(TAG_FLOAT),
         "Bool" => Some(TAG_BOOL),
         "String" => Some(TAG_STRING),
@@ -1981,6 +2017,7 @@ fn inline_type_name(value: &InlineValue) -> &'static str {
         InlineValue::Null => "Null",
         InlineValue::Bool(_) => "Bool",
         InlineValue::Int(_) => "Int",
+        InlineValue::UInt(_) => "UInt",
         InlineValue::Float(_) => "Float",
         InlineValue::String(_) => "String",
         InlineValue::Tuple(_) => "Tuple",
@@ -1994,6 +2031,7 @@ fn handle_data_type_name(value: &HandleData) -> &'static str {
         HandleData::Null => "Null",
         HandleData::Bool(_) => "Bool",
         HandleData::Int(_) => "Int",
+        HandleData::UInt(_) => "UInt",
         HandleData::Float(_) => "Float",
         HandleData::String(_) => "String",
         HandleData::Tuple(_) => "Tuple",
@@ -2007,6 +2045,7 @@ fn render_handle_data(value: &HandleData) -> String {
         HandleData::Null => "null".to_owned(),
         HandleData::Bool(value) => value.to_string(),
         HandleData::Int(value) => value.to_string(),
+        HandleData::UInt(value) => value.to_string(),
         HandleData::Float(value) => value.to_string(),
         HandleData::String(value) => value.clone(),
         HandleData::Tuple(values) => format!(
@@ -2041,6 +2080,7 @@ fn render_inline(value: &InlineValue) -> String {
         InlineValue::Null => "null".to_owned(),
         InlineValue::Bool(v) => v.to_string(),
         InlineValue::Int(v) => v.to_string(),
+        InlineValue::UInt(v) => v.to_string(),
         InlineValue::Float(v) => v.to_string(),
         InlineValue::String(v) => v.clone(),
         InlineValue::Handle(h) => format!("<handle {}>", h.0),

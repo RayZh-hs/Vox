@@ -1384,6 +1384,7 @@ fn render_runtime_value_source(value: &RuntimeValue) -> Option<String> {
 fn inline_value_is_source_literal(value: &InlineValue) -> bool {
     match value {
         InlineValue::Int(_)
+        | InlineValue::UInt(_)
         | InlineValue::Float(_)
         | InlineValue::Bool(_)
         | InlineValue::String(_)
@@ -1959,6 +1960,7 @@ fn stored_last_value(result_source: &str, value: &RuntimeValue) -> StoredItem {
 fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
     match value {
         vox_core::value::InlineValue::Int(value) => value.to_string(),
+        vox_core::value::InlineValue::UInt(value) => value.to_string(),
         vox_core::value::InlineValue::Float(value) => render_float_literal(*value),
         vox_core::value::InlineValue::Bool(value) => value.to_string(),
         vox_core::value::InlineValue::String(value) => {
@@ -1992,6 +1994,7 @@ fn render_inline_value_source(value: &vox_core::value::InlineValue) -> String {
 fn inline_value_type_source(value: &vox_core::value::InlineValue) -> String {
     match value {
         vox_core::value::InlineValue::Int(_) => "Int".to_owned(),
+        vox_core::value::InlineValue::UInt(_) => "UInt".to_owned(),
         vox_core::value::InlineValue::Float(_) => "Float".to_owned(),
         vox_core::value::InlineValue::Bool(_) => "Bool".to_owned(),
         vox_core::value::InlineValue::String(_) => "String".to_owned(),

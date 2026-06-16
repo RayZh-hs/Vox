@@ -1854,6 +1854,7 @@ impl<'a> EvalContext<'a> {
                 let ty_name = name.to_source_string();
                 match ty_name.as_str() {
                     "Int" => Ok(matches!(value, Value::Int(_))),
+                    "UInt" => Ok(matches!(value, Value::UInt(_))),
                     "Float" => Ok(matches!(value, Value::Float(_))),
                     "Bool" => Ok(matches!(value, Value::Bool(_))),
                     "String" => Ok(matches!(value, Value::String(_))),
@@ -2790,6 +2791,7 @@ pub(crate) enum Value {
     Null,
     Bool(bool),
     Int(i64),
+    UInt(u64),
     Float(f64),
     String(String),
     Handle(vox_core::ids::HandleId, HandleSummary),
@@ -2827,6 +2829,7 @@ impl Value {
     fn from_inline(value: InlineValue) -> Self {
         match value {
             InlineValue::Int(value) => Self::Int(value),
+            InlineValue::UInt(value) => Self::UInt(value),
             InlineValue::Float(value) => Self::Float(value),
             InlineValue::Bool(value) => Self::Bool(value),
             InlineValue::String(value) => Self::String(value),
@@ -2856,6 +2859,7 @@ impl Value {
             HandleData::Null => Self::Null,
             HandleData::Bool(value) => Self::Bool(value),
             HandleData::Int(value) => Self::Int(value),
+            HandleData::UInt(value) => Self::UInt(value),
             HandleData::Float(value) => Self::Float(value),
             HandleData::String(value) => Self::String(value),
             HandleData::List(values) => {
@@ -2878,6 +2882,7 @@ impl Value {
             Self::Null => Some(InlineValue::Null),
             Self::Bool(value) => Some(InlineValue::Bool(*value)),
             Self::Int(value) => Some(InlineValue::Int(*value)),
+            Self::UInt(value) => Some(InlineValue::UInt(*value)),
             Self::Float(value) => Some(InlineValue::Float(*value)),
             Self::String(value) => Some(InlineValue::String(value.clone())),
             Self::Handle(handle, _) => Some(InlineValue::Handle(*handle)),
@@ -2900,6 +2905,7 @@ impl Value {
             Self::Null => Some(HandleData::Null),
             Self::Bool(value) => Some(HandleData::Bool(*value)),
             Self::Int(value) => Some(HandleData::Int(*value)),
+            Self::UInt(value) => Some(HandleData::UInt(*value)),
             Self::Float(value) => Some(HandleData::Float(*value)),
             Self::String(value) => Some(HandleData::String(value.clone())),
             Self::Handle(_, _) => None,
@@ -2927,6 +2933,7 @@ impl Value {
             (Self::Null, Self::Null) => true,
             (Self::Bool(left), Self::Bool(right)) => left == right,
             (Self::Int(left), Self::Int(right)) => left == right,
+            (Self::UInt(left), Self::UInt(right)) => left == right,
             (Self::Float(left), Self::Float(right)) => left == right,
             (Self::Int(left), Self::Float(right)) => (*left as f64) == *right,
             (Self::Float(left), Self::Int(right)) => *left == (*right as f64),
@@ -2962,6 +2969,7 @@ impl Value {
             Self::Null => "Null",
             Self::Bool(_) => "Bool",
             Self::Int(_) => "Int",
+            Self::UInt(_) => "UInt",
             Self::Float(_) => "Float",
             Self::String(_) => "String",
             Self::Handle(_, _) => "Handle",
@@ -2979,6 +2987,7 @@ impl Value {
             Self::Null => "null".to_owned(),
             Self::Bool(value) => value.to_string(),
             Self::Int(value) => value.to_string(),
+            Self::UInt(value) => value.to_string(),
             Self::Float(value) => value.to_string(),
             Self::String(value) => value.clone(),
             Self::Handle(handle, summary) => {
@@ -3033,6 +3042,7 @@ impl Value {
             Self::Null => ReplType::Null,
             Self::Bool(_) => ReplType::Bool,
             Self::Int(_) => ReplType::Int,
+            Self::UInt(_) => ReplType::UInt,
             Self::Float(_) => ReplType::Float,
             Self::String(_) => ReplType::String,
             Self::Handle(_, summary) => ReplType::Named {
@@ -3262,6 +3272,7 @@ fn runtime_type_from_syntax(
             let raw = name.to_source_string();
             match raw.as_str() {
                 "Int" => ReplType::Int,
+                "UInt" => ReplType::UInt,
                 "Float" => ReplType::Float,
                 "Bool" => ReplType::Bool,
                 "String" => ReplType::String,
@@ -3323,6 +3334,7 @@ fn runtime_type_from_syntax(
 fn runtime_type_from_host_type(ty: &VoxType) -> ReplType {
     match ty {
         VoxType::Int => ReplType::Int,
+        VoxType::UInt => ReplType::UInt,
         VoxType::Float => ReplType::Float,
         VoxType::Bool => ReplType::Bool,
         VoxType::String => ReplType::String,
@@ -3370,6 +3382,7 @@ fn runtime_type_from_host_type(ty: &VoxType) -> ReplType {
 fn runtime_type_from_opaque_surface(raw: &str) -> ReplType {
     match raw {
         "Int" => ReplType::Int,
+        "UInt" => ReplType::UInt,
         "Float" => ReplType::Float,
         "Bool" => ReplType::Bool,
         "String" => ReplType::String,
@@ -3425,6 +3438,7 @@ fn value_from_inline_value(runtime: &Runtime, value: &InlineValue) -> Result<Val
         InlineValue::Null
         | InlineValue::Bool(_)
         | InlineValue::Int(_)
+        | InlineValue::UInt(_)
         | InlineValue::Float(_)
         | InlineValue::String(_) => Ok(Value::from_inline(value.clone())),
     }
@@ -3456,6 +3470,7 @@ fn expr_as_qualified_name(expr: &Expr) -> Option<QualifiedName> {
 fn builtin_receiver_for_value(value: &Value) -> Option<BuiltinReceiver> {
     match value {
         Value::Int(_) => Some(BuiltinReceiver::Int),
+        Value::UInt(_) => Some(BuiltinReceiver::UInt),
         Value::Float(_) => Some(BuiltinReceiver::Float),
         Value::Bool(_) => Some(BuiltinReceiver::Bool),
         Value::String(_) => Some(BuiltinReceiver::String),
@@ -3473,6 +3488,7 @@ fn eval_builtin_method(
 ) -> Result<Value, EvalError> {
     match receiver {
         BuiltinReceiver::Int => eval_int_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::UInt => eval_uint_builtin(receiver_value, method_name, arguments),
         BuiltinReceiver::Float => eval_float_builtin(receiver_value, method_name, arguments),
         BuiltinReceiver::Bool => eval_bool_builtin(receiver_value, method_name, arguments),
         BuiltinReceiver::String => eval_string_builtin(receiver_value, method_name, arguments),
@@ -3498,7 +3514,29 @@ fn eval_int_builtin(
     match method_name {
         "toString" => Ok(Value::String(value.to_string())),
         "toFloat" => Ok(Value::Float(value as f64)),
+        "toUInt" => Ok(if value < 0 {
+            Value::Null
+        } else {
+            Value::UInt(value as u64)
+        }),
         _ => unknown_builtin_method(BuiltinReceiver::Int, method_name),
+    }
+}
+
+fn eval_uint_builtin(
+    receiver: Value,
+    method_name: &str,
+    arguments: Vec<Value>,
+) -> Result<Value, EvalError> {
+    expect_arg_count(method_name, &arguments, 0)?;
+    let Value::UInt(value) = receiver else {
+        return Err(EvalError::Message("UInt builtin receiver mismatch".to_owned()));
+    };
+    match method_name {
+        "toString" => Ok(Value::String(value.to_string())),
+        "toFloat" => Ok(Value::Float(value as f64)),
+        "toInt" => Ok(i64::try_from(value).map(Value::Int).unwrap_or(Value::Null)),
+        _ => unknown_builtin_method(BuiltinReceiver::UInt, method_name),
     }
 }
 

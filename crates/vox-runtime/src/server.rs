@@ -1508,6 +1508,7 @@ impl RuntimeConnection {
             InlineValue::Null
             | InlineValue::Bool(_)
             | InlineValue::Int(_)
+            | InlineValue::UInt(_)
             | InlineValue::Float(_)
             | InlineValue::String(_) => crate::protocol::encode_inline_value(payload, value)
                 .map_err(WireFailure::bad_argument),

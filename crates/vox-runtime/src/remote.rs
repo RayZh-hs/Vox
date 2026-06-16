@@ -1004,6 +1004,7 @@ fn collect_inline_handles(value: &vox_core::value::InlineValue, handles: &mut BT
         vox_core::value::InlineValue::Null
         | vox_core::value::InlineValue::Bool(_)
         | vox_core::value::InlineValue::Int(_)
+        | vox_core::value::InlineValue::UInt(_)
         | vox_core::value::InlineValue::Float(_)
         | vox_core::value::InlineValue::String(_) => {}
     }

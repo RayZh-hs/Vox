@@ -676,6 +676,7 @@ fn write_path(out: &mut String, path: &[MirPathSegment]) -> fmt::Result {
 fn render_inline_value(value: &InlineValue) -> String {
     match value {
         InlineValue::Int(value) => value.to_string(),
+        InlineValue::UInt(value) => value.to_string(),
         InlineValue::Float(value) => value.to_string(),
         InlineValue::Bool(value) => value.to_string(),
         InlineValue::String(value) => format!("{value:?}"),

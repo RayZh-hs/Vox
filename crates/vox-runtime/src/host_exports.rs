@@ -126,11 +126,30 @@ impl IntoHostValue for i64 {
     }
 }
 
+impl FromHostValue for u64 {
+    fn from_host_value(_: &Runtime, value: &RuntimeValue) -> Result<Self, String> {
+        match value {
+            RuntimeValue::Inline(InlineValue::UInt(value)) => Ok(*value),
+            other => Err(format!(
+                "expected UInt host value, received {}",
+                runtime_value_kind(other)
+            )),
+        }
+    }
+}
+
+impl IntoHostValue for u64 {
+    fn into_host_value(self, _: &mut Runtime) -> Result<RuntimeValue, String> {
+        Ok(RuntimeValue::Inline(InlineValue::UInt(self)))
+    }
+}
+
 impl FromHostValue for f64 {
     fn from_host_value(_: &Runtime, value: &RuntimeValue) -> Result<Self, String> {
         match value {
             RuntimeValue::Inline(InlineValue::Float(value)) => Ok(*value),
             RuntimeValue::Inline(InlineValue::Int(value)) => Ok(*value as f64),
+            RuntimeValue::Inline(InlineValue::UInt(value)) => Ok(*value as f64),
             other => Err(format!(
                 "expected Float host value, received {}",
                 runtime_value_kind(other)
@@ -282,16 +301,34 @@ impl IntoVoxFieldData for i64 {
     }
 }
 
+impl FromVoxFieldData for u64 {
+    fn from_vox_field_data(data: HandleData) -> Result<Self, String> {
+        match data {
+            HandleData::UInt(value) => Ok(value),
+            other => Err(format!(
+                "expected UInt handle data, received {}",
+                handle_data_kind(&other)
+            )),
+        }
+    }
+}
+
+impl IntoVoxFieldData for u64 {
+    fn into_vox_field_data(self) -> Result<HandleData, String> {
+        Ok(HandleData::UInt(self))
+    }
+}
+
 impl FromVoxFieldData for u8 {
     fn from_vox_field_data(data: HandleData) -> Result<Self, String> {
-        let value = <i64 as FromVoxFieldData>::from_vox_field_data(data)?;
+        let value = <u64 as FromVoxFieldData>::from_vox_field_data(data)?;
         u8::try_from(value).map_err(|_| format!("integer value {value} is outside the u8 range"))
     }
 }
 
 impl IntoVoxFieldData for u8 {
     fn into_vox_field_data(self) -> Result<HandleData, String> {
-        Ok(HandleData::Int(self as i64))
+        Ok(HandleData::UInt(self as u64))
     }
 }
 
@@ -300,6 +337,7 @@ impl FromVoxFieldData for f64 {
         match data {
             HandleData::Float(value) => Ok(value),
             HandleData::Int(value) => Ok(value as f64),
+            HandleData::UInt(value) => Ok(value as f64),
             other => Err(format!(
                 "expected Float handle data, received {}",
                 handle_data_kind(&other)
@@ -452,6 +490,7 @@ fn registered_host_functions_for_manifest(
 fn runtime_value_kind(value: &RuntimeValue) -> &'static str {
     match value {
         RuntimeValue::Inline(InlineValue::Int(_)) => "Int",
+        RuntimeValue::Inline(InlineValue::UInt(_)) => "UInt",
         RuntimeValue::Inline(InlineValue::Float(_)) => "Float",
         RuntimeValue::Inline(InlineValue::Bool(_)) => "Bool",
         RuntimeValue::Inline(InlineValue::String(_)) => "String",
@@ -466,6 +505,7 @@ fn runtime_value_kind(value: &RuntimeValue) -> &'static str {
 fn handle_data_kind(value: &HandleData) -> &'static str {
     match value {
         HandleData::Int(_) => "Int",
+        HandleData::UInt(_) => "UInt",
         HandleData::Float(_) => "Float",
         HandleData::Bool(_) => "Bool",
         HandleData::String(_) => "String",

@@ -424,6 +424,25 @@ impl<'a> MirExecutor<'a> {
                 match method {
                     "toString" => Ok(InlineValue::String(value.to_string())),
                     "toFloat" => Ok(InlineValue::Float(*value as f64)),
+                    "toUInt" => Ok(if *value < 0 {
+                        InlineValue::Null
+                    } else {
+                        InlineValue::UInt(*value as u64)
+                    }),
+                    _ => unknown_mir_builtin(receiver, method),
+                }
+            }
+            BuiltinReceiver::UInt => {
+                let InlineValue::UInt(value) = first else {
+                    return Err("UInt builtin receiver mismatch".to_owned());
+                };
+                expect_builtin_arg_count(method, rest, 0)?;
+                match method {
+                    "toString" => Ok(InlineValue::String(value.to_string())),
+                    "toFloat" => Ok(InlineValue::Float(*value as f64)),
+                    "toInt" => Ok(i64::try_from(*value)
+                        .map(InlineValue::Int)
+                        .unwrap_or(InlineValue::Null)),
                     _ => unknown_mir_builtin(receiver, method),
                 }
             }
@@ -660,6 +679,7 @@ fn handle_data_from_inline(value: &InlineValue) -> Option<HandleData> {
         InlineValue::Null => Some(HandleData::Null),
         InlineValue::Bool(value) => Some(HandleData::Bool(*value)),
         InlineValue::Int(value) => Some(HandleData::Int(*value)),
+        InlineValue::UInt(value) => Some(HandleData::UInt(*value)),
         InlineValue::Float(value) => Some(HandleData::Float(*value)),
         InlineValue::String(value) => Some(HandleData::String(value.clone())),
         InlineValue::Tuple(values) => values
@@ -832,6 +852,7 @@ fn render_inline_value(value: &InlineValue) -> String {
         InlineValue::Null => "null".to_owned(),
         InlineValue::Bool(value) => value.to_string(),
         InlineValue::Int(value) => value.to_string(),
+        InlineValue::UInt(value) => value.to_string(),
         InlineValue::Float(value) => value.to_string(),
         InlineValue::String(value) => value.clone(),
         InlineValue::Handle(handle) => format!("<handle {}>", handle.0),
@@ -951,6 +972,7 @@ fn expect_bool(value: InlineValue, label: &str) -> Result<bool, String> {
 fn matches_type_name(executor: &MirExecutor<'_>, value: &InlineValue, ty: &str) -> bool {
     match (ty, value) {
         ("Int", InlineValue::Int(_))
+        | ("UInt", InlineValue::UInt(_))
         | ("Float", InlineValue::Float(_))
         | ("Bool", InlineValue::Bool(_))
         | ("String", InlineValue::String(_))
@@ -1000,6 +1022,7 @@ fn split_qualified_host_name(callee: &str) -> Option<(ModulePath, String)> {
 fn type_name(value: &InlineValue) -> &'static str {
     match value {
         InlineValue::Int(_) => "Int",
+        InlineValue::UInt(_) => "UInt",
         InlineValue::Float(_) => "Float",
         InlineValue::Bool(_) => "Bool",
         InlineValue::String(_) => "String",
@@ -1235,6 +1258,7 @@ fn inline_value_from_data(data: HandleData) -> Result<InlineValue, String> {
         HandleData::Null => Ok(InlineValue::Null),
         HandleData::Bool(value) => Ok(InlineValue::Bool(value)),
         HandleData::Int(value) => Ok(InlineValue::Int(value)),
+        HandleData::UInt(value) => Ok(InlineValue::UInt(value)),
         HandleData::Float(value) => Ok(InlineValue::Float(value)),
         HandleData::String(value) => Ok(InlineValue::String(value)),
         HandleData::Tuple(values) => values
@@ -1256,6 +1280,7 @@ fn handle_data_from_inline_value(value: &InlineValue) -> Result<HandleData, Stri
         InlineValue::Null => Ok(HandleData::Null),
         InlineValue::Bool(value) => Ok(HandleData::Bool(*value)),
         InlineValue::Int(value) => Ok(HandleData::Int(*value)),
+        InlineValue::UInt(value) => Ok(HandleData::UInt(*value)),
         InlineValue::Float(value) => Ok(HandleData::Float(*value)),
         InlineValue::String(value) => Ok(HandleData::String(value.clone())),
         InlineValue::Tuple(values) => values
@@ -1384,6 +1409,7 @@ fn handle_data_type(data: &HandleData) -> &'static str {
         HandleData::Null => "Null",
         HandleData::Bool(_) => "Bool",
         HandleData::Int(_) => "Int",
+        HandleData::UInt(_) => "UInt",
         HandleData::Float(_) => "Float",
         HandleData::String(_) => "String",
         HandleData::List(_) => "List",
@@ -1397,6 +1423,7 @@ fn render_handle_data(value: &HandleData) -> String {
         HandleData::Null => "null".to_owned(),
         HandleData::Bool(value) => value.to_string(),
         HandleData::Int(value) => value.to_string(),
+        HandleData::UInt(value) => value.to_string(),
         HandleData::Float(value) => value.to_string(),
         HandleData::String(value) => value.clone(),
         HandleData::List(values) => format!(

@@ -19,6 +19,7 @@ pub enum ReplType {
     Null,
     Bool,
     Int,
+    UInt,
     Float,
     String,
     List(Box<ReplType>),
@@ -151,6 +152,7 @@ impl ReplType {
             Self::Null => "Null".to_owned(),
             Self::Bool => "Bool".to_owned(),
             Self::Int => "Int".to_owned(),
+            Self::UInt => "UInt".to_owned(),
             Self::Float => "Float".to_owned(),
             Self::String => "String".to_owned(),
             Self::List(item) => format!("List[{}]", item.render()),
@@ -2579,6 +2581,7 @@ fn from_type_syntax(
             let raw = name.to_source_string();
             match raw.as_str() {
                 "Int" => ReplType::Int,
+                "UInt" => ReplType::UInt,
                 "Float" => ReplType::Float,
                 "Bool" => ReplType::Bool,
                 "String" => ReplType::String,
@@ -2641,6 +2644,7 @@ fn from_type_syntax(
 fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
     match ty {
         vox_core::types::VoxType::Int => ReplType::Int,
+        vox_core::types::VoxType::UInt => ReplType::UInt,
         vox_core::types::VoxType::Float => ReplType::Float,
         vox_core::types::VoxType::Bool => ReplType::Bool,
         vox_core::types::VoxType::String => ReplType::String,
@@ -2682,6 +2686,7 @@ fn from_vox_host_type(ty: &vox_core::types::VoxType) -> ReplType {
 fn repl_type_from_opaque_surface(raw: &str) -> ReplType {
     match raw {
         "Int" => ReplType::Int,
+        "UInt" => ReplType::UInt,
         "Float" => ReplType::Float,
         "Bool" => ReplType::Bool,
         "String" => ReplType::String,
@@ -2892,6 +2897,7 @@ fn substitute_repl_type(ty: &ReplType, substitutions: &BTreeMap<String, ReplType
 fn builtin_receiver_for_repl_type(ty: &ReplType) -> Option<BuiltinReceiver> {
     match ty {
         ReplType::Int => Some(BuiltinReceiver::Int),
+        ReplType::UInt => Some(BuiltinReceiver::UInt),
         ReplType::Float => Some(BuiltinReceiver::Float),
         ReplType::Bool => Some(BuiltinReceiver::Bool),
         ReplType::String => Some(BuiltinReceiver::String),
@@ -2906,15 +2912,21 @@ fn builtin_method_type_for_repl_type(ty: &ReplType, method_name: &str) -> Option
     builtins::builtin_method(receiver, method_name)?;
 
     let int = ReplType::Int;
+    let uint = ReplType::UInt;
     let float = ReplType::Float;
     let bool_ty = ReplType::Bool;
     let string = ReplType::String;
     let nullable_int = ReplType::Nullable(Box::new(ReplType::Int));
+    let nullable_uint = ReplType::Nullable(Box::new(ReplType::UInt));
     let nullable_float = ReplType::Nullable(Box::new(ReplType::Float));
 
     let signature = match (receiver, method_name) {
         (BuiltinReceiver::Int, "toString") => (vec![int.clone()], string),
         (BuiltinReceiver::Int, "toFloat") => (vec![int.clone()], float),
+        (BuiltinReceiver::Int, "toUInt") => (vec![int.clone()], nullable_uint),
+        (BuiltinReceiver::UInt, "toString") => (vec![uint.clone()], string),
+        (BuiltinReceiver::UInt, "toFloat") => (vec![uint.clone()], float),
+        (BuiltinReceiver::UInt, "toInt") => (vec![uint.clone()], nullable_int),
         (BuiltinReceiver::Float, "toString") => (vec![float.clone()], string),
         (BuiltinReceiver::Float, "toInt") => (vec![float.clone()], nullable_int),
         (BuiltinReceiver::Float, "round" | "floor" | "ceil") => (vec![float.clone()], int),
@@ -3006,7 +3018,7 @@ fn type_satisfies_bound(ty: &ReplType, bound: &str) -> bool {
 
 fn predefined_type_name_kind(name: &str) -> Option<&'static str> {
     match name {
-        "Int" | "Float" | "Bool" | "String" | "Unit" => Some("type"),
+        "Int" | "UInt" | "Float" | "Bool" | "String" | "Unit" => Some("type"),
         "List" | "Econ" => Some("type constructor"),
         _ => None,
     }

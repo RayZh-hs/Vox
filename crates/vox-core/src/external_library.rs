@@ -363,6 +363,7 @@ fn encode_vox_type(
 ) -> Result<(), ExternalLibraryFormatError> {
     match ty {
         VoxType::Int => writer.write_u8(0x00),
+        VoxType::UInt => writer.write_u8(0x0c),
         VoxType::Float => writer.write_u8(0x01),
         VoxType::Bool => writer.write_u8(0x02),
         VoxType::String => writer.write_u8(0x03),
@@ -412,6 +413,7 @@ fn encode_vox_type(
 fn decode_vox_type(reader: &mut BinaryReader<'_>) -> Result<VoxType, ExternalLibraryFormatError> {
     match reader.read_u8()? {
         0x00 => Ok(VoxType::Int),
+        0x0c => Ok(VoxType::UInt),
         0x01 => Ok(VoxType::Float),
         0x02 => Ok(VoxType::Bool),
         0x03 => Ok(VoxType::String),
