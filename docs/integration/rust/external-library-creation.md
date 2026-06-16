@@ -1,6 +1,6 @@
 # External Library Creation
 
-Rust host integration should feel small:
+Rust host integration is intentionally small:
 
 - declare the package once;
 - mark Rust structs, traits, and functions as Vox-exportable once;
@@ -12,7 +12,7 @@ encoding types.
 
 An external library is the Rust-side description of one Vox package. In Rust,
 the builder type for that concept is `ExternalLibrary`. Ordinary library
-authors should not build `PackageManifest`, `TypeSpec`, `FunctionSpec`, or
+authors do not build `PackageManifest`, `TypeSpec`, `FunctionSpec`, or
 `VoxType` by hand.
 
 ## The Model
@@ -38,7 +38,7 @@ That means:
 
 ### 1. Mark exported structs once
 
-Use a Vox SDK derive on each Rust struct that should be visible to Vox:
+Use a Vox SDK derive on each Rust struct that is visible to Vox:
 
 ```rust
 use voxlib_sdk::{VoxExport, external_library::ExternalLibrary};
@@ -168,7 +168,7 @@ alongside the manifest. `ExternalLibrary::generate()` writes them into the
 `.voxlib` file automatically.
 
 To override a docstring (e.g. when the Rust doc comment is intended for Rust
-consumers but the Vox docstring should differ), use the explicit form:
+consumers but the Vox docstring differs), use the explicit form:
 
 ```rust
 #[vox_fn(purity = "pure", doc = "Blurs an image with a Gaussian kernel.")]
@@ -272,26 +272,26 @@ fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
 
 ## Automatic Inclusion Rules
 
-`ExternalLibrary` should include an exported Rust struct automatically when:
+`ExternalLibrary` includes an exported Rust struct automatically when:
 
 - an exported function parameter uses it;
 - an exported function return type uses it;
 - an exported trait method uses it;
 - it appears inside a supported container such as `Option<T>` or `Vec<T>`.
 
-`ExternalLibrary` should include an exported Rust trait automatically when:
+`ExternalLibrary` includes an exported Rust trait automatically when:
 
 - an exported function parameter uses `dyn Trait`;
 - an exported function return type uses `dyn Trait`;
 - the trait itself declares exported methods.
 
-`ExternalLibrary` should include an exported Rust function automatically when:
+`ExternalLibrary` includes an exported Rust function automatically when:
 
 - it is marked with `#[vox_fn(...)]`;
 - it is a lowered function referenced by an exported trait method;
 - it belongs to the package being built.
 
-`ExternalLibrary` should follow these references transitively until the
+`ExternalLibrary` follows these references transitively until the
 reachable package metadata is complete.
 
 ## Trait Methods and Lowered Functions
@@ -334,7 +334,7 @@ Rust types map to Vox types automatically for the common cases:
 - exported Rust structs -> qualified named Vox types
 - exported Rust traits behind `dyn` -> qualified dynamic trait types
 
-Most users should stay entirely in ordinary Rust signatures and let Vox infer
+Most users stay entirely in ordinary Rust signatures and let Vox infer
 the manifest types.
 
 When a host function needs to return multiple named values, prefer a record

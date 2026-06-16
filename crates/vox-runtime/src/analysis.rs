@@ -2019,6 +2019,21 @@ impl<'a> TypeEngine<'a> {
         method_name: &str,
         _scope: &TypeScope,
     ) -> Option<ReplType> {
+        if method_name == "update" {
+            if let ReplType::Named { name, arguments } = target_type {
+                if name == "Econ" {
+                    let snapshot = arguments
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| ReplType::Unknown("Unknown".to_owned()));
+                    return Some(ReplType::Function {
+                        parameters: vec![target_type.clone()],
+                        result: Box::new(snapshot),
+                    });
+                }
+            }
+        }
+
         if let Some(function) = self.functions.get(method_name) {
             if let Some(first_param) = function.summary.parameters.first() {
                 if target_type.is_assignable_to(&first_param.ty) {

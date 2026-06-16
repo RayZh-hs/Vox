@@ -126,6 +126,12 @@ All methods are **pure** unless noted.
 | `slice` | `(List[T], from: Int, to: Int) -> List[T]` | Prelude | Sub-list `[from, to)` |
 | `reversed` | `(List[T]) -> List[T]` | Prelude | New list in reverse order |
 
+### Econ[T]
+
+| Method | Signature | Impl | Purity | Description |
+|--------|-----------|------|--------|-------------|
+| `update` | `(Econ[T]) -> T` | Builtin | Evil | Re-run the captured `econ` block, replace the snapshot, and return the refreshed value |
+
 ### `std.containers`
 
 `std.containers` is an ordinary standard-library module, not part of the

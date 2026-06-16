@@ -40,7 +40,7 @@ All other expressions in statement position require a trailing semicolon.
 
 The final expression in a block may be written without a semicolon. This is the block’s trailing expression.
 
-To use a block-like expression as the trailing expression of a block when it would otherwise be parsed as a statement, wrap it in parentheses:
+To use a block-like expression as the trailing expression of a block in a position parsed as a statement, wrap it in parentheses:
 
 ```vox
 fun describe(x: Int?): String {

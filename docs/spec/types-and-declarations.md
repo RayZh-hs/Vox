@@ -84,7 +84,8 @@ The following type forms are built into the language:
 
 `List[T]` is a predefined generic type constructor.
 
-`Econ[T]` is a predefined generic type constructor.
+`Econ[T]` is a predefined generic type constructor. `Econ[T]` values expose
+`update(self: Econ[T]) -> T` as a built-in effectful method.
 
 ## 3. Generic Parameter Clauses
 

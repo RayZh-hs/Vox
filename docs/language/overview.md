@@ -148,9 +148,8 @@ fun cachedText(path: String): Econ[String] {
 cached snapshot of an effectful computation. Pure code can pass the handle
 around without re-running the effect.
 
-Runtime support for refreshing `econ` snapshots will be implemented. For now,
-the language syntax is available, but refresh tooling should be treated as
-incomplete.
+Use `snapshot.update()` to refresh an `Econ[T]`. The call re-runs the original
+`econ` block, stores the new snapshot, and returns the refreshed `T` value.
 
 ## Scripts
 

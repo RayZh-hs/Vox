@@ -1174,6 +1174,10 @@ impl<'a> EvalContext<'a> {
     ) -> Result<Value, EvalError> {
         let receiver_val = self.eval_expr(receiver)?;
 
+        if method_name == "update" && matches!(receiver_val, Value::Econ(_)) {
+            return self.eval_econ_update(receiver_val, arguments);
+        }
+
         let qualified_name = QualifiedName {
             segments: vec![method_name.to_owned()],
             span: TextSpan::new(0, 0),
@@ -1258,8 +1262,46 @@ impl<'a> EvalContext<'a> {
     }
 
     fn eval_econ(&mut self, econ: &EconIntrinsic) -> Result<Value, EvalError> {
-        self.eval_block(&econ.body)
-            .map(|value| Value::Econ(Box::new(value)))
+        let captured = self.capture_all_visible_names_exprs_in_block(&econ.body)?;
+        let snapshot = self.eval_block(&econ.body)?;
+        Ok(Value::Econ(Rc::new(RefCell::new(EconValue {
+            snapshot,
+            module: self.module.clone(),
+            body: econ.body.clone(),
+            captured,
+        }))))
+    }
+
+    fn eval_econ_update(
+        &mut self,
+        receiver: Value,
+        arguments: &[Argument],
+    ) -> Result<Value, EvalError> {
+        if !arguments.is_empty() {
+            return Err(EvalError::Message(
+                "`Econ.update` does not accept arguments".to_owned(),
+            ));
+        }
+
+        let Value::Econ(econ) = receiver else {
+            return Err(EvalError::Message(format!(
+                "`update` is only defined for `Econ`, found `{}`",
+                receiver.type_name()
+            )));
+        };
+
+        let (module, body, captured) = {
+            let econ = econ.borrow();
+            (econ.module.clone(), econ.body.clone(), econ.captured.clone())
+        };
+
+        let mut context = EvalContext::new(self.runtime, module);
+        if !captured.is_empty() {
+            context.push_scope(Scope::from_values(captured));
+        }
+        let refreshed = context.eval_block(&body)?;
+        econ.borrow_mut().snapshot = refreshed.clone();
+        Ok(refreshed)
     }
 
     fn eval_receiver_call(
@@ -1810,7 +1852,9 @@ impl<'a> EvalContext<'a> {
                         _ => Ok(false),
                     },
                     "Econ" => match (value, arguments.as_slice()) {
-                        (Value::Econ(inner), [inner_ty]) => self.matches_type(inner, inner_ty),
+                        (Value::Econ(inner), [inner_ty]) => {
+                            self.matches_type(&inner.borrow().snapshot, inner_ty)
+                        }
                         (Value::Econ(_), _) => Ok(true),
                         _ => Ok(false),
                     },
@@ -1993,6 +2037,35 @@ impl<'a> EvalContext<'a> {
         let names = self.capture_all_visible_names(&lambda.body, parameter_names);
         let mut captured = self.capture_scoped_bindings(&names);
         captured.extend(self.capture_script_bindings("<lambda>", names)?);
+        Ok(captured)
+    }
+
+    fn capture_all_visible_names_exprs_in_block(
+        &self,
+        block: &BlockExpr,
+    ) -> Result<BTreeMap<String, Value>, EvalError> {
+        let mut collector = CaptureNameCollector::new(
+            self.module.name.as_str(),
+            {
+                let mut visible = self
+                    .module
+                    .script_bindings_snapshot()
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                for scope in &self.scopes {
+                    for name in scope.bindings.keys() {
+                        visible.insert(name.clone());
+                    }
+                }
+                visible
+            },
+            BTreeSet::new(),
+        );
+        collector.visit_block(block);
+        let names = collector.captures;
+        let mut captured = self.capture_scoped_bindings(&names);
+        captured.extend(self.capture_script_bindings("<econ>", names)?);
         Ok(captured)
     }
 
@@ -2709,7 +2782,25 @@ pub(crate) enum Value {
     Record(BTreeMap<String, Value>),
     Range(RangeValue),
     Function(Rc<FunctionValue>),
-    Econ(Box<Value>),
+    Econ(Rc<RefCell<EconValue>>),
+}
+
+#[derive(Clone)]
+pub(crate) struct EconValue {
+    snapshot: Value,
+    module: Rc<ModuleState>,
+    body: BlockExpr,
+    captured: BTreeMap<String, Value>,
+}
+
+impl fmt::Debug for EconValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EconValue")
+            .field("snapshot", &self.snapshot)
+            .field("module", &self.module.name)
+            .field("captured", &self.captured.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Value {
@@ -2842,7 +2933,9 @@ impl Value {
                     })
             }
             (Self::Range(left), Self::Range(right)) => left.equals(right),
-            (Self::Econ(left), Self::Econ(right)) => left.equals(right),
+            (Self::Econ(left), Self::Econ(right)) => {
+                left.borrow().snapshot.equals(&right.borrow().snapshot)
+            }
             (Self::Function(left), Self::Function(right)) => Rc::ptr_eq(left, right),
             _ => false,
         }
@@ -2904,7 +2997,7 @@ impl Value {
                     }
                 }
             }
-            Self::Econ(value) => format!("econ({})", value.render()),
+            Self::Econ(value) => format!("econ({})", value.borrow().snapshot.render()),
         }
     }
 
@@ -2963,7 +3056,7 @@ impl Value {
             Self::Function(function) => function.runtime_type(),
             Self::Econ(value) => ReplType::Named {
                 name: "Econ".to_owned(),
-                arguments: vec![value.runtime_type()],
+                arguments: vec![value.borrow().snapshot.runtime_type()],
             },
         }
     }

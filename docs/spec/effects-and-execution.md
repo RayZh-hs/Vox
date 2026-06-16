@@ -78,11 +78,15 @@ Semantics:
 - pure computations that depend on an `Econ[T]` depend on the snapshot version,
   not on re-running the effect.
 
-`econ` does not use a Rust-style `!` sigil. It is a compiler-known intrinsic
-with dedicated syntax.
+`Econ[T]` exposes one built-in method:
 
-Runtime support for refreshing `econ` snapshots will be implemented. The
-surface syntax already exists.
+```vox
+evil fun update(self: Econ[T]): T
+```
+
+`snapshot.update()` re-runs the block captured by the original `econ[T]`
+expression, stores the refreshed snapshot in `snapshot`, and returns the new
+value.
 
 ## 5. Evaluation Model
 

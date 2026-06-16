@@ -205,7 +205,7 @@ For external libraries, struct types expose trait methods as methods when the
 struct implements the corresponding trait. These are resolved through the
 package manifest's `trait_impls` during method resolution.
 
-If a function definition would shadow an existing method (a function with the
+If a function definition shadows an existing method (a function with the
 same name and a compatible first parameter), the LSP reports a warning.
 Defining two functions with the same name and indistinguishable parameter
 types (same count and same types at each position) is a compile-time error.

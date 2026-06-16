@@ -11,8 +11,7 @@ Chapters:
 5. [Statements and Control Flow](./statements-and-control-flow.md)
 6. [Effects and Execution](./effects-and-execution.md)
 
-This specification describes the current Vox surface language. One runtime
-feature is still incomplete: refreshing `econ` snapshots will be implemented.
+This specification describes the current Vox surface language.
 
 ## Notation
 

@@ -38,7 +38,7 @@ reserved.
   ambiently shared across all clients;
 - sharing: library mounts, caches, `Econ` state, and handle storage are owned
   by the runtime and may be shared across connections;
-- disconnect: dropping the connection should release connection-owned
+- disconnect: dropping the connection releases connection-owned
   references; when a session reaches zero attached endpoints, the runtime may
   recycle it unless that session is reserved.
 
@@ -48,7 +48,7 @@ The first frame on every connection must be `HELLO`.
 
 The runtime protocol is the IPC surface for Vox tools that share one runtime.
 
-Normal same-runtime transfer should use these methods:
+Normal same-runtime transfer uses these methods:
 
 - inline copy for small serializable values;
 - handle passing for large or opaque runtime-owned values;
@@ -56,7 +56,7 @@ Normal same-runtime transfer should use these methods:
   closures that the runtime can represent safely;
 - automatic runtime cache reuse instead of explicit client-to-client cache copy.
 
-Cross-runtime movement is different from same-runtime IPC. It should use
+Cross-runtime movement is different from same-runtime IPC. It uses
 explicit export/import operations and versioned bundles rather than raw handle
 reuse.
 
@@ -215,10 +215,10 @@ Tags:
 
 Encoding rules:
 
-- values smaller than the negotiated inline limit should be sent inline;
+- values smaller than the negotiated inline limit are sent inline;
 - large host values must be returned as `handle`;
 - a client may send a previously received `handle` value back as an argument;
-- when a result does not fit the inline limit, the runtime should prefer
+- when a result does not fit the inline limit, the runtime prefers
   returning a `handle` over copying the value into the response.
 - inline values are copy-transferred, not shared by later mutation.
 
@@ -249,9 +249,9 @@ Rules:
 
 Function transfer rules:
 
-- functions should normally cross the process boundary as callable references,
+- functions normally cross the process boundary as callable references,
   not raw executable blobs;
-- top-level functions and compiled script entry points should be addressable by
+- top-level functions and compiled script entry points are addressable by
   runtime-issued callable ids or by symbol plus revision metadata;
 - closures may only be transferred when the runtime can retain their captured
   environment safely as a runtime-owned callable object.
@@ -488,7 +488,7 @@ Success response payload:
 `target_id` is `session_id`.
 
 Compatibility command for setting only the session default optimization mode.
-New clients should use `SET_SESSION_OPT`.
+New clients use `SET_SESSION_OPT`.
 
 Request payload:
 
@@ -760,7 +760,7 @@ u32 handle_flags
 string summary
 ```
 
-`handle_flags` should currently use:
+`handle_flags` currently uses:
 
 - `0x0000_0001`: pure-serializable
 - `0x0000_0002`: externally pinned
@@ -853,7 +853,7 @@ Request payload: empty.
 
 Success response payload: empty.
 
-Only privileged clients should be allowed to issue this opcode.
+Only privileged clients may issue this opcode.
 
 ## Error Model
 
@@ -878,13 +878,13 @@ Recommended error codes:
 - `9`: `ERR_BAD_ARGUMENT`
 - `10`: `ERR_PERMISSION_DENIED`
 
-`ERR_BAD_FRAME` should be treated as fatal to the connection.
+`ERR_BAD_FRAME` is fatal to the connection.
 
 ## Events
 
 Events are optional and never replace the required response to a request.
 
-If implemented, supported events should be:
+If implemented, supported events are:
 
 - `0x80`: `HANDLE_DROPPED` with payload `u32 handle_id`
 - `0x81`: `ECON_INVALIDATED` with payload `string econ_key` plus `u64 version`

@@ -128,7 +128,7 @@ There are two supported ways to share data today.
 
 ### 1. Share one named session
 
-If multiple clients should see the same bindings and definitions, they must
+If multiple clients need the same bindings and definitions, they must
 attach to the same named session. This is the direct sharing model.
 
 Anonymous sessions can also be shared by id while they are still live, or after
