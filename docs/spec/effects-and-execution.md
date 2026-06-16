@@ -31,7 +31,12 @@ Rules:
 - purity is contagious: a function that directly performs or depends on an
   effectful computation is `evil`;
 - pure code may call only pure computations unless the effect is mediated by
-  `econ`.
+  `econ`;
+- an effectful operation must be executed again when its containing computation
+  is evaluated, even if its explicit Vox arguments are unchanged;
+- marking a function `evil` does not make every operation inside it uncached.
+  Pure subcomputations inside an evil function may still be cached, shared,
+  folded, or removed according to their own pure inputs and demand.
 
 ## 3. `evil` Scripts
 
@@ -90,6 +95,10 @@ binding.
 Pure results may be cached.
 
 Effectful computations are never treated as pure cached results.
+
+Pure computations inside an effectful computation remain pure. If an evil
+operation produces the same value as in a previous evaluation, downstream pure
+work may reuse cached results for that value.
 
 When a package artifact changes, cached package values from the previous
 artifact may be discarded. Precise dependency invalidation is an implementation
