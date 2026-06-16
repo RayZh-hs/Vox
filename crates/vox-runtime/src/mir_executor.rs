@@ -1222,6 +1222,9 @@ fn eval_list_builtin_inline(
                     .collect::<Result<_, _>>()?,
             ),
         ))),
+        "fold" | "foldRight" | "map" | "filter" | "flatMap" | "zip" => Err(format!(
+            "List.{method} is not supported by the MIR executor yet"
+        )),
         _ => unknown_mir_builtin(BuiltinReceiver::List, method),
     }
 }

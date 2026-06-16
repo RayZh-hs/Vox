@@ -788,6 +788,9 @@ fn eval_list_builtin_wasm(
                 HandleData::List(items.iter().cloned().rev().collect()),
             )
         }
+        "fold" | "foldRight" | "map" | "filter" | "flatMap" | "zip" => Err(format!(
+            "List.{method} is not supported by the WASM executor yet"
+        )),
         _ => unknown_wasm_builtin(BuiltinReceiver::List, method),
     }
 }

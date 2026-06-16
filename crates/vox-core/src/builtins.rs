@@ -211,6 +211,36 @@ pub const BUILTIN_METHODS: &[BuiltinMethod] = &[
         implementation: BuiltinImpl::Prelude,
     },
     BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "fold",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "foldRight",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "map",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "filter",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "flatMap",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
+        receiver: BuiltinReceiver::List,
+        name: "zip",
+        implementation: BuiltinImpl::Prelude,
+    },
+    BuiltinMethod {
         receiver: BuiltinReceiver::Econ,
         name: "update",
         implementation: BuiltinImpl::Intrinsic,

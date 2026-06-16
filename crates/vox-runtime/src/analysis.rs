@@ -946,23 +946,13 @@ impl<'a> TypeEngine<'a> {
                         if let Some(method_type) =
                             self.resolve_method_name_type(&receiver_type, name, scope)
                         {
-                            let mut method_args = Vec::with_capacity(arguments.len() + 1);
-                            method_args.push(CallArgumentType::Positional(receiver_type));
-                            for argument in arguments {
-                                match argument {
-                                    Argument::Positional(expr) => {
-                                        method_args.push(CallArgumentType::Positional(
-                                            self.infer_expr(expr, scope)?,
-                                        ));
-                                    }
-                                    Argument::Named { value, .. } => {
-                                        method_args.push(CallArgumentType::Named(
-                                            self.infer_expr(value, scope)?,
-                                        ));
-                                    }
-                                }
-                            }
-                            return self.apply_call(method_type, method_args);
+                            return self.infer_method_call(
+                                receiver_type,
+                                name,
+                                method_type,
+                                arguments,
+                                scope,
+                            );
                         }
                     }
                 }
@@ -1733,6 +1723,48 @@ impl<'a> TypeEngine<'a> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         self.apply_call(callee_type, arguments)
+    }
+
+    fn infer_method_call(
+        &self,
+        receiver_type: ReplType,
+        method_name: &str,
+        method_type: ReplType,
+        arguments: &[Argument],
+        scope: &mut TypeScope,
+    ) -> Result<ReplType, String> {
+        let mut method_args = Vec::with_capacity(arguments.len() + 1);
+        method_args.push(CallArgumentType::Positional(receiver_type.clone()));
+        let mut argument_types = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            match argument {
+                Argument::Positional(expr) => {
+                    let ty = self.infer_expr(expr, scope)?;
+                    argument_types.push(ty.clone());
+                    method_args.push(CallArgumentType::Positional(ty));
+                }
+                Argument::Named { value, .. } => {
+                    let ty = self.infer_expr(value, scope)?;
+                    argument_types.push(ty.clone());
+                    method_args.push(CallArgumentType::Named(ty));
+                }
+            }
+        }
+
+        let Some(BuiltinReceiver::List) = builtin_receiver_for_repl_type(&receiver_type) else {
+            return self.apply_call(method_type, method_args);
+        };
+        if builtins::builtin_method(BuiltinReceiver::List, method_name).is_none() {
+            return self.apply_call(method_type, method_args);
+        }
+
+        if let Some(result) =
+            infer_higher_order_list_method(&receiver_type, method_name, &argument_types)?
+        {
+            return Ok(result);
+        }
+
+        self.apply_call(method_type, method_args)
     }
 
     fn apply_call(
@@ -2978,6 +3010,99 @@ fn builtin_method_type_for_repl_type(ty: &ReplType, method_name: &str) -> Option
         ),
         (BuiltinReceiver::List, "slice") => (vec![ty.clone(), int.clone(), int], ty.clone()),
         (BuiltinReceiver::List, "reversed") => (vec![ty.clone()], ty.clone()),
+        (BuiltinReceiver::List, "fold") => {
+            let item = list_item_type(ty);
+            let acc = ReplType::TypeParameter {
+                name: "U".to_owned(),
+                bound: None,
+            };
+            (
+                vec![
+                    ty.clone(),
+                    acc.clone(),
+                    ReplType::Function {
+                        parameters: vec![acc.clone(), item],
+                        result: Box::new(acc.clone()),
+                    },
+                ],
+                acc,
+            )
+        }
+        (BuiltinReceiver::List, "foldRight") => {
+            let item = list_item_type(ty);
+            let acc = ReplType::TypeParameter {
+                name: "U".to_owned(),
+                bound: None,
+            };
+            (
+                vec![
+                    ty.clone(),
+                    acc.clone(),
+                    ReplType::Function {
+                        parameters: vec![item, acc.clone()],
+                        result: Box::new(acc.clone()),
+                    },
+                ],
+                acc,
+            )
+        }
+        (BuiltinReceiver::List, "map") => {
+            let item = list_item_type(ty);
+            let mapped = ReplType::TypeParameter {
+                name: "U".to_owned(),
+                bound: None,
+            };
+            (
+                vec![
+                    ty.clone(),
+                    ReplType::Function {
+                        parameters: vec![item],
+                        result: Box::new(mapped.clone()),
+                    },
+                ],
+                ReplType::List(Box::new(mapped)),
+            )
+        }
+        (BuiltinReceiver::List, "filter") => (
+            vec![
+                ty.clone(),
+                ReplType::Function {
+                    parameters: vec![list_item_type(ty)],
+                    result: Box::new(bool_ty),
+                },
+            ],
+            ty.clone(),
+        ),
+        (BuiltinReceiver::List, "flatMap") => {
+            let item = list_item_type(ty);
+            let mapped = ReplType::TypeParameter {
+                name: "U".to_owned(),
+                bound: None,
+            };
+            (
+                vec![
+                    ty.clone(),
+                    ReplType::Function {
+                        parameters: vec![item],
+                        result: Box::new(ReplType::List(Box::new(mapped.clone()))),
+                    },
+                ],
+                ReplType::List(Box::new(mapped)),
+            )
+        }
+        (BuiltinReceiver::List, "zip") => {
+            let other_item = ReplType::TypeParameter {
+                name: "U".to_owned(),
+                bound: None,
+            };
+            (
+                vec![ty.clone(), ReplType::List(Box::new(other_item.clone()))],
+                ReplType::List(Box::new(ReplType::Tuple(vec![
+                    list_item_type(ty),
+                    other_item,
+                ]))),
+            )
+        }
         (BuiltinReceiver::Econ, "update") => {
             let snapshot = match ty {
                 ReplType::Named { arguments, .. } => arguments
@@ -2995,6 +3120,164 @@ fn builtin_method_type_for_repl_type(ty: &ReplType, method_name: &str) -> Option
         parameters: signature.0,
         result: Box::new(signature.1),
     })
+}
+
+fn infer_higher_order_list_method(
+    receiver_type: &ReplType,
+    method_name: &str,
+    arguments: &[ReplType],
+) -> Result<Option<ReplType>, String> {
+    let item = list_item_type(receiver_type);
+    match method_name {
+        "fold" => {
+            let [init, f] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::Function { parameters, result } = f else {
+                return Ok(None);
+            };
+            if parameters.len() != 2 {
+                return Err("`fold` callback must accept two arguments".to_owned());
+            }
+            if !parameters[0].is_assignable_to(init) || !init.is_assignable_to(&parameters[0]) {
+                return Err(format!(
+                    "`fold` callback accumulator type `{}` must match initial value type `{}`",
+                    parameters[0].render(),
+                    init.render()
+                ));
+            }
+            if !item.is_assignable_to(&parameters[1]) {
+                return Err(format!(
+                    "`fold` callback item parameter `{}` cannot accept list item type `{}`",
+                    parameters[1].render(),
+                    item.render()
+                ));
+            }
+            if !result.is_assignable_to(init) {
+                return Err(format!(
+                    "`fold` callback result `{}` is not assignable to accumulator `{}`",
+                    result.render(),
+                    init.render()
+                ));
+            }
+            Ok(Some(init.clone()))
+        }
+        "foldRight" => {
+            let [init, f] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::Function { parameters, result } = f else {
+                return Ok(None);
+            };
+            if parameters.len() != 2 {
+                return Err("`foldRight` callback must accept two arguments".to_owned());
+            }
+            if !item.is_assignable_to(&parameters[0]) {
+                return Err(format!(
+                    "`foldRight` callback item parameter `{}` cannot accept list item type `{}`",
+                    parameters[0].render(),
+                    item.render()
+                ));
+            }
+            if !parameters[1].is_assignable_to(init) || !init.is_assignable_to(&parameters[1]) {
+                return Err(format!(
+                    "`foldRight` callback accumulator type `{}` must match initial value type `{}`",
+                    parameters[1].render(),
+                    init.render()
+                ));
+            }
+            if !result.is_assignable_to(init) {
+                return Err(format!(
+                    "`foldRight` callback result `{}` is not assignable to accumulator `{}`",
+                    result.render(),
+                    init.render()
+                ));
+            }
+            Ok(Some(init.clone()))
+        }
+        "map" => {
+            let [f] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::Function { parameters, result } = f else {
+                return Ok(None);
+            };
+            if parameters.len() != 1 {
+                return Err("`map` callback must accept one argument".to_owned());
+            }
+            if !item.is_assignable_to(&parameters[0]) {
+                return Err(format!(
+                    "`map` callback parameter `{}` cannot accept list item type `{}`",
+                    parameters[0].render(),
+                    item.render()
+                ));
+            }
+            Ok(Some(ReplType::List(Box::new((**result).clone()))))
+        }
+        "filter" => {
+            let [f] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::Function { parameters, result } = f else {
+                return Ok(None);
+            };
+            if parameters.len() != 1 {
+                return Err("`filter` callback must accept one argument".to_owned());
+            }
+            if !item.is_assignable_to(&parameters[0]) {
+                return Err(format!(
+                    "`filter` callback parameter `{}` cannot accept list item type `{}`",
+                    parameters[0].render(),
+                    item.render()
+                ));
+            }
+            if !result.is_assignable_to(&ReplType::Bool) {
+                return Err(format!(
+                    "`filter` callback result must be Bool, found `{}`",
+                    result.render()
+                ));
+            }
+            Ok(Some(receiver_type.clone()))
+        }
+        "flatMap" => {
+            let [f] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::Function { parameters, result } = f else {
+                return Ok(None);
+            };
+            if parameters.len() != 1 {
+                return Err("`flatMap` callback must accept one argument".to_owned());
+            }
+            if !item.is_assignable_to(&parameters[0]) {
+                return Err(format!(
+                    "`flatMap` callback parameter `{}` cannot accept list item type `{}`",
+                    parameters[0].render(),
+                    item.render()
+                ));
+            }
+            let ReplType::List(mapped) = &**result else {
+                return Err(format!(
+                    "`flatMap` callback result must be List, found `{}`",
+                    result.render()
+                ));
+            };
+            Ok(Some(ReplType::List(Box::new((**mapped).clone()))))
+        }
+        "zip" => {
+            let [other] = arguments else {
+                return Ok(None);
+            };
+            let ReplType::List(other_item) = other else {
+                return Ok(None);
+            };
+            Ok(Some(ReplType::List(Box::new(ReplType::Tuple(vec![
+                item,
+                (**other_item).clone(),
+            ])))))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn list_item_type(ty: &ReplType) -> ReplType {

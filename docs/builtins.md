@@ -125,6 +125,12 @@ All methods are **pure** unless noted.
 | `indexOf` | `(List[T], element: T) -> Int?` | Prelude | First index of element; `null` if not found |
 | `slice` | `(List[T], from: Int, to: Int) -> List[T]` | Prelude | Sub-list `[from, to)` |
 | `reversed` | `(List[T]) -> List[T]` | Prelude | New list in reverse order |
+| `fold` | `(List[T], init: U, f: (U, T) -> U) -> U` | Prelude | Left fold (reduce) with initial value |
+| `foldRight` | `(List[T], init: U, f: (T, U) -> U) -> U` | Prelude | Right fold with initial value |
+| `map` | `(List[T], f: (T) -> U) -> List[U]` | Prelude | Map each element to a new value |
+| `filter` | `(List[T], f: (T) -> Bool) -> List[T]` | Prelude | Filter elements by predicate |
+| `flatMap` | `(List[T], f: (T) -> List[U]) -> List[U]` | Prelude | Map and flatten results |
+| `zip` | `(List[T], other: List[U]) -> List[(T, U)]` | Prelude | Pairwise combine with another list; stops at shorter length |
 
 ### Econ[T]
 

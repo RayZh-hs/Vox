@@ -1220,7 +1220,13 @@ impl<'a> EvalContext<'a> {
                         Argument::Named { value, .. } => evaled_args.push(self.eval_expr(value)?),
                     }
                 }
-                return eval_builtin_method(receiver_val, receiver, method_name, evaled_args);
+                return eval_builtin_method(
+                    self.runtime,
+                    receiver_val,
+                    receiver,
+                    method_name,
+                    evaled_args,
+                );
             }
         }
 
@@ -3481,6 +3487,7 @@ fn builtin_receiver_for_value(value: &Value) -> Option<BuiltinReceiver> {
 }
 
 fn eval_builtin_method(
+    runtime: &mut Runtime,
     receiver_value: Value,
     receiver: BuiltinReceiver,
     method_name: &str,
@@ -3492,7 +3499,7 @@ fn eval_builtin_method(
         BuiltinReceiver::Float => eval_float_builtin(receiver_value, method_name, arguments),
         BuiltinReceiver::Bool => eval_bool_builtin(receiver_value, method_name, arguments),
         BuiltinReceiver::String => eval_string_builtin(receiver_value, method_name, arguments),
-        BuiltinReceiver::List => eval_list_builtin(receiver_value, method_name, arguments),
+        BuiltinReceiver::List => eval_list_builtin(runtime, receiver_value, method_name, arguments),
         BuiltinReceiver::Econ => {
             let _ = arguments;
             unknown_builtin_method(receiver, method_name)
@@ -3530,7 +3537,9 @@ fn eval_uint_builtin(
 ) -> Result<Value, EvalError> {
     expect_arg_count(method_name, &arguments, 0)?;
     let Value::UInt(value) = receiver else {
-        return Err(EvalError::Message("UInt builtin receiver mismatch".to_owned()));
+        return Err(EvalError::Message(
+            "UInt builtin receiver mismatch".to_owned(),
+        ));
     };
     match method_name {
         "toString" => Ok(Value::String(value.to_string())),
@@ -3679,6 +3688,7 @@ fn eval_string_builtin(
 }
 
 fn eval_list_builtin(
+    runtime: &mut Runtime,
     receiver: Value,
     method_name: &str,
     arguments: Vec<Value>,
@@ -3735,6 +3745,92 @@ fn eval_list_builtin(
             expect_arg_count(method_name, &arguments, 0)?;
             Ok(Value::List(items.into_iter().rev().collect()))
         }
+        "fold" => {
+            expect_arg_count(method_name, &arguments, 2)?;
+            let mut acc = arguments[0].clone();
+            let function = expect_function_arg(method_name, &arguments, 1)?;
+            for item in items {
+                acc = function.call(
+                    runtime,
+                    vec![
+                        CallArgument::Positional(acc),
+                        CallArgument::Positional(item),
+                    ],
+                )?;
+            }
+            Ok(acc)
+        }
+        "foldRight" => {
+            expect_arg_count(method_name, &arguments, 2)?;
+            let mut acc = arguments[0].clone();
+            let function = expect_function_arg(method_name, &arguments, 1)?;
+            for item in items.into_iter().rev() {
+                acc = function.call(
+                    runtime,
+                    vec![
+                        CallArgument::Positional(item),
+                        CallArgument::Positional(acc),
+                    ],
+                )?;
+            }
+            Ok(acc)
+        }
+        "map" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            let function = expect_function_arg(method_name, &arguments, 0)?;
+            let mut mapped = Vec::with_capacity(items.len());
+            for item in items {
+                mapped.push(function.call(runtime, vec![CallArgument::Positional(item)])?);
+            }
+            Ok(Value::List(mapped))
+        }
+        "filter" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            let function = expect_function_arg(method_name, &arguments, 0)?;
+            let mut filtered = Vec::new();
+            for item in items {
+                let keep = function.call(runtime, vec![CallArgument::Positional(item.clone())])?;
+                let Value::Bool(keep) = keep else {
+                    return Err(EvalError::Message(
+                        "`filter` callback must return Bool".to_owned(),
+                    ));
+                };
+                if keep {
+                    filtered.push(item);
+                }
+            }
+            Ok(Value::List(filtered))
+        }
+        "flatMap" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            let function = expect_function_arg(method_name, &arguments, 0)?;
+            let mut flattened = Vec::new();
+            for item in items {
+                let value = function.call(runtime, vec![CallArgument::Positional(item)])?;
+                let Value::List(mapped) = value else {
+                    return Err(EvalError::Message(
+                        "`flatMap` callback must return List".to_owned(),
+                    ));
+                };
+                flattened.extend(mapped);
+            }
+            Ok(Value::List(flattened))
+        }
+        "zip" => {
+            expect_arg_count(method_name, &arguments, 1)?;
+            let Value::List(other) = &arguments[0] else {
+                return Err(EvalError::Message(
+                    "`zip` expected List argument".to_owned(),
+                ));
+            };
+            Ok(Value::List(
+                items
+                    .into_iter()
+                    .zip(other.iter().cloned())
+                    .map(|(left, right)| Value::Tuple(vec![left, right]))
+                    .collect(),
+            ))
+        }
         _ => unknown_builtin_method(BuiltinReceiver::List, method_name),
     }
 }
@@ -3784,6 +3880,20 @@ fn expect_string(value: &Value, method_name: &str) -> Result<String, EvalError> 
         )));
     };
     Ok(value.clone())
+}
+
+fn expect_function_arg(
+    method_name: &str,
+    arguments: &[Value],
+    index: usize,
+) -> Result<Rc<FunctionValue>, EvalError> {
+    expect_arg_count(method_name, arguments, index + 1)?;
+    let Value::Function(function) = &arguments[index] else {
+        return Err(EvalError::Message(format!(
+            "`{method_name}` expected function argument"
+        )));
+    };
+    Ok(function.clone())
 }
 
 fn substring_chars(value: &str, start: i64, end: i64) -> Result<String, EvalError> {

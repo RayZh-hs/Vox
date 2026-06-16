@@ -677,6 +677,17 @@ fn validate_wasm_call_op(
     args: &[MirValueId],
     body_map: &BTreeMap<String, &MirBody>,
 ) -> Result<(), String> {
+    if let Some((builtins::BuiltinReceiver::List, method)) = builtins::split_builtin_callee(callee)
+        && matches!(
+            method,
+            "fold" | "foldRight" | "map" | "filter" | "flatMap" | "zip"
+        )
+    {
+        return Err(format!(
+            "List.{method} is not supported by the WASM backend yet"
+        ));
+    }
+
     let Some(target) = body_map.get(callee) else {
         return Ok(());
     };

@@ -2623,7 +2623,13 @@ fn builtin_return_type(callee: &str, args: &[MirValueId], body: &BodyBuilder) ->
                 None
             }
         }),
-        (BuiltinReceiver::List, "slice" | "reversed") => receiver_ty.cloned(),
+        (BuiltinReceiver::List, "slice" | "reversed" | "filter") => receiver_ty.cloned(),
+        (BuiltinReceiver::List, "fold" | "foldRight") => {
+            args.get(1).and_then(|arg| body.value_type(*arg)).cloned()
+        }
+        (BuiltinReceiver::List, "map" | "flatMap" | "zip") => {
+            Some(VoxType::List(Box::new(VoxType::opaque_surface("Unknown"))))
+        }
         (BuiltinReceiver::Econ, "update") => None,
         _ => None,
     }
