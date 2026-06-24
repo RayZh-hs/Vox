@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use vox_core::{
     builtins::{self, BuiltinReceiver},
@@ -27,6 +27,7 @@ pub struct MirExecutor<'a> {
     versions: Vec<Option<InlineValue>>,
     version_to_binding: Vec<MirValueId>,
     iterators: BTreeMap<MirValueId, IteratorState>,
+    function_index: HashMap<String, usize>,
     block_index: Vec<usize>,
     max_value_id: usize,
     max_version_id: usize,
@@ -36,6 +37,13 @@ const UNINIT_VALUE: MirValueId = MirValueId(u32::MAX);
 
 impl<'a> MirExecutor<'a> {
     pub fn new(runtime: &'a mut Runtime, _artifact_id: ArtifactId, module: &'a MirModule) -> Self {
+        let function_index = module
+            .bodies
+            .iter()
+            .enumerate()
+            .filter(|(_, body)| matches!(body.kind, MirBodyKind::Function))
+            .map(|(index, body)| (body.name.clone(), index))
+            .collect();
         Self {
             runtime,
             module,
@@ -43,6 +51,7 @@ impl<'a> MirExecutor<'a> {
             versions: Vec::new(),
             version_to_binding: Vec::new(),
             iterators: BTreeMap::new(),
+            function_index,
             block_index: Vec::new(),
             max_value_id: 0,
             max_version_id: 0,
@@ -54,20 +63,26 @@ impl<'a> MirExecutor<'a> {
         artifact: &CompiledArtifact,
         arguments: &[RuntimeValue],
     ) -> Result<RuntimeValue, String> {
-        let body = self
+        let body_index = self
             .module
             .bodies
             .iter()
-            .find(|body| matches!(body.kind, MirBodyKind::ScriptEntry))
+            .position(|body| matches!(body.kind, MirBodyKind::ScriptEntry))
             .ok_or_else(|| "MIR module does not contain a script entry body".to_owned())?;
-        self.run_body(body, arguments, Some(&artifact.parameters))
+        let arguments = arguments
+            .iter()
+            .map(inline_value_from_runtime)
+            .collect::<Vec<_>>();
+        let module = self.module;
+        let body = &module.bodies[body_index];
+        self.run_body(body, &arguments, Some(&artifact.parameters))
             .map(runtime_value_from_inline)
     }
 
     fn run_body(
         &mut self,
         body: &MirBody,
-        arguments: &[RuntimeValue],
+        arguments: &[InlineValue],
         parameter_specs: Option<&[ParameterSpec]>,
     ) -> Result<InlineValue, String> {
         let mv = body
@@ -140,7 +155,7 @@ impl<'a> MirExecutor<'a> {
         for (value, argument) in body.parameters.iter().zip(arguments) {
             let idx = value.0 as usize;
             if idx < self.values.len() {
-                self.values[idx] = Some(inline_value_from_runtime(argument));
+                self.values[idx] = Some(argument.clone());
             }
         }
 
@@ -358,25 +373,15 @@ impl<'a> MirExecutor<'a> {
         if let Some((receiver, method)) = builtins::split_builtin_callee(callee) {
             return self.eval_builtin_call(receiver, method, runtime_args);
         }
-        if let Some(function) = self
-            .module
-            .bodies
-            .iter()
-            .find(|candidate| {
-                matches!(candidate.kind, MirBodyKind::Function) && candidate.name == callee
-            })
-            .cloned()
-        {
-            let arguments = runtime_args
-                .into_iter()
-                .map(runtime_value_from_inline)
-                .collect::<Vec<_>>();
+        if let Some(&function_index) = self.function_index.get(callee) {
+            let module = self.module;
+            let function = &module.bodies[function_index];
             let saved_values = std::mem::take(&mut self.values);
             let saved_versions = std::mem::take(&mut self.versions);
             let saved_v2b = std::mem::take(&mut self.version_to_binding);
             let saved_iters = std::mem::take(&mut self.iterators);
             let saved_blocks = std::mem::take(&mut self.block_index);
-            let result = self.run_body(&function, &arguments, None);
+            let result = self.run_body(function, &runtime_args, None);
             self.values = saved_values;
             self.versions = saved_versions;
             self.version_to_binding = saved_v2b;

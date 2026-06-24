@@ -672,14 +672,18 @@ impl Runtime {
             }
         }
 
-        if let Some(mir) = artifact.mir.clone() {
-            match MirExecutor::new(self, artifact.id, &mir).run_script(&artifact, &expanded_args) {
-                Ok(value) => {
-                    self.mir_execution_failures.remove(&artifact_id);
-                    return Ok(value);
-                }
-                Err(message) => {
-                    self.mir_execution_failures.insert(artifact_id, message);
+        if artifact.optimization >= OptimizationLevel::IOpt {
+            if let Some(mir) = artifact.mir.clone() {
+                match MirExecutor::new(self, artifact.id, &mir)
+                    .run_script(&artifact, &expanded_args)
+                {
+                    Ok(value) => {
+                        self.mir_execution_failures.remove(&artifact_id);
+                        return Ok(value);
+                    }
+                    Err(message) => {
+                        self.mir_execution_failures.insert(artifact_id, message);
+                    }
                 }
             }
         }

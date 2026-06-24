@@ -1,12 +1,11 @@
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::{self, Write},
     rc::Rc,
 };
 
 use vox_compiler::{
-    TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
@@ -14,6 +13,7 @@ use vox_compiler::{
         TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
         ValueDecl,
     },
+    TreewalkScript,
 };
 use vox_core::{
     builtins::{self, BuiltinReceiver},
@@ -267,6 +267,7 @@ struct ModuleState {
     parameter_values: RefCell<BTreeMap<String, Value>>,
     script_bindings: RefCell<BTreeMap<String, Binding>>,
     function_captures: RefCell<BTreeMap<String, BTreeMap<String, Value>>>,
+    resolved_functions: RefCell<HashMap<String, Rc<FunctionValue>>>,
     finalized_script_bindings: RefCell<BTreeMap<String, BTreeSet<String>>>,
     cached_values: RefCell<BTreeMap<String, CachedTopLevelValue>>,
 }
@@ -313,6 +314,7 @@ impl ModuleState {
             parameter_values: RefCell::new(BTreeMap::new()),
             script_bindings: RefCell::new(BTreeMap::new()),
             function_captures: RefCell::new(BTreeMap::new()),
+            resolved_functions: RefCell::new(HashMap::new()),
             finalized_script_bindings: RefCell::new(BTreeMap::new()),
             cached_values: RefCell::new(BTreeMap::new()),
         }
@@ -329,6 +331,7 @@ impl ModuleState {
     fn clear_script_bindings(&self) {
         self.script_bindings.borrow_mut().clear();
         self.function_captures.borrow_mut().clear();
+        self.resolved_functions.borrow_mut().clear();
         self.finalized_script_bindings.borrow_mut().clear();
     }
 
@@ -363,6 +366,7 @@ impl ModuleState {
         self.function_captures
             .borrow_mut()
             .insert(name.clone(), captured.clone());
+        self.resolved_functions.borrow_mut().remove(&name);
         let mut finalized = self.finalized_script_bindings.borrow_mut();
         for value_name in captured.keys() {
             finalized
@@ -422,8 +426,13 @@ impl ModuleState {
         Some(local.clone())
     }
 
-    fn resolve_function(self: &Rc<Self>, name: &str) -> Option<FunctionValue> {
-        self.functions.get(name).cloned().map(|decl| {
+    fn resolve_function(self: &Rc<Self>, name: &str) -> Option<Rc<FunctionValue>> {
+        if let Some(function) = self.resolved_functions.borrow().get(name).cloned() {
+            return Some(function);
+        }
+
+        let decl = self.functions.get(name).cloned()?;
+        let function = {
             let type_scope = runtime_generic_type_scope(&decl.generic_parameters);
             if decl.generic_parameters.is_empty() {
                 let return_type = self
@@ -479,7 +488,12 @@ impl ModuleState {
                     captured: self.function_capture(&decl.name),
                 })
             }
-        })
+        };
+        let function = Rc::new(function);
+        self.resolved_functions
+            .borrow_mut()
+            .insert(name.to_owned(), function.clone());
+        Some(function)
     }
 
     fn resolve_imported_host_function(
@@ -1113,7 +1127,7 @@ impl<'a> EvalContext<'a> {
             }
 
             if let Some(function) = self.module.resolve_function(&local_name) {
-                return Ok(Value::Function(Rc::new(function)));
+                return Ok(Value::Function(function));
             }
 
             if self.module.values.contains_key(&local_name) {
@@ -1154,6 +1168,20 @@ impl<'a> EvalContext<'a> {
             ));
         };
 
+        if arguments
+            .iter()
+            .all(|argument| matches!(argument, Argument::Positional(_)))
+        {
+            let evaluated_args = arguments
+                .iter()
+                .map(|argument| match argument {
+                    Argument::Positional(expr) => self.eval_expr(expr),
+                    Argument::Named { .. } => unreachable!("checked above"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return function.call_positional(self.runtime, evaluated_args);
+        }
+
         let evaluated_args = arguments
             .iter()
             .map(|argument| match argument {
@@ -1181,7 +1209,7 @@ impl<'a> EvalContext<'a> {
         };
 
         let function = if let Some(function) = self.module.resolve_function(method_name) {
-            Some(Rc::new(function))
+            Some(function)
         } else if let Some(host_fn) = self
             .module
             .resolve_imported_host_function(self.runtime, &qualified_name)
@@ -1664,12 +1692,17 @@ impl<'a> EvalContext<'a> {
     }
 
     fn eval_block(&mut self, block: &BlockExpr) -> Result<Value, EvalError> {
-        self.push_scope(Scope::default());
+        let scope_pushed = block_needs_scope(block);
+        if scope_pushed {
+            self.push_scope(Scope::default());
+        }
         for item in &block.items {
             match self.eval_block_item(item) {
                 Ok(()) => {}
                 Err(error) => {
-                    self.pop_scope();
+                    if scope_pushed {
+                        self.pop_scope();
+                    }
                     return Err(error);
                 }
             }
@@ -1680,7 +1713,9 @@ impl<'a> EvalContext<'a> {
         } else {
             Ok(Value::unit())
         };
-        self.pop_scope();
+        if scope_pushed {
+            self.pop_scope();
+        }
         value
     }
 
@@ -2155,6 +2190,13 @@ impl<'a> EvalContext<'a> {
     }
 }
 
+fn block_needs_scope(block: &BlockExpr) -> bool {
+    block
+        .items
+        .iter()
+        .any(|item| matches!(item, BlockItem::LocalValue(_)))
+}
+
 struct CaptureNameCollector {
     module_segments: Vec<String>,
     visible: BTreeSet<String>,
@@ -2478,6 +2520,24 @@ impl FunctionValue {
         }
     }
 
+    pub(crate) fn call_positional(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        match self {
+            Self::User(function) => function.call_positional(runtime, arguments),
+            Self::Generic(function) => function.call_positional(runtime, arguments),
+            Self::Host(function) => function.call(
+                runtime,
+                arguments
+                    .into_iter()
+                    .map(CallArgument::Positional)
+                    .collect(),
+            ),
+        }
+    }
+
     fn runtime_type(&self) -> ReplType {
         match self {
             Self::User(function) => ReplType::Function {
@@ -2574,6 +2634,46 @@ impl UserFunction {
         }
     }
 
+    fn call_positional(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        let function_name = self.name.as_deref().unwrap_or("<lambda>");
+        if arguments.len() > self.parameters.len() {
+            return Err(EvalError::Message(format!(
+                "function `{function_name}` received too many positional arguments"
+            )));
+        }
+
+        let mut context = EvalContext::new(runtime, self.module.clone());
+        if !self.captured.is_empty() {
+            context.push_scope(Scope::from_values(self.captured.clone()));
+        }
+        context.push_scope(Scope::default());
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            let value = if let Some(value) = arguments.get(index) {
+                value.clone()
+            } else if let Some(default) = &parameter.default {
+                context.eval_expr(default)?
+            } else {
+                return Err(EvalError::Message(format!(
+                    "missing required parameter `{}` in function `{function_name}`",
+                    parameter.name
+                )));
+            };
+            context.define_local(parameter.name.clone(), value, false);
+        }
+
+        match context.eval_expr(&self.body) {
+            Ok(value) => Ok(value),
+            Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Break) => Err(EvalError::Break),
+            Err(EvalError::Continue) => Err(EvalError::Continue),
+            Err(EvalError::Message(message)) => Err(EvalError::Message(message)),
+        }
+    }
+
     fn return_type(&self) -> ReplType {
         self.return_type.clone()
     }
@@ -2620,6 +2720,97 @@ impl GenericFunction {
                 .get(&parameter.name)
                 .cloned()
                 .expect("parameter should be assigned after default handling");
+            infer_runtime_type_parameter(
+                &parameter.ty,
+                &value.runtime_type(),
+                &mut substitutions,
+                &self.name,
+            )?;
+            context.define_local(parameter.name.clone(), value, false);
+        }
+
+        let mut ordered_types = Vec::with_capacity(self.generic_parameters.len());
+        for parameter in &self.generic_parameters {
+            let Some(ty) = substitutions.get(&parameter.name).cloned() else {
+                return Err(EvalError::Message(format!(
+                    "could not infer a concrete type for generic parameter `{}` in function `{}`",
+                    parameter.name, self.name
+                )));
+            };
+            if !runtime_type_satisfies_bound(&ty, &parameter.bound) {
+                return Err(EvalError::Message(format!(
+                    "type `{}` does not satisfy bound `{}` for `{}` in function `{}`",
+                    render_runtime_type(&ty),
+                    parameter.bound,
+                    parameter.name,
+                    self.name
+                )));
+            }
+            ordered_types.push(ty);
+        }
+
+        let result = match context.eval_expr(&self.body) {
+            Ok(value) => Ok(value),
+            Err(EvalError::Return(value)) => Ok(value),
+            Err(EvalError::Break) => Err(EvalError::Break),
+            Err(EvalError::Continue) => Err(EvalError::Continue),
+            Err(EvalError::Message(message)) => Err(EvalError::Message(message)),
+        };
+        drop(context);
+
+        if result.is_ok() {
+            runtime.record_generic_realization(
+                self.key.clone(),
+                generic_handle_summary(
+                    &self.name,
+                    &self.generic_parameters,
+                    &self.parameters,
+                    &self.return_type,
+                ),
+                RealizationKey {
+                    type_arguments: ordered_types.iter().map(render_runtime_type).collect(),
+                },
+                realized_handle_summary(
+                    &self.name,
+                    &self.parameters,
+                    &self.return_type,
+                    &substitutions,
+                ),
+            );
+        }
+
+        result
+    }
+
+    fn call_positional(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        if arguments.len() > self.parameters.len() {
+            return Err(EvalError::Message(format!(
+                "function `{}` received too many positional arguments",
+                self.name
+            )));
+        }
+
+        let mut substitutions = BTreeMap::new();
+        let mut context = EvalContext::new(runtime, self.module.clone());
+        if !self.captured.is_empty() {
+            context.push_scope(Scope::from_values(self.captured.clone()));
+        }
+        context.push_scope(Scope::default());
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            let value = if let Some(value) = arguments.get(index) {
+                value.clone()
+            } else if let Some(default) = &parameter.default {
+                context.eval_expr(default)?
+            } else {
+                return Err(EvalError::Message(format!(
+                    "missing required parameter `{}` in function `{}`",
+                    parameter.name, self.name
+                )));
+            };
             infer_runtime_type_parameter(
                 &parameter.ty,
                 &value.runtime_type(),
