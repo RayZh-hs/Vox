@@ -66,7 +66,7 @@ automatically when it is referenced.
 ```rust
 #[vox_trait]
 trait Filter {
-    #[vox(lowered_by = filter_apply, purity = "pure")]
+    #[vox(lowered_by = filter_apply, pure = true)]
     fn apply(&self, input: Image) -> Image;
 }
 ```
@@ -89,12 +89,12 @@ Functions follow the same rule: mark them once on the Rust item and let the
 external library include them automatically.
 
 ```rust
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
     todo!()
 }
 
-#[vox_fn(name = "filter_apply", purity = "pure")]
+#[vox_fn(name = "filter_apply", pure = true)]
 fn filter_apply(filter: &dyn Filter, input: Image) -> Image {
     filter.apply(input)
 }
@@ -104,6 +104,9 @@ This marks each function as part of the Vox package surface.
 
 The optional function `name` override controls the public Vox function name. If
 omitted, Vox uses the Rust function name.
+
+`pure` is a boolean attribute: `true` means the function is pure, and `false`
+means it is effectful.
 
 ### 4. Build the package once
 
@@ -149,7 +152,7 @@ struct Image {
 }
 
 /// Applies a Gaussian blur to the image.
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
     todo!()
 }
@@ -158,7 +161,7 @@ fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
 #[vox_trait]
 trait Filter {
     /// Applies this filter to an input image.
-    #[vox(lowered_by = filter_apply, purity = "pure")]
+    #[vox(lowered_by = filter_apply, pure = true)]
     fn apply(&self, input: Image) -> Image;
 }
 ```
@@ -171,7 +174,7 @@ To override a docstring (e.g. when the Rust doc comment is intended for Rust
 consumers but the Vox docstring differs), use the explicit form:
 
 ```rust
-#[vox_fn(purity = "pure", doc = "Blurs an image with a Gaussian kernel.")]
+#[vox_fn(pure = true, doc = "Blurs an image with a Gaussian kernel.")]
 fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
     todo!()
 }
@@ -190,16 +193,16 @@ struct Image {
 
 #[vox_trait]
 trait Filter {
-    #[vox(lowered_by = filter_apply, purity = "pure")]
+    #[vox(lowered_by = filter_apply, pure = true)]
     fn apply(&self, input: Image) -> Image;
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
     todo!()
 }
 
-#[vox_fn(name = "filter_apply", purity = "pure")]
+#[vox_fn(name = "filter_apply", pure = true)]
 fn filter_apply(filter: &dyn Filter, input: Image) -> Image {
     filter.apply(input)
 }
@@ -260,11 +263,11 @@ struct Image {
 
 #[vox_trait(name = "PixelFilter")]
 trait Filter {
-    #[vox(name = "run", lowered_by = filter_apply, purity = "pure")]
+    #[vox(name = "run", lowered_by = filter_apply, pure = true)]
     fn apply(&self, input: Image) -> Image;
 }
 
-#[vox_fn(name = "gaussian_blur", purity = "pure")]
+#[vox_fn(name = "gaussian_blur", pure = true)]
 fn blur(input: Image, #[vox(default)] radius: f64) -> Image {
     todo!()
 }
@@ -347,7 +350,7 @@ Vox-facing return type when Rust cannot express the anonymous record directly:
 
 ```rust
 #[vox_fn(
-    purity = "pure",
+    pure = true,
     return_type = "{ shadows: Int, mids: Int, highlights: Int }"
 )]
 fn histogram(image: Image) -> HistogramSummary {
@@ -368,7 +371,7 @@ In low-level manifest code, the equivalent shape is `VoxType::Record(...)`.
 - `#[vox_trait(...)]` marks a Rust trait as exportable metadata and may
   override its exported name.
 - `#[vox_fn(...)]` describes one exported function and may override its
-  exported name, Vox return type, or docstring.
+  exported name, purity, Vox return type, or docstring.
 - `ExternalLibrary::build()` returns `(PackageManifest, Vec<u8>)` — the package
   manifest and serialized docstring metadata.
 - `ExternalLibrary::generate(wasm_bytes)` produces a `GeneratedExternalLibrary`

@@ -33,22 +33,22 @@ struct TestPoint {
 #[allow(dead_code)]
 struct TestEmpty {}
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn make_empty() -> TestEmpty {
     TestEmpty {}
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn make_point(x: i64, y: i64) -> TestPoint {
     TestPoint { x, y }
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn point_distance(a: TestPoint, b: TestPoint) -> f64 {
     (((b.x - a.x).pow(2) + (b.y - a.y).pow(2)) as f64).sqrt()
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn maybe_point(has: bool, x: i64, y: i64) -> Option<TestPoint> {
     if has {
         Some(TestPoint { x, y })
@@ -57,12 +57,12 @@ fn maybe_point(has: bool, x: i64, y: i64) -> Option<TestPoint> {
     }
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn points(count: i64) -> Vec<TestPoint> {
     (0..count).map(|i| TestPoint { x: i, y: i * 2 }).collect()
 }
 
-#[vox_fn(purity = "pure")]
+#[vox_fn(pure = true)]
 fn tags() -> Vec<String> {
     vec!["fast".into(), "gpu".into()]
 }

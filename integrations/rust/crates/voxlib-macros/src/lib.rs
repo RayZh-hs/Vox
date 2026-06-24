@@ -658,8 +658,8 @@ impl FunctionOptions {
                 options.name = Some(expect_lit_str(&value.value, "name")?.value());
                 continue;
             }
-            if value.path.is_ident("purity") {
-                options.purity = PurityValue::parse(expect_lit_str(&value.value, "purity")?)?;
+            if value.path.is_ident("pure") {
+                options.purity = PurityValue::parse_bool(&value.value)?;
                 continue;
             }
             if value.path.is_ident("return_type") {
@@ -704,8 +704,8 @@ impl TraitMethodOptions {
                 lowered_by = Some(expect_ident_or_lit_str(&value.value, "lowered_by")?);
                 continue;
             }
-            if value.path.is_ident("purity") {
-                purity = PurityValue::parse(expect_lit_str(&value.value, "purity")?)?;
+            if value.path.is_ident("pure") {
+                purity = PurityValue::parse_bool(&value.value)?;
                 continue;
             }
             if value.path.is_ident("doc") {
@@ -730,6 +730,22 @@ impl TraitMethodOptions {
             doc,
         })
     }
+}
+
+fn expect_lit_bool(expr: &syn::Expr, field: &str) -> syn::Result<bool> {
+    let syn::Expr::Lit(value) = expr else {
+        return Err(Error::new_spanned(
+            expr,
+            format!("{field} expects a boolean literal"),
+        ));
+    };
+    let syn::Lit::Bool(value) = &value.lit else {
+        return Err(Error::new_spanned(
+            &value.lit,
+            format!("{field} expects a boolean literal"),
+        ));
+    };
+    Ok(value.value)
 }
 
 fn expect_lit_str<'a>(expr: &'a syn::Expr, field: &str) -> syn::Result<&'a LitStr> {
@@ -771,14 +787,10 @@ enum PurityValue {
 }
 
 impl PurityValue {
-    fn parse(value: &LitStr) -> syn::Result<Self> {
-        match value.value().as_str() {
-            "pure" => Ok(Self::Pure),
-            "evil" => Ok(Self::Evil),
-            _ => Err(Error::new_spanned(
-                value,
-                "purity must be \"pure\" or \"evil\"",
-            )),
+    fn parse_bool(expr: &syn::Expr) -> syn::Result<Self> {
+        match expect_lit_bool(expr, "purity")? {
+            true => Ok(Self::Pure),
+            false => Ok(Self::Evil),
         }
     }
 
