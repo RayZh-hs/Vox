@@ -37,7 +37,7 @@ const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
 const TAG_UINT: i32 = 9;
-const TAG_CLOSURE: i32 = 9;
+const TAG_CLOSURE: i32 = 10;
 
 const SCRATCH_OFF: u32 = 0;
 const RESULT_OFF: u32 = 16384;
@@ -124,10 +124,9 @@ impl Ctx {
         self.version_count = 0;
 
         self.is_lambda_body = matches!(body.kind, MirBodyKind::Lambda);
-        let param_offset: u32 = if self.is_lambda_body { 1 } else { 0 };
 
         for (i, p) in body.parameters.iter().enumerate() {
-            self.parameter_index.insert(*p, i as u32 + param_offset);
+            self.parameter_index.insert(*p, i as u32);
         }
 
         let mut idx = 0u32;
@@ -221,7 +220,11 @@ impl Ctx {
 
     fn tag_local(&self, vid: MirValueId) -> u32 {
         if let Some(idx) = self.parameter_index.get(&vid).copied() {
-            idx * 2
+            if self.is_lambda_body {
+                1 + idx * 2
+            } else {
+                idx * 2
+            }
         } else {
             self.parameter_local_count() + self.value_index.get(&vid).copied().unwrap_or(0) * 2
         }
@@ -229,7 +232,11 @@ impl Ctx {
 
     fn data_local(&self, vid: MirValueId) -> u32 {
         if let Some(idx) = self.parameter_index.get(&vid).copied() {
-            idx * 2 + 1
+            if self.is_lambda_body {
+                2 + idx * 2
+            } else {
+                idx * 2 + 1
+            }
         } else {
             self.parameter_local_count() + self.value_index.get(&vid).copied().unwrap_or(0) * 2 + 1
         }
@@ -241,7 +248,7 @@ impl Ctx {
 
     fn parameter_local_count(&self) -> u32 {
         let base = self.parameter_index.len() as u32 * 2;
-        if self.is_lambda_body { base + 2 } else { base }
+        if self.is_lambda_body { base + 1 } else { base }
     }
 
     fn closure_local(&self) -> u32 {
@@ -415,9 +422,26 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         if matches!(body.kind, MirBodyKind::ScriptEntry) {
             entry_func_index = Some(func_index);
         }
-        let type_idx = *body_type_indices
-            .get(&body.parameters.len())
-            .ok_or_else(|| format!("missing wasm type for {} parameters", body.parameters.len()))?;
+        let type_idx = if matches!(body.kind, MirBodyKind::Lambda) {
+            let capture_count: usize = body
+                .name
+                .split('.')
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let explicit_params = body.parameters.len().saturating_sub(capture_count);
+            *closure_type_indices
+                .get(&explicit_params)
+                .ok_or_else(|| {
+                    format!("missing wasm closure type for {explicit_params} explicit parameters")
+                })?
+        } else {
+            *body_type_indices
+                .get(&body.parameters.len())
+                .ok_or_else(|| {
+                    format!("missing wasm type for {} parameters", body.parameters.len())
+                })?
+        };
         funcs.function(type_idx);
         func_index += 1;
     }
@@ -512,10 +536,12 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     wasm.section(&funcs);
     if lambda_count > 0 {
         wasm.section(&table);
-        wasm.section(&elems);
     }
     wasm.section(&globals);
     wasm.section(&exports);
+    if lambda_count > 0 {
+        wasm.section(&elems);
+    }
     wasm.section(&codes);
 
     if !ctx.string_data.is_empty() {
@@ -969,6 +995,7 @@ fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
                 "Int" | "UInt" | "Float" | "Bool" | "String" | "Null"
             )
                 || name.starts_with("Iterator<")
+                || name.starts_with("Function<")
         }
         _ => false,
     }
@@ -2345,6 +2372,7 @@ fn emit_dynamic_call(
 
 fn i32_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
     local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I32WrapI64);
     i32(f, offset as i32);
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::I32Store(MemArg {
@@ -2356,6 +2384,7 @@ fn i32_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
 
 fn i64_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
     local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I32WrapI64);
     i32(f, offset as i32);
     f.instruction(&Instruction::I32Add);
     f.instruction(&Instruction::I64Store(MemArg {

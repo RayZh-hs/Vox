@@ -24,6 +24,7 @@ const TAG_LIST: i32 = 6;
 const TAG_HANDLE: i32 = 7;
 const TAG_NULL: i32 = 8;
 const TAG_UINT: i32 = 9;
+const TAG_CLOSURE: i32 = 10;
 const TAG_INVALID: i32 = -1;
 const STRDATA_OFF: i64 = 32768;
 const WASM_PAGE_SIZE: u32 = 65536;
@@ -52,7 +53,7 @@ pub fn try_wasm_execute(
     let mut config = Config::new();
     config.max_wasm_stack(8 * 1024 * 1024);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
-    let module = Module::new(&engine, wasm_bytes).map_err(|e| e.to_string())?;
+    let module = Module::new(&engine, wasm_bytes).map_err(|e| format!("{e:?}"))?;
 
     let runtime_ptr = runtime as *mut Runtime;
 
@@ -1545,6 +1546,7 @@ fn from_wasm(
             }
         }
         TAG_HANDLE | TAG_LIST => Ok(RuntimeValue::Handle(HandleId(val as u64))),
+        TAG_CLOSURE => Err("compiled closure values cannot cross the wasm boundary".to_owned()),
         _ => Err(format!("unknown wasm result tag {tag}")),
     }
 }

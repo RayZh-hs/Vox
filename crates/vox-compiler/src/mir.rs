@@ -1586,8 +1586,9 @@ impl BodyBuilder {
         }
 
         for param in &lambda.parameters {
+            let ty = param.ty.as_ref().map(type_syntax_to_vox);
             let value = child.new_value(
-                Some(VoxType::opaque_surface("Unknown")),
+                ty.or_else(|| Some(VoxType::opaque_surface("Unknown"))),
                 MirValueDefinition::Parameter(param.name.clone()),
                 Some(param.span.clone()),
             );
@@ -1609,11 +1610,16 @@ impl BodyBuilder {
         }
 
         let result = child.lower_expr(&lambda.body);
+        let result_ty = child
+            .value_type(result)
+            .cloned()
+            .unwrap_or_else(|| VoxType::opaque_surface("Unknown"));
+        child.result_type = Some(result_ty.clone());
         child.terminate(MirTerminator::Return(result));
         let (lambda_body, _nested_lambdas) = child.finish();
         self.lambda_bodies.push(lambda_body);
 
-        self.emit_op(
+        let lambda_value = self.emit_op(
             MirOpKind::Lambda {
                 parameters: param_names,
                 captures: captures.clone(),
@@ -1621,7 +1627,14 @@ impl BodyBuilder {
             },
             captures,
             Some(expr.span.clone()),
-        )
+        );
+        if let Some(value) = self.values.iter_mut().find(|value| value.id == lambda_value) {
+            value.ty = Some(VoxType::opaque_surface(format!(
+                "Function<{}>",
+                render_type_key(&result_ty)
+            )));
+        }
+        lambda_value
     }
 
     fn alloc_foreign_body_id(&mut self) -> MirBodyId {
@@ -2627,7 +2640,13 @@ fn builtin_return_type(callee: &str, args: &[MirValueId], body: &BodyBuilder) ->
         (BuiltinReceiver::List, "fold" | "foldRight") => {
             args.get(1).and_then(|arg| body.value_type(*arg)).cloned()
         }
-        (BuiltinReceiver::List, "map" | "flatMap" | "zip") => {
+        (BuiltinReceiver::List, "map") => args
+            .get(1)
+            .and_then(|arg| body.value_type(*arg))
+            .and_then(function_result_type)
+            .map(|ty| VoxType::List(Box::new(ty)))
+            .or_else(|| Some(VoxType::List(Box::new(VoxType::opaque_surface("Unknown"))))),
+        (BuiltinReceiver::List, "flatMap" | "zip") => {
             Some(VoxType::List(Box::new(VoxType::opaque_surface("Unknown"))))
         }
         (BuiltinReceiver::Econ, "update") => None,
@@ -2676,6 +2695,16 @@ fn parse_type_key(raw: &str) -> Option<VoxType> {
         "Null" => Some(VoxType::opaque_surface("Null")),
         _ => None,
     }
+}
+
+fn function_result_type(ty: &VoxType) -> Option<VoxType> {
+    let VoxType::OpaqueSurface(name) = ty else {
+        return None;
+    };
+    let inner = name
+        .strip_prefix("Function<")
+        .and_then(|rest| rest.strip_suffix('>'))?;
+    parse_type_key(inner)
 }
 
 fn mir_mutability(mutability: Mutability) -> MirMutability {
