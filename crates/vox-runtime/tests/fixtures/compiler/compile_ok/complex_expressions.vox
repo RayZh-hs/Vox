@@ -1,0 +1,36 @@
+script fixtures.compile.complex_expr;
+
+param x: Int = 10;
+param cond: Bool = true;
+
+val deep_arith: Int = -x + 2 * (3 - 4) / 5 % 6 + 7 * (8 + (9 - 10));
+
+val deep_logic: Bool = !cond || cond && !(cond || cond && !cond);
+
+val deep_compare: Bool = x + 1 < x * 2 && x / 3 <= x % 5 || x == 10 && x != 20;
+
+val deep_mixed: Int = (if (cond) { 1 } else { 2 }) + (if (!cond) { 3 } else { 4 });
+
+val triple_ternary: String = (if (cond) {
+    "a"
+} else {
+    (if (cond) { "b" } else { "c" })
+});
+
+val nested_block: Int = {
+    val a = {
+        val b = {
+            val c = 1;
+            c + 2
+        };
+        b + 3
+    };
+    a + 4
+};
+
+val paren_override: Int = (1 + 2) * (3 + 4) / (5 + 1);
+
+val unary_chain: Int = ---x;
+
+1
+

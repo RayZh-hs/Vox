@@ -1,0 +1,21 @@
+script fixtures.semantic.nested_func_scopes;
+
+fun add(a: Int, b: Int): Int = a + b;
+
+fun multiply(a: Int, b: Int): Int = a * b;
+
+fun compute(x: Int): Int {
+    val step1 = add(x, 10);
+    val step2 = multiply(step1, 2);
+    step2
+}
+
+fun applyTwice(fn: (Int) -> Int, x: Int): Int = fn(fn(x));
+
+fun increment(x: Int): Int = x + 1;
+
+val result = compute(5);
+val doubled = applyTwice(increment, 3);
+
+result
+

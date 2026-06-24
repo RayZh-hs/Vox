@@ -1,0 +1,46 @@
+script fixtures.algorithm.prime;
+
+fun isPrime(n: Int): Bool {
+    (if (n < 2) {
+        false
+    } else {
+        (if (n == 2) {
+            true
+        } else {
+            (if (n % 2 == 0) {
+                false
+            } else {
+                var d: Int = 3;
+                var result: Bool = true;
+                for (d * d <= n) {
+                    (if (n % d == 0) {
+                        result = false;
+                        break;
+                    });
+                    d += 2;
+                };
+                result
+            })
+        })
+    })
+}
+
+fun nthPrime(n: Int): Int {
+    var count: Int = 0;
+    var candidate: Int = 1;
+    for (count < n) {
+        candidate += 1;
+        if (isPrime(candidate)) {
+            count += 1;
+        };
+    };
+    candidate
+}
+
+val p1: Bool = isPrime(2);
+val p2: Bool = isPrime(17);
+val p3: Bool = isPrime(100);
+val nth: Int = nthPrime(10);
+
+nth
+

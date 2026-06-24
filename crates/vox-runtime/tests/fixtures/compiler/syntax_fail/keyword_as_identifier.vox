@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.keyword_as_id;
+
+val val: Int = 1;
+

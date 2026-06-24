@@ -1,0 +1,15 @@
+script fixtures.semantic.param_defaults;
+
+param count: Int = 10;
+param name: String = "Vox";
+param flag: Bool = true;
+param ratio: Float = 0.5;
+
+fun multi(a: Int = 1, b: Int = 2, c: Int = 3): Int = a + b + c;
+
+val sum: Int = multi();
+val sumTwo: Int = multi(b = 5);
+val sumAll: Int = multi(10, 20, 30);
+
+sum
+

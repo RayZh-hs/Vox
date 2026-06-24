@@ -1,0 +1,46 @@
+script fixtures.algorithm.sorting;
+
+fun findMin(list: List[Int]): Int {
+    var minVal: Int = list[0];
+    var i: Int = 1;
+    for (i < list.length()) {
+        if (list[i] < minVal) {
+            minVal = list[i];
+        };
+        i += 1;
+    };
+    minVal
+}
+
+fun findMax(list: List[Int]): Int {
+    var maxVal: Int = list[0];
+    var i: Int = 1;
+    for (i < list.length()) {
+        if (list[i] > maxVal) {
+            maxVal = list[i];
+        };
+        i += 1;
+    };
+    maxVal
+}
+
+fun isSorted(list: List[Int]): Bool {
+    var i: Int = 0;
+    var len: Int = list.length();
+    for (i < len - 1) {
+        if (list[i] > list[i + 1]) {
+            return false;
+        };
+        i += 1;
+    };
+    true
+}
+
+val numbers: List[Int] = [5, 3, 8, 1, 9, 2];
+val minVal = findMin(numbers);
+val maxVal = findMax(numbers);
+val sorted = [1, 2, 3, 5, 8, 9];
+val check = isSorted(sorted);
+
+minVal
+

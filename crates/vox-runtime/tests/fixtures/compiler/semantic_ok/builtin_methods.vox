@@ -1,0 +1,16 @@
+script fixtures.semantic.builtin_methods;
+
+param input: Int = 42;
+param text: String = "hello world";
+param range: List[Int] = [1, 2, 3, 4, 5];
+
+val strInt: String = input.toString();
+val strLen: Int = text.length();
+val isEmpty: Bool = text.isEmpty();
+val lower: String = text.toLower();
+val upper: String = text.toUpper();
+val listLen: Int = range.length();
+val contains: Bool = text.contains("hello");
+
+strInt
+

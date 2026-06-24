@@ -1,0 +1,8 @@
+script fixtures.syntax.fail.trailing_comma_call;
+
+fun f(x: Int): Int = x + 1;
+
+val y = f(,);
+
+y
+

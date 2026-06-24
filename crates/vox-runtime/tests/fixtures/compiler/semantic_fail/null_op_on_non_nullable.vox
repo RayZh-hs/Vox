@@ -1,0 +1,7 @@
+script fixtures.semantic.fail.null_op_on_non_nullable;
+
+val x: Int = 5;
+val bad = x?.toString();
+
+bad
+

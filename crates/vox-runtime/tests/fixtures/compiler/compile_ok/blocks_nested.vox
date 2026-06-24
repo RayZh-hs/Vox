@@ -1,0 +1,37 @@
+script fixtures.compile.blocks;
+
+val outer: Int = {
+    val one: Int = 1;
+    var acc: Int = 0;
+    acc = one;
+    {
+        val two: Int = 2;
+        acc = acc + two;
+    };
+    acc
+};
+
+val blockInExpr: Int = {
+    val x = 10;
+    x
+} + {
+    val y = 20;
+    y
+};
+
+val blockInCall: Int = {
+    val base = 100;
+    base
+} + 1;
+
+val blockAsArg: Bool = if ({
+    val condition = true;
+    condition
+}) {
+    true
+} else {
+    false
+};
+
+1
+

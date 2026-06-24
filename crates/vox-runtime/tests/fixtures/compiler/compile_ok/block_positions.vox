@@ -1,0 +1,34 @@
+script fixtures.compile.block_positions;
+
+param flag: Bool = true;
+
+val block_as_call_arg: Int = ({
+    val base = 100;
+    base
+}) + ({
+    val extra = 20;
+    extra
+});
+
+val block_as_operand: Int = {
+    val a = 10;
+    a
+} * {
+    val b = 5;
+    b
+};
+
+val block_as_index: Int = [1, 2, 3][{
+    val idx = 0;
+    idx
+}];
+
+fun take(v: Int): Int = v * 2;
+
+val block_as_arg: Int = take({
+    val v = 7;
+    v
+});
+
+1
+

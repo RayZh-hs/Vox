@@ -1,0 +1,19 @@
+script fixtures.semantic.record_update;
+
+val point: {x: Int, y: Int} = { x = 1, y = 2, };
+
+val movedX = point.updated(x = 10);
+val movedY = point.updated(y = 20);
+val movedBoth = point.updated(x = 5, y = 6);
+
+val pair: (Int, String,) = (1, "a",);
+
+val updatedFirst = updated(pair, #0 = 99);
+val updatedSecond = updated(pair, #1 = "z");
+
+val numbers: List[Int] = [1, 2, 3, 4];
+
+val updatedHead = numbers.updated(#0 = 10);
+
+point.x
+

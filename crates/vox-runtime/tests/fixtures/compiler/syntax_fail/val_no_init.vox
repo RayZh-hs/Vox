@@ -1,0 +1,6 @@
+script fixtures.syntax.fail.val_no_init;
+
+val x: Int;
+
+x
+

@@ -1,0 +1,49 @@
+script fixtures.algorithm.summation;
+
+fun sumRange(n: Int): Int {
+    var total: Int = 0;
+    var i: Int = 0;
+    for (i <= n) {
+        total += i;
+        i += 1;
+    };
+    total
+}
+
+fun sumOfSquares(n: Int): Int {
+    var total: Int = 0;
+    var i: Int = 1;
+    for (i <= n) {
+        total += i * i;
+        i += 1;
+    };
+    total
+}
+
+fun sumList(list: List[Int]): Int {
+    var total: Int = 0;
+    var i: Int = 0;
+    for (i < list.length()) {
+        total += list[i];
+        i += 1;
+    };
+    total
+}
+
+fun productRange(n: Int): Int {
+    var prod: Int = 1;
+    var i: Int = 1;
+    for (i <= n) {
+        prod *= i;
+        i += 1;
+    };
+    prod
+}
+
+val s10 = sumRange(10);
+val sq5 = sumOfSquares(5);
+val listSum = sumList([1, 2, 3, 4, 5]);
+val fact5 = productRange(5);
+
+s10
+

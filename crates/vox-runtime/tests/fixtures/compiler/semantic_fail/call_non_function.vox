@@ -1,0 +1,7 @@
+script fixtures.semantic.fail.call_non_func;
+
+val x: Int = 1;
+val y = x(1);
+
+y
+

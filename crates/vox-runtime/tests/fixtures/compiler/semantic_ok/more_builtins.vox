@@ -1,0 +1,14 @@
+script fixtures.semantic.ok;
+
+param items: List[Int] = [1, 2, 3];
+
+val firstItem: Int? = items.first();
+val lastItem: Int? = items.last();
+val isEmpty: Bool = items.isEmpty();
+val size: Int = items.size();
+
+val str: String = "hello".toUpper();
+val idx: Int? = str.indexOf("E");
+
+size
+

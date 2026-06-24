@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.negate_non_bool;
+
+val x: Bool = !42;
+
+x
+

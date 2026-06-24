@@ -1,0 +1,36 @@
+script fixtures.algorithm.collatz;
+
+fun collatzLen(n: Int): Int {
+    var steps: Int = 0;
+    var current: Int = n;
+    for (current > 1) {
+        if (current % 2 == 0) {
+            current = current / 2;
+        } else {
+            current = 3 * current + 1;
+        };
+        steps += 1;
+    };
+    steps
+}
+
+fun longestCollatz(limit: Int): Int {
+    var maxLen: Int = 0;
+    var best: Int = 0;
+    var i: Int = 1;
+    for (i <= limit) {
+        val length = collatzLen(i);
+        if (length > maxLen) {
+            maxLen = length;
+            best = i;
+        };
+        i += 1;
+    };
+    best
+}
+
+val len27 = collatzLen(27);
+val longest = longestCollatz(100);
+
+len27
+

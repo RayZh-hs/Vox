@@ -1,0 +1,12 @@
+script fixtures.syntax.fail.if_no_parens;
+
+fun bad(x: Int): Int {
+    if x > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+bad(0)
+

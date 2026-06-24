@@ -1,0 +1,8 @@
+script fixtures.semantic.fail.wrong_arg_type;
+
+fun add(a: Int, b: Int): Int = a + b;
+
+val x = add(1, "not an int");
+
+x
+

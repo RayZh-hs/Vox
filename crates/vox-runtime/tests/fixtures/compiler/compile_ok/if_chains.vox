@@ -1,0 +1,42 @@
+script fixtures.compile.if_chains;
+
+param x: Int = 5;
+
+val simple: String = if (x > 0) { "pos" } else { "neg" };
+
+val elseif3: String = if (x > 10) {
+    "big"
+} else if (x > 5) {
+    "mid"
+} else if (x > 0) {
+    "small"
+} else {
+    "none"
+};
+
+val nested_if: String = if (x > 0) {
+    if (x > 5) {
+        if (x > 8) { "large" } else { "medium" }
+    } else {
+        "small"
+    }
+} else {
+    "negative"
+};
+
+val if_in_block: Int = {
+    val result = if (true) { 42 } else { 0 };
+    result + 1
+};
+
+val block_in_if: Int = if ({
+    val y = x + 1;
+    y > 0
+}) {
+    1
+} else {
+    0
+};
+
+1
+

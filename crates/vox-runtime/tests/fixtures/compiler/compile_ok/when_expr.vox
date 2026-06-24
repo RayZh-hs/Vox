@@ -1,0 +1,25 @@
+script fixtures.compile.when_expr;
+
+param maybeStr: String? = "hello";
+param intVal: Int = 42;
+
+val simple = when (maybeStr) {
+    is String as s -> "string";
+    else -> "other";
+};
+
+val inlineArm = when (intVal) {
+    is Int as n -> n + 1;
+    else -> 0;
+};
+
+val blockArm = when (intVal) {
+    is Int as n -> {
+        val doubled = n * 2;
+        doubled
+    }
+    else -> 0;
+};
+
+simple
+

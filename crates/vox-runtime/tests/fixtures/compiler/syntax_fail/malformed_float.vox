@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.malformed_float;
+
+val x: Float = 1.2.3;
+

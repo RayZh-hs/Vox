@@ -1,0 +1,10 @@
+script fixtures.syntax.fail.missing_block_after_if;
+
+fun bad(flag: Bool): Int {
+    if (flag)
+    return 1;
+    0
+}
+
+bad(false)
+

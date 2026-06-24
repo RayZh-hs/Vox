@@ -1,0 +1,36 @@
+script fixtures.algorithm.newton;
+
+fun abs(x: Float): Float {
+    (if (x < 0.0) {
+        -x
+    } else {
+        x
+    })
+}
+
+fun sqrt(n: Float): Float {
+    (if (n < 0.0) {
+        return 0.0;
+    });
+    (if (n == 0.0) {
+        return 0.0;
+    });
+    var guess: Float = n / 2.0;
+    var i: Int = 0;
+    for (i < 20) {
+        val prev = guess;
+        guess = (guess + n / guess) / 2.0;
+        if (abs(guess - prev) < 0.0001) {
+            break;
+        };
+        i += 1;
+    };
+    guess
+}
+
+val sqrt2 = sqrt(2.0);
+val sqrt9 = sqrt(9.0);
+val sqrt25 = sqrt(25.0);
+
+sqrt2
+

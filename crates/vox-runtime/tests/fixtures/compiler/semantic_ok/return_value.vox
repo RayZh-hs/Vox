@@ -1,0 +1,32 @@
+script fixtures.semantic.return_value;
+
+fun returnsInt(): Int {
+    return 42;
+}
+
+fun returnsUnit(): Unit {
+    return;
+}
+
+fun returnsEarly(x: Int): Int {
+    if (x < 0) {
+        return 0;
+    };
+    x
+}
+
+fun returnsFromBranch(flag: Bool): String {
+    if (flag) {
+        return "yes";
+    };
+    "no"
+}
+
+val a: Int = returnsInt();
+val b: () = returnsUnit();
+val c: Int = returnsEarly(-1);
+val d: Int = returnsEarly(5);
+val e: String = returnsFromBranch(true);
+
+a
+

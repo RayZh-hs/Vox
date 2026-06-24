@@ -1,0 +1,8 @@
+script fixtures.syntax.fail.fun_no_parens;
+
+fun bad {
+    1
+}
+
+bad()
+

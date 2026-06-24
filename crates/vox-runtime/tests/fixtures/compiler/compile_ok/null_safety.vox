@@ -1,0 +1,14 @@
+script fixtures.compile.null_safety;
+
+param maybeVal: Int? = null;
+param maybeRecord: {name: String}? = null;
+
+val safeAccess: String? = maybeRecord?.name;
+val forced: Int = maybeVal!!;
+val coalesced: Int = maybeVal ?: 42;
+val chainedCoalesced: Int = maybeVal ?: (-1 ?: 0);
+val inExpr: Int = (maybeVal ?: 10) + 5;
+val cond: Bool = maybeRecord?.name != null;
+
+1
+

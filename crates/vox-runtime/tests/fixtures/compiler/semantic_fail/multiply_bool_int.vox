@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.multiply_bool_int;
+
+val x: Int = true * 3;
+
+x
+

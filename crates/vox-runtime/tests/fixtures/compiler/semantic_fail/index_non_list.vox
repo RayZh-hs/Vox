@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.index_non_list;
+
+val x = 1[0];
+
+x
+

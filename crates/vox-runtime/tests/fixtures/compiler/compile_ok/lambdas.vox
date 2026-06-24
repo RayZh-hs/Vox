@@ -1,0 +1,26 @@
+script fixtures.compile.lambdas;
+
+param threshold: Int = 10;
+
+val simple: (Int) -> Int = x -> x + 1;
+val typed: (Int, Bool,) -> Int = (x: Int, flag: Bool,) -> {
+    if (flag) {
+        x + 1
+    } else {
+        x - 1
+    }
+};
+
+val capture: (Int) -> Int = x -> x + threshold;
+
+val bodyBlock: (Int) -> Int = (x: Int,) -> {
+    val doubled = x * 2;
+    doubled
+};
+
+val noParams: () -> Int = () -> 42;
+
+val inExpr: Int = (x -> x * 2)(5);
+
+1
+

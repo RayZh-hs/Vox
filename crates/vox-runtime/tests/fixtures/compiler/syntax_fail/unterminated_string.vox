@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.unterminated_string;
+
+val x: String = "hello;
+

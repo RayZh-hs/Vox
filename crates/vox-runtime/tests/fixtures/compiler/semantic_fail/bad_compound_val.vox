@@ -1,0 +1,9 @@
+script fixtures.semantic.fail.bad_compound_val;
+
+fun bad(): Unit {
+    val x: Int = 1;
+    x += 2;
+}
+
+bad()
+

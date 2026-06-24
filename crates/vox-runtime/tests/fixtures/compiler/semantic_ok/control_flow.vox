@@ -1,0 +1,56 @@
+script fixtures.semantic.control_flow;
+
+fun classify(n: Int): String {
+    (if (n < 0) {
+        "negative"
+    } else {
+        (if (n == 0) {
+            "zero"
+        } else {
+            (if (n % 2 == 0) {
+                "even"
+            } else {
+                "odd"
+            })
+        })
+    })
+}
+
+fun fizzbuzz(n: Int): String {
+    var out: String = "";
+    if (n % 3 == 0) {
+        out = out + "fizz";
+    };
+    if (n % 5 == 0) {
+        out = out + "buzz";
+    };
+    (if (out.isEmpty()) {
+        out = "none";
+    });
+    out
+}
+
+fun sumDigits(n: Int): Int {
+    var sum: Int = 0;
+    var m: Int = n;
+    for (m > 0) {
+        sum += m % 10;
+        m = m / 10;
+    };
+    sum
+}
+
+val c1: String = classify(-5);
+val c2: String = classify(0);
+val c3: String = classify(7);
+val c4: String = classify(8);
+
+val fb3 = fizzbuzz(3);
+val fb5 = fizzbuzz(5);
+val fb15 = fizzbuzz(15);
+val fb7 = fizzbuzz(7);
+
+val sd = sumDigits(1234);
+
+c1
+

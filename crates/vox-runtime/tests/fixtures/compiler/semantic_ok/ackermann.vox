@@ -1,0 +1,24 @@
+script fixtures.algorithm.ackermann;
+
+fun ackermann(m: Int, n: Int): Int {
+    (if (m == 0) {
+        n + 1
+    } else {
+        (if (n == 0) {
+            ackermann(m - 1, 1)
+        } else {
+            ackermann(m - 1, ackermann(m, n - 1))
+        })
+    })
+}
+
+val a00 = ackermann(0, 0);
+val a01 = ackermann(0, 1);
+val a10 = ackermann(1, 0);
+val a11 = ackermann(1, 1);
+val a12 = ackermann(1, 2);
+val a22 = ackermann(2, 2);
+val a31 = ackermann(3, 1);
+
+a31
+

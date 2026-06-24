@@ -1,0 +1,26 @@
+script fixtures.algorithm.fibonacci_iterative;
+
+fun fib(n: Int): Int {
+    (if (n <= 1) {
+        return n;
+    });
+    var a: Int = 0;
+    var b: Int = 1;
+    var i: Int = 2;
+    for (i <= n) {
+        val next = a + b;
+        a = b;
+        b = next;
+        i += 1;
+    };
+    b
+}
+
+val f0 = fib(0);
+val f1 = fib(1);
+val f5 = fib(5);
+val f10 = fib(10);
+val f20 = fib(20);
+
+f20
+

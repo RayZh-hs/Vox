@@ -1,0 +1,14 @@
+evil script fixtures.compile.evil_entry;
+
+param text: String = "hello";
+
+public evil fun log(msg: String): Unit {
+    panic "not executed";
+}
+
+fun pureComputation(x: Int): Int = x * 2;
+
+val cached: Int = pureComputation(42);
+
+cached
+

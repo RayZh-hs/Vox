@@ -1,0 +1,18 @@
+script fixtures.compile.econ_expr;
+
+param seed: Int = 1;
+
+val snapshot: Econ[Int] = econ[Int] {
+    val doubled = seed * 2;
+    doubled
+};
+
+val inBlock = {
+    val cached: Econ[String] = econ[String] {
+        "result"
+    };
+    cached
+};
+
+1
+

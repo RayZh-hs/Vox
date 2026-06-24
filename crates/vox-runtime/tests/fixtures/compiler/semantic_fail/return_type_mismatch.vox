@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.return_type;
+
+fun bad(): Int = "not an int";
+
+bad()
+

@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.arithmetic_type;
+
+val x: Int = "hello" + 1;
+
+x
+

@@ -1,0 +1,18 @@
+script fixtures.semantic.shadow_scope;
+
+val x: Int = 1;
+
+fun inner(p: Int): Int {
+    val y: Int = p + 1;
+    {
+        val x: Int = 100;
+        val y: Int = 200;
+        x + y
+    }
+}
+
+val outer: Int = x;
+val result: Int = inner(outer);
+
+result
+

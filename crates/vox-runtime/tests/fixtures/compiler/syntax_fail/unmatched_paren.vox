@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.unmatched_paren;
+
+val x: Int = (1 + 2;
+

@@ -1,0 +1,24 @@
+script fixtures.semantic.when_advanced;
+
+param value: String? = "hello";
+param maybeList: List[Int]? = null;
+
+fun describe(v: String?): String {
+    (when (v) {
+        is String as s -> "got: $s";
+        else -> "nothing";
+    })
+}
+
+fun countItems(items: List[Int]?): Int {
+    (when (items) {
+        is List[Int] as lst -> lst.length();
+        else -> 0;
+    })
+}
+
+val result: String = describe(value);
+val itemCount: Int = countItems(maybeList);
+
+result
+

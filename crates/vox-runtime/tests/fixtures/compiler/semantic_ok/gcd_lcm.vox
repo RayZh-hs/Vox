@@ -1,0 +1,19 @@
+script fixtures.algorithm.gcd_lcm;
+
+fun gcd(a: Int, b: Int): Int {
+    (if (b == 0) {
+        a
+    } else {
+        gcd(b, a % b)
+    })
+}
+
+fun lcm(a: Int, b: Int): Int {
+    a / gcd(a, b) * b
+}
+
+val g = gcd(48, 18);
+val l = lcm(12, 18);
+
+g
+

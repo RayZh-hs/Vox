@@ -1,0 +1,26 @@
+script fixtures.algorithm.binary_search;
+
+fun binarySearch(list: List[Int], target: Int): Int {
+    var lo: Int = 0;
+    var hi: Int = list.length();
+    for (lo < hi) {
+        val mid = lo + (hi - lo) / 2;
+        val value = list[mid];
+        if (value == target) {
+            return mid;
+        };
+        if (value < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        };
+    };
+    -1
+}
+
+val sorted: List[Int] = [2, 5, 8, 12, 16, 23, 38, 56, 72, 91];
+val found = binarySearch(sorted, 23);
+val notFound = binarySearch(sorted, 100);
+
+found
+

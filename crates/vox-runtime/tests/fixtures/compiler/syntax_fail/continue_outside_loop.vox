@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.continue_outside_loop;
+
+continue;
+

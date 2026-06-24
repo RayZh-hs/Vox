@@ -1,0 +1,4 @@
+script fixtures.syntax.fail.evil_on_val;
+
+evil val x: Int = 1;
+

@@ -1,0 +1,16 @@
+script fixtures.semantic.generics;
+
+fun pair[T: Any, U: Any](first: T, second: U): (T, U) = (first, second);
+
+fun id[T: Any](value: T): T = value;
+
+fun wrap[T: Any](value: T): List[T] = [value];
+
+val intPair: (Int, Int) = pair(1, 2);
+val mixed: (Int, String) = pair(42, "hello");
+val intVal: Int = id(42);
+val strVal: String = id("world");
+val wrapped: List[Int] = wrap(intVal);
+
+intVal
+

@@ -1,0 +1,36 @@
+script fixtures.compile.literals;
+
+val intPos: Int = 42;
+val intNeg: Int = -17;
+val intZero: Int = 0;
+val intUnderscore: Int = 1_000_000;
+val floatPos: Float = 3.14;
+val floatNeg: Float = -2.718;
+val floatSciSmall: Float = 1.5e+10;
+val floatSciLarge: Float = 2.5E-3;
+val floatZero: Float = 0.0;
+val stringPlain: String = "hello";
+val stringEmpty: String = "";
+val stringEscape: String = "line1\nline2\tindented";
+val stringUnicode: String = "\u{41}\u{42}\u{43}";
+val stringHex: String = "\u{2603}";
+val boolTrue: Bool = true;
+val boolFalse: Bool = false;
+val nullInt: Int? = null;
+val nullString: String? = null;
+val unitParen: () = ();
+val unitBrace: {} = {};
+val emptyList: List[Int] = [];
+val singletonList: List[Int] = [1,];
+val listMultiline: List[Int] = [
+    1,
+    2,
+    3,
+];
+val emptyRecord: {x: Int}? = null;
+val recordCompact: {x: Int, y: Int,} = { x = 1, y = 2, };
+val tuplePair: (Int, String,) = (1, "a",);
+val tupleSingle: (Int,) = (1,);
+
+1
+

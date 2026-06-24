@@ -1,0 +1,10 @@
+script fixtures.semantic.fail.for_non_bool_condition;
+
+fun bad(list: List[Int]): Unit {
+    for (val i = 0; i + 1) {
+        i;
+    }
+}
+
+bad([1])
+

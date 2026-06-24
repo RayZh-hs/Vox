@@ -1,0 +1,27 @@
+script fixtures.semantic.tuple_record;
+
+val pair: (Int, String,) = (42, "answer",);
+val triple: (Bool, Int, Float,) = (true, 1, 2.5,);
+
+val point: {x: Int, y: Int} = { x = 3, y = 4, };
+val person: {name: String, age: Int, active: Bool} = {
+    name = "Alice",
+    age = 30,
+    active = true,
+};
+
+val moved = point.updated(x = 10);
+val grown = person.updated(age = 31);
+val renamed = person.updated(name = "Bob");
+
+val swapped = updated(pair, #0 = 99, #1 = "new");
+
+val nested: {pos: {x: Int, y: Int}, label: String} = {
+    pos = { x = 1, y = 2, },
+    label = "origin",
+};
+
+val movedNested = nested.updated(pos.x = 5, label = "moved");
+
+point.x
+

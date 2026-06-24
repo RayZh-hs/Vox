@@ -1,0 +1,18 @@
+script fixtures.semantic.compound_assign;
+
+param start: Int = 0;
+
+fun accumulate(base: Int): Int {
+    var x: Int = base;
+    x += 5;
+    x -= 2;
+    x *= 3;
+    x /= 2;
+    x %= 4;
+    x
+}
+
+val result: Int = accumulate(start);
+
+result
+

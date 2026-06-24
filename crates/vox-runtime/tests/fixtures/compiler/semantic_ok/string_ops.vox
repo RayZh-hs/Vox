@@ -1,0 +1,16 @@
+script fixtures.semantic.string_ops;
+
+param text: String = "hello world vox language";
+
+val starts: Bool = text.startsWith("hello");
+val ends: Bool = text.endsWith("language");
+val contains: Bool = text.contains("vox");
+val replaced: String = text.replace("vox", "VOX");
+val trimmed: String = "  spaces  ".trim();
+val repeated: String = "ab".repeat(3);
+val substring: String = text.substring(0, 5);
+
+val combined: String = text.toUpper().substring(6, 11);
+
+combined
+

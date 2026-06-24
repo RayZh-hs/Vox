@@ -1,0 +1,13 @@
+script fixtures.semantic.string_interp;
+
+param name: String = "Vox";
+param count: Int = 3;
+
+val greeting: String = "Hello, $name!";
+val expr: String = "count is ${count + 1}";
+val multi: String = "$name has ${count} items";
+val nested: String = "${count * 2}";
+val literal: String = "literal";
+
+greeting
+

@@ -1,0 +1,7 @@
+script fixtures.syntax.fail.package_with_trailing;
+
+package fixtures.syntax.fail.extra;
+val x: Int = 1;
+
+x
+

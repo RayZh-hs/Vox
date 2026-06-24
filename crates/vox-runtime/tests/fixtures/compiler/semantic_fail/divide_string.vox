@@ -1,0 +1,6 @@
+script fixtures.semantic.fail.divide_string;
+
+val x: Int = "hello" / 2;
+
+x
+

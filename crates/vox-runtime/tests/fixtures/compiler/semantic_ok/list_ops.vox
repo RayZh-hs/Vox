@@ -1,0 +1,21 @@
+script fixtures.semantic.list_ops;
+
+param base: List[Int] = [1, 2, 3, 4, 5, 6];
+
+val len: Int = base.length();
+val first: Int? = base.first();
+val last: Int? = base.last();
+val isEmpty: Bool = base.isEmpty();
+val contains: Bool = base.contains(3);
+val index: Int? = base.indexOf(4);
+val sliced: List[Int] = base.slice(1, 4);
+val at: Int? = base.get(2);
+
+val reversed: List[Int] = base.reversed();
+val total: Int = base.fold(0, (acc: Int, x: Int,) -> acc + x);
+val product: Int = base.fold(1, (acc: Int, x: Int,) -> acc * x);
+
+val doubled: Int = base.map((x: Int) -> x * 2).fold(0, (acc: Int, x: Int,) -> acc + x);
+
+len
+

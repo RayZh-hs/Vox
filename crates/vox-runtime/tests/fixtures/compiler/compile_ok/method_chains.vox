@@ -1,0 +1,17 @@
+script fixtures.compile.method_chains;
+
+param text: String = "vox";
+param numbers: List[Int] = [3, 1, 4, 1, 5];
+
+fun addOne(x: Int): Int = x + 1;
+fun addTwo(x: Int): Int = x + 2;
+fun addThree(x: Int): Int = x + 3;
+
+val chained: Int = 1.addOne().addTwo().addThree();
+
+val stringChain: Int = text.toUpper().toLower().length();
+
+val listLen: Int = numbers.length().addTwo();
+
+10
+

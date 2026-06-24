@@ -1,0 +1,15 @@
+script fixtures.semantic.higher_order;
+
+fun apply(fn: (Int) -> Int, x: Int): Int = fn(x);
+
+fun twice(fn: (Int) -> Int, x: Int): Int = fn(fn(x));
+
+fun double(x: Int): Int = x * 2;
+
+fun addThree(x: Int): Int = x + 3;
+
+val applied: Int = apply(double, 5);
+val twiced: Int = twice(addThree, 1);
+
+applied
+

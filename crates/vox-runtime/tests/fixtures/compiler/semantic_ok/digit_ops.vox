@@ -1,0 +1,59 @@
+script fixtures.algorithm.digit_ops;
+
+fun digitSum(n: Int): Int {
+    var sum: Int = 0;
+    var num: Int = n;
+    for (num > 0) {
+        sum += num % 10;
+        num = num / 10;
+    };
+    sum
+}
+
+fun digitCount(n: Int): Int {
+    var count: Int = 0;
+    var num: Int = n;
+    for (num > 0) {
+        count += 1;
+        num = num / 10;
+    };
+    count
+}
+
+fun reverseDigits(n: Int): Int {
+    var rev: Int = 0;
+    var num: Int = n;
+    for (num > 0) {
+        rev = rev * 10 + num % 10;
+        num = num / 10;
+    };
+    rev
+}
+
+fun isArmstrong(n: Int): Bool {
+    val d = digitCount(n);
+    var sum: Int = 0;
+    var num: Int = n;
+    for (num > 0) {
+        var digit = num % 10;
+        var pow: Int = 1;
+        var i: Int = 0;
+        for (i < d) {
+            pow *= digit;
+            i += 1;
+        };
+        sum += pow;
+        num = num / 10;
+    };
+    sum == n
+}
+
+val ds = digitSum(12345);
+val dc = digitCount(9876);
+val rd = reverseDigits(1234);
+val arm1: Bool = isArmstrong(153);
+val arm2: Bool = isArmstrong(370);
+val arm3: Bool = isArmstrong(100);
+
+ds
+

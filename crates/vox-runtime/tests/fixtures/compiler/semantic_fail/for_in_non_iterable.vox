@@ -1,0 +1,10 @@
+script fixtures.semantic.fail.for_in_non_iterable;
+
+fun bad(): Unit {
+    for (x in true) {
+        x;
+    }
+}
+
+bad()
+
