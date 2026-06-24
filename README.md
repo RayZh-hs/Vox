@@ -31,19 +31,16 @@ repository.
 
 ## Current Scope
 
-Vox currently includes:
+The Vox Ecosystem currently includes:
 
-- a source frontend for package and script units;
-- semantic checks for names, imports, public values, functions, and package
-  manifests;
-- runtime mounting for `.vox` packages and `.voxlib` libraries;
-- a REPL that can run with an embedded runtime or attach to a shared runtime;
-- a binary runtime protocol for external clients;
-- an LSP server for editor diagnostics;
-- Rust integration crates for authoring external `.voxlib` packages.
+- A beautifully designed programming language with strong static typing, type inference, and modern fluent syntax.
+- A runtime for interpreting and executing compiled Vox code;
+- A full-featured compiler suite for parsing, semantic analysis, MIR lowering, optimization, and WASM backend;
+- A REPL that can run with an embedded runtime or attach to a shared runtime for debugging;
+- A feature-rich LSP server for IDE integration, providing diagnostics, hover, go-to-definition, etc.;
+- Rust integration crates for authoring external `.voxlib` packages, more languages coming soon.
 
-The parser, type system, optimizer, and runtime are still under active
-development. Expect the public surface to change while Vox is in alpha.
+The Vox language is still under active development. Expect changes to the public surface while Vox is in alpha.
 
 ## Quick Start
 
@@ -95,20 +92,33 @@ mdbook build docs
 mdbook serve docs
 ```
 
+## Testing
+
+Run the compiler test suite:
+
+```sh
+cargo test
+```
+
 ## Workspace Layout
 
-- [`crates/vox-core`](crates/vox-core): shared language and runtime data model.
-- [`crates/vox-compiler`](crates/vox-compiler): frontend, semantic analysis,
-  package manifests, and backend lowering.
-- [`crates/vox-runtime`](crates/vox-runtime): long-lived runtime state, package
-  mounting, artifact storage, host calls, and runtime protocol support.
-- [`crates/vox-repl`](crates/vox-repl): interactive shell for evaluating Vox
-  code.
-- [`crates/vox-lsp`](crates/vox-lsp): language server for editor diagnostics.
+- [`crates/vox-core`](crates/vox-core): shared language data model, types, MIR,
+  builtins, and host registry.
+- [`crates/vox-compiler`](crates/vox-compiler): frontend (parsing, semantic
+  analysis), MIR lowering, optimization, and WASM backend. Exports a CLI binary
+  (`vox-compiler`) for compiling `.vox` sources to `.voxlib` libraries.
+- [`crates/vox-runtime`](crates/vox-runtime): long-lived runtime with MIR and
+  WASM executors, tree-walk interpreter, package mounting, artifact storage, and
+  runtime protocol server. Exports a binary for running a shared runtime server.
+- [`crates/vox-repl`](crates/vox-repl): interactive REPL shell for evaluating
+  Vox code, with line editing, completions, and type inspection.
+- [`crates/vox-lsp`](crates/vox-lsp): language server providing diagnostics,
+  hover, go-to-definition, and best-effort matching.
 - [`integrations/rust/crates/voxlib-sdk`](integrations/rust/crates/voxlib-sdk):
-  Rust SDK for defining external Vox libraries.
+  Rust SDK for defining external Vox libraries with structs, functions, and
+  traits.
 - [`integrations/rust/crates/voxlib-macros`](integrations/rust/crates/voxlib-macros):
-  procedural macros used by the Rust SDK.
+  procedural macros (`VoxExport`, `vox_fn`) used by the Rust SDK.
 
 ## License
 
