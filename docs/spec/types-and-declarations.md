@@ -125,12 +125,16 @@ ImportDecl
 
 Rules:
 
-- an import makes a package name available for qualified access;
+- an import makes the package available for qualified access under the final
+  module-path segment (for example, `import foo.bar; bar.baz()`); `import foo;`
+  remains addressable as `foo.bar()`;
 - `public import` re-exports the imported package from a package file;
 - `private import` is permitted but equivalent to an omitted visibility
   modifier.
 
-Selective imports and import aliasing are not available in Vox.
+Selective imports, nested selective imports, and explicit module/item aliasing
+are supported by the frontend and runtime. An explicit module alias replaces
+the implicit final segment binding.
 
 ## 5. Script Parameters
 

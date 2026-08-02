@@ -168,19 +168,28 @@ ImportDecl
    |  "import" ModulePath "." "(" ImportItem ("," ImportItem)* ","? ")" ";"
 
 ImportItem
-  ::= Identifier
-   |  Identifier "as" Identifier
+  ::= Identifier ImportTree?
+   |  Identifier "as" Identifier ImportTree?
+
+ImportTree
+  ::= "." "(" ImportItem ("," ImportItem)* ","? ")"
 ```
 
 ### 7.1. Wildcard Import
 
-A bare import makes all public symbols from the target package available. If a
-symbol name is provided by exactly one imported package, it may be used
-unqualified. If multiple imports provide the same name, that symbol must be used
-with a qualified path.
+A bare import binds the package under the final segment of its module path and
+makes all public symbols from the target package available. For example,
+`import foo` is referenced as `foo.bar`, while `import foo.bar` is referenced as
+`bar`. If a symbol name is provided by exactly one imported package, it may also
+be used unqualified. If multiple imports provide the same name, that symbol must
+be used with a qualified path.
 
 ```
-import foo.bar;     // foo.bar provides baz and qux
+import foo;         // foo provides bar
+foo.bar();
+
+import foo.bar;     // foo.bar provides baz and qux; it is bound as `bar`
+bar.baz();
 baz();              // ok: only foo.bar provides baz
 foo.bar.qux();      // always works
 ```
@@ -204,13 +213,19 @@ other.baz();                     // ok
 ### 7.3. Selective Import
 
 A parenthesised list after a `.` imports only the named symbols, with optional
-per-item aliasing.
+per-item aliasing. Import items may contain nested lists, which continue through
+the corresponding package path.
 
 ```
 import foo.bar.(baz, goo as go);
 baz();              // shorthand: equivalent to foo.bar.baz
 go();               // aliased: equivalent to foo.bar.goo
 foo.bar.goo();      // original name still works
+
+import foo.(bar, nested.(baz, qux as renamed));
+bar();              // imported from foo
+baz();              // imported from foo.nested
+renamed();          // imported from foo.nested.qux
 ```
 
 ### 7.4. Public Import Aliasing

@@ -15,11 +15,13 @@ pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportRes
     let mut unqualified_sources: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut explicit: BTreeMap<String, String> = BTreeMap::new();
 
-    for import in imports {
+    for import in imports.iter().flat_map(ImportDecl::expanded) {
         let module_str = import.module.to_source_string();
 
         if let Some(alias) = &import.alias {
             module_aliases.insert(alias.clone(), module_str.clone());
+        } else if let Some(binding) = import.module.segments.last() {
+            module_aliases.insert(binding.clone(), module_str.clone());
         }
 
         let manifest = host.package(

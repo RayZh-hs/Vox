@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
-    Expr, ExprKind, ForHeader, FunctionDecl, IntrinsicExpr, LocalValueDecl, Mutability,
+    Expr, ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LocalValueDecl, Mutability,
     QualifiedName, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
     UpdatedPathSegment, ValueDecl, WhenExpr,
 };
@@ -445,8 +445,16 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn collect_imports(&mut self) -> Result<(), String> {
-        for item in &self.unit.items {
-            if let TopLevelItem::Import(import) = item {
+        for import in self
+            .unit
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Import(import) => Some(import),
+                _ => None,
+            })
+            .flat_map(ImportDecl::expanded)
+        {
                 let name = import.module.to_source_string();
                 let manifest = self
                     .manifests
@@ -470,6 +478,15 @@ impl<'a> TypeEngine<'a> {
                         },
                     );
                     self.module_aliases.insert(alias.clone(), name.clone());
+                } else if let Some(binding) = import.module.segments.last() {
+                    self.imports.insert(
+                        binding.clone(),
+                        ImportedPackage {
+                            manifest: Some(manifest.clone()),
+                            selective: selective.clone(),
+                        },
+                    );
+                    self.module_aliases.insert(binding.clone(), name.clone());
                 }
 
                 self.imports.insert(
@@ -485,7 +502,6 @@ impl<'a> TypeEngine<'a> {
                     seen.insert(name.clone());
                     self.collect_reexported_imports(&name, &manifest, &mut seen)?;
                 }
-            }
         }
         Ok(())
     }
@@ -1920,6 +1936,9 @@ impl<'a> TypeEngine<'a> {
         let mut candidates: Vec<(String, ImportedSymbol<'_>)> = Vec::new();
         for (import_path, imported) in &self.imports {
             if let Some(manifest) = &imported.manifest {
+                if manifest.package.as_str() != *import_path {
+                    continue;
+                }
                 if let Some(selective) = &imported.selective {
                     for (name, alias) in selective {
                         let effective = alias.as_ref().unwrap_or(name);
@@ -2095,8 +2114,11 @@ impl<'a> TypeEngine<'a> {
             }
         }
 
-        for (_, imported) in &self.imports {
+        for (import_path, imported) in &self.imports {
             if let Some(manifest) = &imported.manifest {
+                if manifest.package.as_str() != *import_path {
+                    continue;
+                }
                 if let Some(selective) = &imported.selective {
                     for (fn_name, alias) in selective {
                         let effective = alias.as_ref().unwrap_or(fn_name);

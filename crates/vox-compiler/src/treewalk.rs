@@ -34,7 +34,7 @@ impl TreewalkScript {
 
         for item in &frontend.syntax.items {
             match item {
-                TopLevelItem::Import(import) => imports.push(import.clone()),
+                TopLevelItem::Import(import) => imports.extend(import.expanded()),
                 TopLevelItem::Param(param) => parameters.push(param.clone()),
                 TopLevelItem::Value(value) => values.push(value.clone()),
                 TopLevelItem::Function(function) => functions.push(function.clone()),

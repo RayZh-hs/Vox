@@ -718,6 +718,8 @@ impl ModuleState {
         self.imports.iter().find(|import| {
             import.module.to_source_string() == path
                 || import.alias.as_ref().is_some_and(|alias| alias == path)
+                || (import.alias.is_none()
+                    && import.module.segments.last().is_some_and(|binding| binding == path))
         })
     }
 

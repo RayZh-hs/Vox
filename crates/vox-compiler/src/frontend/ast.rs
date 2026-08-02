@@ -117,7 +117,44 @@ pub struct ImportDecl {
 pub struct ImportItem {
     pub name: String,
     pub alias: Option<String>,
+    pub items: Option<Vec<ImportItem>>,
     pub span: TextSpan,
+}
+
+impl ImportDecl {
+    pub fn expanded(&self) -> Vec<ImportDecl> {
+        let Some(items) = &self.items else {
+            return vec![self.clone()];
+        };
+
+        let direct = items
+            .iter()
+            .filter(|item| item.items.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut imports = Vec::new();
+        if !direct.is_empty() || items.is_empty() {
+            let mut root = self.clone();
+            root.items = Some(direct);
+            imports.push(root);
+        }
+
+        for item in items.iter().filter(|item| item.items.is_some()) {
+            let mut module = self.module.clone();
+            module.segments.push(item.name.clone());
+            let nested = ImportDecl {
+                docs: self.docs.clone(),
+                visibility: self.visibility,
+                module,
+                alias: item.alias.clone(),
+                items: item.items.clone(),
+                span: item.span.clone(),
+            };
+            imports.extend(nested.expanded());
+        }
+
+        imports
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

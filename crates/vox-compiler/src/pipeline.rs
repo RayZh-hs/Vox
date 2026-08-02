@@ -233,10 +233,12 @@ fn public_reexports(frontend: &FrontendUnit) -> Vec<ModulePath> {
         .iter()
         .filter_map(|item| match item {
             TopLevelItem::Import(import) if matches!(import.visibility, Visibility::Public) => {
-                ModulePath::parse(&import.module.to_source_string()).ok()
+                Some(import.expanded())
             }
             _ => None,
         })
+        .flatten()
+        .filter_map(|import| ModulePath::parse(&import.module.to_source_string()).ok())
         .collect()
 }
 

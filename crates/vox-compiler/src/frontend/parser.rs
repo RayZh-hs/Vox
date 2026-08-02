@@ -457,34 +457,7 @@ impl Parser {
                 TokenKind::LParen,
                 "expected `(` after `.` for selective import list",
             )?;
-            let mut items = Vec::new();
-            while !self.at(TokenKind::RParen) {
-                let item_start = self.current().span.start;
-                let (name, _) = self.expect_identifier("expected imported name")?;
-                let item_alias = if self.consume(TokenKind::As) {
-                    let (alias_name, _) =
-                        self.expect_identifier("expected alias name after `as`")?;
-                    Some(alias_name)
-                } else {
-                    None
-                };
-                items.push(ImportItem {
-                    name,
-                    alias: item_alias,
-                    span: TextSpan::new(item_start, self.previous().span.end),
-                });
-                if !self.consume(TokenKind::Comma) {
-                    break;
-                }
-                if self.at(TokenKind::RParen) {
-                    break;
-                }
-            }
-            self.expect_simple(
-                TokenKind::RParen,
-                "expected `)` after selective import list",
-            )?;
-            Some(items)
+            Some(self.parse_import_items()?)
         } else {
             None
         };
@@ -501,6 +474,44 @@ impl Parser {
             items,
             span: TextSpan::new(start, self.previous().span.end),
         })
+    }
+
+    fn parse_import_items(&mut self) -> Result<Vec<ImportItem>, DiagnosticBag> {
+        let mut items = Vec::new();
+        while !self.at(TokenKind::RParen) {
+            let item_start = self.current().span.start;
+            let (name, _) = self.expect_identifier("expected imported name")?;
+            let item_alias = if self.consume(TokenKind::As) {
+                let (alias_name, _) =
+                    self.expect_identifier("expected alias name after `as`")?;
+                Some(alias_name)
+            } else {
+                None
+            };
+            let nested = if self.consume(TokenKind::Dot) {
+                self.expect_simple(
+                    TokenKind::LParen,
+                    "expected `(` after `.` for nested import list",
+                )?;
+                Some(self.parse_import_items()?)
+            } else {
+                None
+            };
+            items.push(ImportItem {
+                name,
+                alias: item_alias,
+                items: nested,
+                span: TextSpan::new(item_start, self.previous().span.end),
+            });
+            if !self.consume(TokenKind::Comma) {
+                break;
+            }
+            if self.at(TokenKind::RParen) {
+                break;
+            }
+        }
+        self.expect_simple(TokenKind::RParen, "expected `)` after nested import list")?;
+        Ok(items)
     }
 
     fn parse_import_module_path(&mut self) -> Result<QualifiedName, DiagnosticBag> {
