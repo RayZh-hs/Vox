@@ -427,6 +427,19 @@ impl ModuleState {
         }
     }
 
+    fn mutable_struct_field(&self, type_name: &str, field_name: &str) -> bool {
+        let local_name = type_name.rsplit('.').next().unwrap_or(type_name);
+        self.structs
+            .get(local_name)
+            .and_then(|structure| {
+                structure
+                    .fields
+                    .iter()
+                    .find(|field| field.name == field_name)
+            })
+            .is_some_and(|field| matches!(field.mutability, Mutability::Var))
+    }
+
     fn native_instance_method(
         self: &Rc<Self>,
         owner: &str,
@@ -1090,9 +1103,21 @@ impl<'a> EvalContext<'a> {
             }
             BlockItem::Assignment(assignment) => {
                 let value = self.eval_expr(&assignment.value)?;
-                self.module.assign_script_binding(&assignment.name, value)
+                if let Some(target) = &assignment.target {
+                    let target = self.eval_expr(target)?;
+                    self.assign_struct_field(target, &assignment.name, value)
+                } else {
+                    self.module.assign_script_binding(&assignment.name, value)
+                }
             }
             BlockItem::CompoundAssignment(assignment) => {
+                if let Some(target) = &assignment.target {
+                    let target = self.eval_expr(target)?;
+                    let current = self.eval_field(target.clone(), &assignment.name)?;
+                    let rhs = self.eval_expr(&assignment.value)?;
+                    let next = self.eval_compound_assignment(current, rhs, assignment.op)?;
+                    return self.assign_struct_field(target, &assignment.name, next);
+                }
                 let current = self
                     .module
                     .script_binding(&assignment.name)
@@ -1673,7 +1698,7 @@ impl<'a> EvalContext<'a> {
             Value::Record(fields) => fields.get(name).cloned().ok_or_else(|| {
                 EvalError::Message(format!("record does not contain field `{name}`"))
             }),
-            Value::Struct { fields, .. } => fields.get(name).cloned().ok_or_else(|| {
+            Value::Struct { fields, .. } => fields.borrow().get(name).cloned().ok_or_else(|| {
                 EvalError::Message(format!("struct does not contain field `{name}`"))
             }),
             other => Err(EvalError::Message(format!(
@@ -1681,6 +1706,26 @@ impl<'a> EvalContext<'a> {
                 other.type_name()
             ))),
         }
+    }
+
+    fn assign_struct_field(
+        &self,
+        target: Value,
+        name: &str,
+        value: Value,
+    ) -> Result<(), EvalError> {
+        let Value::Struct { type_name, fields } = target else {
+            return Err(EvalError::Message(
+                "field assignment requires a native struct value".to_owned(),
+            ));
+        };
+        if !self.module.mutable_struct_field(&type_name, name) {
+            return Err(EvalError::Message(format!(
+                "cannot assign to immutable field `{name}` of `{type_name}`"
+            )));
+        }
+        fields.borrow_mut().insert(name.to_owned(), value);
+        Ok(())
     }
 
     fn apply_updated_path(
@@ -1708,14 +1753,8 @@ impl<'a> EvalContext<'a> {
                 fields.insert(name.clone(), next);
                 Ok(Value::Record(fields))
             }
-            (
-                Value::Struct {
-                    type_name,
-                    mut fields,
-                },
-                UpdatedPathSegment::Field(name),
-            ) => {
-                let current = fields.get(name).cloned().ok_or_else(|| {
+            (Value::Struct { type_name, fields }, UpdatedPathSegment::Field(name)) => {
+                let current = fields.borrow().get(name).cloned().ok_or_else(|| {
                     EvalError::Message(format!("struct does not contain field `{name}`"))
                 })?;
                 let next = if rest.is_empty() {
@@ -1723,8 +1762,12 @@ impl<'a> EvalContext<'a> {
                 } else {
                     self.apply_updated_path(current, rest, replacement)?
                 };
-                fields.insert(name.clone(), next);
-                Ok(Value::Struct { type_name, fields })
+                let mut copied = fields.borrow().clone();
+                copied.insert(name.clone(), next);
+                Ok(Value::Struct {
+                    type_name,
+                    fields: Rc::new(RefCell::new(copied)),
+                })
             }
             (Value::Record(_), UpdatedPathSegment::Index(index)) => Err(EvalError::Message(
                 format!("record updates require a field name, found `#{index}`"),
@@ -2007,9 +2050,21 @@ impl<'a> EvalContext<'a> {
             }
             BlockItem::Assignment(assignment) => {
                 let value = self.eval_expr(&assignment.value)?;
-                self.assign_local(&assignment.name, value)
+                if let Some(target) = &assignment.target {
+                    let target = self.eval_expr(target)?;
+                    self.assign_struct_field(target, &assignment.name, value)
+                } else {
+                    self.assign_local(&assignment.name, value)
+                }
             }
             BlockItem::CompoundAssignment(assignment) => {
+                if let Some(target) = &assignment.target {
+                    let target = self.eval_expr(target)?;
+                    let current = self.eval_field(target.clone(), &assignment.name)?;
+                    let rhs = self.eval_expr(&assignment.value)?;
+                    let next = self.eval_compound_assignment(current, rhs, assignment.op)?;
+                    return self.assign_struct_field(target, &assignment.name, next);
+                }
                 let current = self.lookup_local_binding(&assignment.name)?;
                 if !current.mutable {
                     return Err(EvalError::Message(format!(
@@ -3003,7 +3058,7 @@ impl NativeFunction {
                 }
                 Ok(Value::Struct {
                     type_name: self.module.native_type_name(owner),
-                    fields: values,
+                    fields: Rc::new(RefCell::new(values)),
                 })
             }
             NativeFunctionKind::PackageConstructor { package, type_name } => {
@@ -3035,7 +3090,7 @@ impl NativeFunction {
                 )?;
                 Ok(Value::Struct {
                     type_name: format!("{}.{}", package.as_str(), type_name),
-                    fields: assigned,
+                    fields: Rc::new(RefCell::new(assigned)),
                 })
             }
             NativeFunctionKind::Associated { owner, method } => {
@@ -3522,7 +3577,7 @@ pub(crate) enum Value {
     Record(BTreeMap<String, Value>),
     Struct {
         type_name: String,
-        fields: BTreeMap<String, Value>,
+        fields: Rc<RefCell<BTreeMap<String, Value>>>,
     },
     Range(RangeValue),
     Function(Rc<FunctionValue>),
@@ -3695,6 +3750,8 @@ impl Value {
                     fields: right,
                 },
             ) => {
+                let left = left.borrow();
+                let right = right.borrow();
                 left_name == right_name
                     && left.len() == right.len()
                     && left.iter().all(|(name, value)| {
@@ -3758,6 +3815,7 @@ impl Value {
             }
             Self::Struct { type_name, fields } => {
                 let entries = fields
+                    .borrow()
                     .iter()
                     .map(|(name, value)| format!("{name} = {}", value.render()))
                     .collect::<Vec<_>>();

@@ -608,6 +608,7 @@ pub enum BlockItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssignmentStatement {
+    pub target: Option<Expr>,
     pub name: String,
     pub value: Expr,
     pub span: TextSpan,
@@ -624,6 +625,7 @@ pub enum CompoundAssignmentOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompoundAssignmentStatement {
+    pub target: Option<Expr>,
     pub name: String,
     pub op: CompoundAssignmentOp,
     pub value: Expr,

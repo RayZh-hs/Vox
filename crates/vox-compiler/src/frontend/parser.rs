@@ -1912,21 +1912,28 @@ impl Parser {
     }
 
     fn try_parse_assignment_statement(&mut self) -> Result<Option<BlockItem>, DiagnosticBag> {
-        let TokenKind::Identifier(name) = self.current().kind.clone() else {
+        if !matches!(self.current().kind, TokenKind::Identifier(_)) {
             return Ok(None);
-        };
+        }
 
-        let Some(next) = self.peek_kind(1) else {
-            return Ok(None);
-        };
-
+        let checkpoint = self.index;
         let start = self.current().span.start;
-        match next {
+        let target_expr = self.parse_expr()?;
+        let (target, name) = match target_expr.kind {
+            ExprKind::Name(name) if name.segments.len() == 1 => (None, name.segments[0].clone()),
+            ExprKind::Field { target, name } => (Some(*target), name),
+            _ => {
+                self.index = checkpoint;
+                return Ok(None);
+            }
+        };
+        match self.current().kind {
             TokenKind::Assign => {
-                self.index += 2;
+                self.index += 1;
                 let value = self.parse_expr()?;
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after assignment")?;
                 Ok(Some(BlockItem::Assignment(AssignmentStatement {
+                    target,
                     name,
                     span: TextSpan::new(start, self.previous().span.end),
                     value,
@@ -1937,7 +1944,6 @@ impl Parser {
             | TokenKind::StarEq
             | TokenKind::SlashEq
             | TokenKind::PercentEq => {
-                self.index += 1;
                 let op = match self.bump().kind {
                     TokenKind::PlusEq => CompoundAssignmentOp::Add,
                     TokenKind::MinusEq => CompoundAssignmentOp::Subtract,
@@ -1953,6 +1959,7 @@ impl Parser {
                 )?;
                 Ok(Some(BlockItem::CompoundAssignment(
                     CompoundAssignmentStatement {
+                        target,
                         name,
                         op,
                         value,
@@ -1960,7 +1967,10 @@ impl Parser {
                     },
                 )))
             }
-            _ => Ok(None),
+            _ => {
+                self.index = checkpoint;
+                Ok(None)
+            }
         }
     }
 
@@ -2062,6 +2072,7 @@ impl Parser {
                 let value = self.parse_expr()?;
                 let end = value.span.end;
                 Ok(BlockItem::Assignment(AssignmentStatement {
+                    target: None,
                     name,
                     value,
                     span: TextSpan::new(start, end),
@@ -2083,6 +2094,7 @@ impl Parser {
                 };
                 let value = self.parse_expr()?;
                 Ok(BlockItem::CompoundAssignment(CompoundAssignmentStatement {
+                    target: None,
                     name,
                     op,
                     value,

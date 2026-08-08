@@ -1247,6 +1247,8 @@ impl<'a> TypeEngine<'a> {
         scope: &mut TypeScope,
     ) -> Result<BTreeSet<String>, String> {
         let captured_values = self.validate_function_captures(function, scope)?;
+        let previous_evil = scope.evil;
+        scope.evil = function.evil;
         scope.generic_parameters = generic_parameter_scope(&function.generic_parameters);
         for parameter in &function.parameters {
             scope.values.insert(
@@ -1277,6 +1279,7 @@ impl<'a> TypeEngine<'a> {
         if let Some(existing) = self.functions.get_mut(&function.name) {
             existing.summary.return_type = return_type;
         }
+        scope.evil = previous_evil;
         Ok(captured_values)
     }
 
@@ -1740,6 +1743,22 @@ impl<'a> TypeEngine<'a> {
             match item {
                 BlockItem::LocalValue(value) => self.infer_local_value(value, &mut nested)?,
                 BlockItem::Assignment(assignment) => {
+                    if let Some(target) = &assignment.target {
+                        if !nested.evil {
+                            return Err("field assignment requires an `evil` function".to_owned());
+                        }
+                        let target_ty = self.infer_expr(target, &mut nested)?;
+                        let field_ty = self.native_field_type(&target_ty, &assignment.name)?;
+                        let next = self.infer_expr(&assignment.value, &mut nested)?;
+                        if !next.is_assignable_to(&field_ty) {
+                            return Err(format!(
+                                "cannot assign `{}` to `{}`",
+                                next.render(),
+                                field_ty.render()
+                            ));
+                        }
+                        continue;
+                    }
                     let current = nested
                         .values
                         .get(&assignment.name)
@@ -1761,6 +1780,16 @@ impl<'a> TypeEngine<'a> {
                     }
                 }
                 BlockItem::CompoundAssignment(assignment) => {
+                    if let Some(target) = &assignment.target {
+                        if !scope.evil {
+                            return Err("field assignment requires an `evil` function".to_owned());
+                        }
+                        let target_ty = self.infer_expr(target, &mut nested)?;
+                        let field_ty = self.native_field_type(&target_ty, &assignment.name)?;
+                        let rhs = self.infer_expr(&assignment.value, &mut nested)?;
+                        self.infer_compound_assignment(&field_ty, &rhs, assignment.op)?;
+                        continue;
+                    }
                     let current = nested
                         .values
                         .get(&assignment.name)
@@ -1980,6 +2009,21 @@ impl<'a> TypeEngine<'a> {
                 .ok_or_else(|| format!("trait `{trait_name}` has no field `{name}`")),
             other => Err(format!("cannot access field on `{}`", other.render())),
         }
+    }
+
+    fn native_field_type(&self, target_type: &ReplType, field: &str) -> Result<ReplType, String> {
+        let ReplType::Named { name, .. } = target_type else {
+            return Err("field assignment requires a native struct receiver".to_owned());
+        };
+        self.local_types
+            .values()
+            .find(|ty| {
+                ty.name.name == *name
+                    || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == *name
+            })
+            .and_then(|ty| ty.fields.iter().find(|candidate| candidate.name == field))
+            .map(|field| from_vox_host_type(&field.ty))
+            .ok_or_else(|| format!("type `{name}` has no field `{field}`"))
     }
 
     fn infer_updated(
@@ -3095,6 +3139,7 @@ impl<'a> CaptureNameCollector<'a> {
 struct TypeScope {
     values: BTreeMap<String, LocalBinding>,
     generic_parameters: BTreeMap<String, GenericParameterSummary>,
+    evil: bool,
 }
 
 #[derive(Debug, Clone)]
