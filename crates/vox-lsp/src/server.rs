@@ -563,7 +563,10 @@ fn type_name_span(
             })
             .or_else(|| visit_expr(&function.body, name)),
         TopLevelItem::Statement(item) => visit_block_item(item, name),
-        TopLevelItem::Import(_) => None,
+        TopLevelItem::Import(_)
+        | TopLevelItem::Struct(_)
+        | TopLevelItem::Trait(_)
+        | TopLevelItem::Impl(_) => None,
     })
 }
 
@@ -738,7 +741,12 @@ fn declaration_name_span(
         }
         TopLevelItem::Function(function) => visit_expr(source, &function.body, name),
         TopLevelItem::Statement(item) => visit_block_item(source, item, name),
-        TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Value(_) => None,
+        TopLevelItem::Import(_)
+        | TopLevelItem::Param(_)
+        | TopLevelItem::Value(_)
+        | TopLevelItem::Struct(_)
+        | TopLevelItem::Trait(_)
+        | TopLevelItem::Impl(_) => None,
     })
 }
 
@@ -916,6 +924,9 @@ fn item_span(item: &vox_compiler::frontend::ast::TopLevelItem) -> vox_core::diag
         TopLevelItem::Param(p) => p.span.clone(),
         TopLevelItem::Value(v) => v.span.clone(),
         TopLevelItem::Function(f) => f.span.clone(),
+        TopLevelItem::Struct(s) => s.span.clone(),
+        TopLevelItem::Trait(t) => t.span.clone(),
+        TopLevelItem::Impl(i) => i.span.clone(),
         TopLevelItem::Statement(s) => block_item_span(s),
     }
 }
@@ -1050,6 +1061,9 @@ fn compute_semantic_tokens(source: &str) -> Vec<SemanticToken> {
             | TokenKind::Public
             | TokenKind::Return
             | TokenKind::Script
+            | TokenKind::Struct
+            | TokenKind::Trait
+            | TokenKind::Impl
             | TokenKind::True
             | TokenKind::Val
             | TokenKind::Var
@@ -1143,6 +1157,9 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
                 SymbolKind::MODULE,
                 i.span.clone(),
             ),
+            TopLevelItem::Struct(s) => (s.name.clone(), SymbolKind::STRUCT, s.span.clone()),
+            TopLevelItem::Trait(t) => (t.name.clone(), SymbolKind::INTERFACE, t.span.clone()),
+            TopLevelItem::Impl(_) => continue,
             TopLevelItem::Statement(_) => continue,
         };
 
@@ -1372,6 +1389,7 @@ fn build_symbol_table(
                     symbols.insert(last.clone(), i.span.clone());
                 }
             }
+            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
             TopLevelItem::Statement(s) => match s {
                 BlockItem::LocalValue(lv) => {
                     symbols.insert(lv.name.clone(), lv.span.clone());
@@ -1687,6 +1705,7 @@ fn find_name_at_offset(
                 }
             }
             TopLevelItem::Import(_) => {}
+            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
         }
     }
 
@@ -2056,6 +2075,7 @@ fn collect_references(
                     spans.push(i.module.span.clone());
                 }
             }
+            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
             TopLevelItem::Statement(s) => collect_in_block_item(s, target, &mut spans),
         }
     }
@@ -2369,6 +2389,7 @@ fn find_call_at_offset(
                 _ => {}
             },
             TopLevelItem::Import(_) => {}
+            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
         }
     }
 
@@ -2671,6 +2692,13 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
                     .entry(i.module.to_source_string())
                     .or_insert(CompletionItemKind::MODULE);
             }
+            TopLevelItem::Struct(s) => {
+                names.entry(s.name.clone()).or_insert(CompletionItemKind::STRUCT);
+            }
+            TopLevelItem::Trait(t) => {
+                names.entry(t.name.clone()).or_insert(CompletionItemKind::INTERFACE);
+            }
+            TopLevelItem::Impl(_) => {}
         }
     }
 
@@ -3140,6 +3168,7 @@ fn build_hover_decls(
                 }
             }
             TopLevelItem::Import(_) => {}
+            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
             TopLevelItem::Statement(statement) => {
                 walk_block_item(source, statement, env, &mut declarations);
             }

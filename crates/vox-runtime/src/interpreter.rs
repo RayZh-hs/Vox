@@ -880,7 +880,11 @@ impl<'a> EvalContext<'a> {
 
     fn eval_top_level_item(&mut self, item: &TopLevelItem) -> Result<(), EvalError> {
         match item {
-            TopLevelItem::Import(_) | TopLevelItem::Param(_) => Ok(()),
+            TopLevelItem::Import(_)
+            | TopLevelItem::Param(_)
+            | TopLevelItem::Struct(_)
+            | TopLevelItem::Trait(_)
+            | TopLevelItem::Impl(_) => Ok(()),
             TopLevelItem::Function(function) => {
                 let captured = self.capture_function_bindings(function)?;
                 self.module

@@ -138,6 +138,13 @@ fn item_key(item: &TopLevelItem) -> EditableKey {
         TopLevelItem::Param(param) => EditableKey::Symbol(param.name.clone()),
         TopLevelItem::Value(value) => EditableKey::Symbol(value.name.clone()),
         TopLevelItem::Function(function) => EditableKey::Symbol(function.name.clone()),
+        TopLevelItem::Struct(structure) => EditableKey::Symbol(structure.name.clone()),
+        TopLevelItem::Trait(trait_decl) => EditableKey::Symbol(trait_decl.name.clone()),
+        TopLevelItem::Impl(implementation) => EditableKey::Symbol(format!(
+            "impl {} for {}",
+            implementation.trait_name.to_source_string(),
+            implementation.struct_name.to_source_string()
+        )),
         TopLevelItem::Statement(_) => EditableKey::Statement,
     }
 }
@@ -148,6 +155,9 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
         TopLevelItem::Param(param) => &param.span,
         TopLevelItem::Value(value) => &value.span,
         TopLevelItem::Function(function) => &function.span,
+        TopLevelItem::Struct(structure) => &structure.span,
+        TopLevelItem::Trait(trait_decl) => &trait_decl.span,
+        TopLevelItem::Impl(implementation) => &implementation.span,
         TopLevelItem::Statement(statement) => match statement {
             BlockItem::LocalValue(value) => &value.span,
             BlockItem::Assignment(assignment) => &assignment.span,

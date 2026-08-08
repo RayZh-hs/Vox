@@ -141,7 +141,12 @@ fn rank_module(unit: &CompilationUnit, level: OptimizationLevel) -> Optimization
         match item {
             TopLevelItem::Value(value) => visit_value(value, &mut features),
             TopLevelItem::Statement(statement) => visit_block_item(statement, &mut features),
-            TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Function(_) => {}
+            TopLevelItem::Import(_)
+            | TopLevelItem::Param(_)
+            | TopLevelItem::Function(_)
+            | TopLevelItem::Struct(_)
+            | TopLevelItem::Trait(_)
+            | TopLevelItem::Impl(_) => {}
         }
     }
     if let Some(result) = &unit.result {

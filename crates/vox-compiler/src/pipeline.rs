@@ -193,11 +193,82 @@ pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> Result<Package
         });
     }
 
-    Ok(PackageManifest {
+    Ok(surface_manifest_from_frontend(frontend))
+}
+
+pub fn surface_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifest {
+    PackageManifest {
         package: frontend.header.module.clone(),
         reexports: public_reexports(frontend),
-        types: Vec::new(),
-        traits: Vec::new(),
+        types: frontend
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Struct(structure)
+                    if matches!(structure.visibility, Visibility::Public) =>
+                {
+                    Some(vox_core::host::TypeSpec {
+                        name: vox_core::types::QualifiedTypeName {
+                            module: frontend.header.module.clone(),
+                            name: structure.name.clone(),
+                        },
+                        fields: structure
+                            .fields
+                            .iter()
+                            .filter(|field| matches!(field.visibility, Visibility::Public))
+                            .map(|field| vox_core::host::FieldSpec {
+                                name: field.name.clone(),
+                                ty: VoxType::opaque_surface(field.ty.to_source_string()),
+                            })
+                            .collect(),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        traits: frontend
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Trait(trait_decl)
+                    if matches!(trait_decl.visibility, Visibility::Public) =>
+                {
+                    Some(vox_core::host::TraitSpec {
+                        name: vox_core::types::QualifiedTypeName {
+                            module: frontend.header.module.clone(),
+                            name: trait_decl.name.clone(),
+                        },
+                        methods: trait_decl
+                            .methods
+                            .iter()
+                            .filter(|method| matches!(method.visibility, Visibility::Public))
+                            .map(|method| vox_core::host::TraitMethodSpec {
+                                name: method.name.clone(),
+                                lowered_by: format!("{}.{}", trait_decl.name, method.name),
+                                parameters: method
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| ParameterSpec {
+                                        name: parameter.name.clone(),
+                                        ty: VoxType::opaque_surface(parameter.ty.to_source_string()),
+                                        has_default: parameter.default.is_some(),
+                                    })
+                                    .collect(),
+                                return_type: method
+                                    .return_type
+                                    .as_ref()
+                                    .map(|ty| VoxType::opaque_surface(ty.to_source_string()))
+                                    .unwrap_or_else(|| VoxType::opaque_surface(format!("{} return type", method.name))),
+                                purity: if method.evil { Purity::Evil } else { Purity::Pure },
+                            })
+                            .collect(),
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
         functions: frontend
             .syntax
             .items
@@ -222,8 +293,29 @@ pub fn package_manifest_from_frontend(frontend: &FrontendUnit) -> Result<Package
                 _ => None,
             })
             .collect(),
-        trait_impls: BTreeMap::new(),
-    })
+        trait_impls: frontend
+            .syntax
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Impl(implementation) => {
+                    let trait_name = vox_core::types::QualifiedTypeName {
+                        module: frontend.header.module.clone(),
+                        name: implementation.trait_name.to_source_string(),
+                    };
+                    let struct_name = vox_core::types::QualifiedTypeName {
+                        module: frontend.header.module.clone(),
+                        name: implementation.struct_name.to_source_string(),
+                    };
+                    Some((trait_name, struct_name))
+                }
+                _ => None,
+            })
+            .fold(BTreeMap::new(), |mut impls, (trait_name, struct_name)| {
+                impls.entry(trait_name).or_default().insert(struct_name);
+                impls
+            }),
+    }
 }
 
 fn public_reexports(frontend: &FrontendUnit) -> Vec<ModulePath> {

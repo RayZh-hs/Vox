@@ -100,6 +100,9 @@ pub enum TopLevelItem {
     Param(ParamDecl),
     Value(ValueDecl),
     Function(FunctionDecl),
+    Struct(StructDecl),
+    Trait(TraitDecl),
+    Impl(ImplDecl),
     Statement(BlockItem),
 }
 
@@ -191,11 +194,66 @@ pub struct FunctionDecl {
     pub docs: Vec<String>,
     pub visibility: Visibility,
     pub evil: bool,
+    pub associated: bool,
     pub name: String,
     pub generic_parameters: Vec<GenericParameter>,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeSyntax>,
     pub body: Expr,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructDecl {
+    pub docs: Vec<String>,
+    pub visibility: Visibility,
+    pub name: String,
+    pub fields: Vec<StructFieldDecl>,
+    pub methods: Vec<FunctionDecl>,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructFieldDecl {
+    pub docs: Vec<String>,
+    pub visibility: Visibility,
+    pub mutability: Mutability,
+    pub name: String,
+    pub ty: TypeSyntax,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitDecl {
+    pub docs: Vec<String>,
+    pub visibility: Visibility,
+    pub name: String,
+    pub fields: Vec<StructFieldDecl>,
+    pub methods: Vec<TraitMethodDecl>,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraitMethodDecl {
+    pub docs: Vec<String>,
+    pub visibility: Visibility,
+    pub evil: bool,
+    pub associated: bool,
+    pub name: String,
+    pub generic_parameters: Vec<GenericParameter>,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<TypeSyntax>,
+    pub body: Option<Expr>,
+    pub span: TextSpan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplDecl {
+    pub docs: Vec<String>,
+    pub visibility: Visibility,
+    pub trait_name: QualifiedName,
+    pub struct_name: QualifiedName,
+    pub methods: Vec<FunctionDecl>,
     pub span: TextSpan,
 }
 

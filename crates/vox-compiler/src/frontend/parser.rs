@@ -14,7 +14,8 @@ use crate::frontend::{
         LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
         QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement, StringLiteral,
         StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg, UpdatedIntrinsic,
-        UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
+        UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr, StructDecl,
+        StructFieldDecl, TraitDecl, TraitMethodDecl, ImplDecl,
     },
     lexer::{LexedStringPart, Lexer, Token, TokenKind},
 };
@@ -323,6 +324,24 @@ impl Parser {
             return Ok(Some(TopLevelItem::Function(function)));
         }
 
+        if self.at(TokenKind::Struct) {
+            return Ok(Some(TopLevelItem::Struct(
+                self.parse_struct_decl(docs, visibility)?,
+            )));
+        }
+
+        if self.at(TokenKind::Trait) {
+            return Ok(Some(TopLevelItem::Trait(
+                self.parse_trait_decl(docs, visibility)?,
+            )));
+        }
+
+        if self.at(TokenKind::Impl) {
+            return Ok(Some(TopLevelItem::Impl(
+                self.parse_impl_decl(docs, visibility)?,
+            )));
+        }
+
         if self.index > 0
             && matches!(
                 self.tokens[self.index - 1].kind,
@@ -330,7 +349,7 @@ impl Parser {
             )
         {
             return self.error_here(
-                "visibility modifiers apply only to import, value, and function declarations",
+                "visibility modifiers apply only to declarations",
             );
         }
 
@@ -423,6 +442,7 @@ impl Parser {
                     }
                 }
                 TopLevelItem::Import(_) => {}
+                TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
                 TopLevelItem::Param(_) | TopLevelItem::Statement(_) => {
                     return Err(DiagnosticBag::from(vec![
                         Diagnostic::error(
@@ -666,11 +686,294 @@ impl Parser {
             docs,
             visibility,
             evil,
+            associated: false,
             name,
             generic_parameters,
             parameters,
             return_type,
             span: TextSpan::new(start, end),
+            body,
+        })
+    }
+
+    fn parse_struct_decl(
+        &mut self,
+        docs: Vec<String>,
+        visibility: Visibility,
+    ) -> Result<StructDecl, DiagnosticBag> {
+        let start = self.current().span.start;
+        self.expect_simple(TokenKind::Struct, "expected `struct`")?;
+        let (name, _) = self.expect_identifier("expected struct name")?;
+        self.expect_simple(TokenKind::LBrace, "expected `{` after struct name")?;
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        while !self.at(TokenKind::RBrace) {
+            let member_docs = self.take_doc_comments();
+            let member_visibility = self.parse_visibility().unwrap_or(Visibility::Public);
+            let member_start = self.current().span.start;
+            if self.at(TokenKind::Val) || self.at(TokenKind::Var) {
+                let mutability = self.parse_mutability()?;
+                let (field_name, _) = self.expect_identifier("expected struct field name")?;
+                self.expect_simple(TokenKind::Colon, "expected `:` after struct field name")?;
+                let ty = self.parse_type()?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after struct field")?;
+                fields.push(StructFieldDecl {
+                    docs: member_docs,
+                    visibility: member_visibility,
+                    mutability,
+                    name: field_name,
+                    ty,
+                    span: TextSpan::new(member_start, self.previous().span.end),
+                });
+                continue;
+            }
+            let associated = self.consume(TokenKind::Struct);
+            let evil = self.consume(TokenKind::Evil);
+            self.expect_simple(TokenKind::Fun, "expected `fun` in struct declaration")?;
+            let (method_name, _) = self.expect_identifier("expected struct function name")?;
+            methods.push(self.parse_function_tail(
+                member_docs,
+                member_visibility,
+                evil,
+                method_name,
+                member_start,
+                associated,
+            )?);
+            if !associated {
+                let method = methods.last_mut().expect("method was just pushed");
+                method.parameters.insert(
+                    0,
+                    Parameter {
+                        name: "self".to_owned(),
+                        ty: TypeSyntax {
+                            kind: TypeKind::Named {
+                                name: QualifiedName {
+                                    segments: vec![name.clone()],
+                                    span: method.span.clone(),
+                                },
+                                arguments: Vec::new(),
+                            },
+                            span: method.span.clone(),
+                        },
+                        default: None,
+                        span: method.span.clone(),
+                    },
+                );
+            }
+        }
+        self.expect_simple(TokenKind::RBrace, "expected `}` after struct declaration")?;
+        Ok(StructDecl {
+            docs,
+            visibility,
+            name,
+            fields,
+            methods,
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_trait_decl(
+        &mut self,
+        docs: Vec<String>,
+        visibility: Visibility,
+    ) -> Result<TraitDecl, DiagnosticBag> {
+        let start = self.current().span.start;
+        self.expect_simple(TokenKind::Trait, "expected `trait`")?;
+        let (name, _) = self.expect_identifier("expected trait name")?;
+        self.expect_simple(TokenKind::LBrace, "expected `{` after trait name")?;
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        while !self.at(TokenKind::RBrace) {
+            let member_docs = self.take_doc_comments();
+            let member_visibility = self.parse_visibility().unwrap_or(Visibility::Public);
+            let member_start = self.current().span.start;
+            if self.at(TokenKind::Val) {
+                self.expect_simple(TokenKind::Val, "expected `val`")?;
+                let (field_name, _) = self.expect_identifier("expected trait field name")?;
+                self.expect_simple(TokenKind::Colon, "expected `:` after trait field name")?;
+                let ty = self.parse_type()?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after trait field")?;
+                fields.push(StructFieldDecl {
+                    docs: member_docs,
+                    visibility: member_visibility,
+                    mutability: Mutability::Val,
+                    name: field_name,
+                    ty,
+                    span: TextSpan::new(member_start, self.previous().span.end),
+                });
+                continue;
+            }
+            let associated = self.consume(TokenKind::Struct);
+            let evil = self.consume(TokenKind::Evil);
+            self.expect_simple(TokenKind::Fun, "expected `fun` in trait declaration")?;
+            let (method_name, _) = self.expect_identifier("expected trait method name")?;
+            let generic_parameters = if self.at(TokenKind::LBracket) {
+                self.parse_generic_parameter_clause()?
+            } else {
+                Vec::new()
+            };
+            self.expect_simple(TokenKind::LParen, "expected `(` before parameter list")?;
+            let parameters = self.parse_parameter_list()?;
+            self.expect_simple(TokenKind::RParen, "expected `)` after parameter list")?;
+            let return_type = if self.consume(TokenKind::Colon) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let body = if self.consume(TokenKind::Assign) {
+                let expr = self.parse_expr()?;
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after trait method")?;
+                Some(expr)
+            } else {
+                self.expect_simple(TokenKind::Semicolon, "expected `;` after trait method signature")?;
+                None
+            };
+            methods.push(TraitMethodDecl {
+                docs: member_docs,
+                visibility: member_visibility,
+                evil,
+                associated,
+                name: method_name,
+                generic_parameters,
+                parameters,
+                return_type,
+                body,
+                span: TextSpan::new(member_start, self.previous().span.end),
+            });
+            if !associated {
+                let method = methods.last_mut().expect("method was just pushed");
+                method.parameters.insert(
+                    0,
+                    Parameter {
+                        name: "self".to_owned(),
+                        ty: TypeSyntax {
+                            kind: TypeKind::Dyn(QualifiedName {
+                                segments: vec![name.clone()],
+                                span: method.span.clone(),
+                            }),
+                            span: method.span.clone(),
+                        },
+                        default: None,
+                        span: method.span.clone(),
+                    },
+                );
+            }
+        }
+        self.expect_simple(TokenKind::RBrace, "expected `}` after trait declaration")?;
+        Ok(TraitDecl {
+            docs,
+            visibility,
+            name,
+            fields,
+            methods,
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_impl_decl(
+        &mut self,
+        docs: Vec<String>,
+        visibility: Visibility,
+    ) -> Result<ImplDecl, DiagnosticBag> {
+        let start = self.current().span.start;
+        self.expect_simple(TokenKind::Impl, "expected `impl`")?;
+        let trait_name = self.parse_qualified_name()?;
+        self.expect_simple(TokenKind::For, "expected `for` in impl declaration")?;
+        let struct_name = self.parse_qualified_name()?;
+        let mut methods = Vec::new();
+        if self.consume(TokenKind::Semicolon) {
+            return Ok(ImplDecl {
+                docs,
+                visibility,
+                trait_name,
+                struct_name,
+                methods,
+                span: TextSpan::new(start, self.previous().span.end),
+            });
+        }
+        self.expect_simple(TokenKind::LBrace, "expected `{` or `;` after impl target")?;
+        while !self.at(TokenKind::RBrace) {
+            let method_docs = self.take_doc_comments();
+            let method_visibility = self.parse_visibility().unwrap_or(Visibility::Public);
+            let method_start = self.current().span.start;
+            let evil = self.consume(TokenKind::Evil);
+            self.expect_simple(TokenKind::Fun, "expected `fun` in impl body")?;
+            let (method_name, _) = self.expect_identifier("expected impl method name")?;
+            methods.push(self.parse_function_tail(
+                method_docs,
+                method_visibility,
+                evil,
+                method_name,
+                method_start,
+                false,
+            )?);
+            let method = methods.last_mut().expect("method was just pushed");
+            method.parameters.insert(
+                0,
+                Parameter {
+                    name: "self".to_owned(),
+                    ty: TypeSyntax {
+                        kind: TypeKind::Named {
+                            name: struct_name.clone(),
+                            arguments: Vec::new(),
+                        },
+                        span: method.span.clone(),
+                    },
+                    default: None,
+                    span: method.span.clone(),
+                },
+            );
+        }
+        self.expect_simple(TokenKind::RBrace, "expected `}` after impl declaration")?;
+        Ok(ImplDecl {
+            docs,
+            visibility,
+            trait_name,
+            struct_name,
+            methods,
+            span: TextSpan::new(start, self.previous().span.end),
+        })
+    }
+
+    fn parse_function_tail(
+        &mut self,
+        docs: Vec<String>,
+        visibility: Visibility,
+        evil: bool,
+        name: String,
+        start: usize,
+        _associated: bool,
+    ) -> Result<FunctionDecl, DiagnosticBag> {
+        let generic_parameters = if self.at(TokenKind::LBracket) {
+            self.parse_generic_parameter_clause()?
+        } else {
+            Vec::new()
+        };
+        self.expect_simple(TokenKind::LParen, "expected `(` before parameter list")?;
+        let parameters = self.parse_parameter_list()?;
+        self.expect_simple(TokenKind::RParen, "expected `)` after parameter list")?;
+        let return_type = if self.consume(TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        let body = if self.consume(TokenKind::Assign) {
+            let expr = self.parse_expr()?;
+            self.expect_simple(TokenKind::Semicolon, "expected `;` after expression-bodied function")?;
+            expr
+        } else {
+            self.parse_block_expr_required()?
+        };
+        Ok(FunctionDecl {
+            docs,
+            visibility,
+            evil,
+            associated: _associated,
+            name,
+            generic_parameters,
+            parameters,
+            return_type,
+            span: TextSpan::new(start, self.previous().span.end),
             body,
         })
     }

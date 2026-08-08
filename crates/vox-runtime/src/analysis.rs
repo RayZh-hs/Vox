@@ -5,11 +5,11 @@ use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
     Expr, ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LocalValueDecl, Mutability,
     QualifiedName, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
-    UpdatedPathSegment, ValueDecl, WhenExpr,
+    UpdatedPathSegment, ValueDecl, WhenExpr, Visibility,
 };
 use vox_core::{
     builtins::{self, BuiltinReceiver},
-    host::{FunctionSpec, PackageManifest, ValueSpec},
+    host::{FunctionSpec, PackageManifest, TypeSpec, ValueSpec},
     source::{ModuleKind, ModulePath},
 };
 
@@ -106,7 +106,10 @@ pub fn infer_environment(
     unit: &CompilationUnit,
     manifests: &[PackageManifest],
 ) -> Result<TypeEnvironment, String> {
-    let mut engine = TypeEngine::new(unit, manifests);
+    let mut all_manifests = manifests.to_vec();
+    let frontend = vox_compiler::FrontendUnit::from_syntax(unit.clone());
+    all_manifests.push(vox_compiler::surface_manifest_from_frontend(&frontend));
+    let mut engine = TypeEngine::new(unit, &all_manifests);
     engine.infer()
 }
 
@@ -421,10 +424,14 @@ struct TypeEngine<'a> {
     functions: BTreeMap<String, FunctionInfo>,
     expr_types: RefCell<BTreeMap<usize, (usize, ReplType)>>,
     warnings: RefCell<Vec<String>>,
+    local_types: BTreeMap<String, TypeSpec>,
+    local_traits: BTreeMap<String, vox_core::host::TraitSpec>,
 }
 
 impl<'a> TypeEngine<'a> {
     fn new(unit: &'a CompilationUnit, manifests: &'a [PackageManifest]) -> Self {
+        let local_frontend = vox_compiler::FrontendUnit::from_syntax(unit.clone());
+        let local_manifest = vox_compiler::surface_manifest_from_frontend(&local_frontend);
         Self {
             module: unit.header.module.as_str(),
             unit,
@@ -439,6 +446,16 @@ impl<'a> TypeEngine<'a> {
             functions: BTreeMap::new(),
             expr_types: RefCell::new(BTreeMap::new()),
             warnings: RefCell::new(Vec::new()),
+            local_types: local_manifest
+                .types
+                .into_iter()
+                .map(|ty| (ty.name.name.clone(), ty))
+                .collect(),
+            local_traits: local_manifest
+                .traits
+                .into_iter()
+                .map(|trait_spec| (trait_spec.name.name.clone(), trait_spec))
+                .collect(),
         }
     }
 
@@ -476,6 +493,7 @@ impl<'a> TypeEngine<'a> {
     fn prime(&mut self) -> Result<(), String> {
         self.collect_imports()?;
         self.collect_function_headers()?;
+        self.validate_native_declarations()?;
         self.check_method_guards()?;
         match self.unit.header.kind {
             ModuleKind::Package => {
@@ -487,6 +505,116 @@ impl<'a> TypeEngine<'a> {
                 self.collect_parameter_bindings()?;
                 self.infer_parameter_defaults()?;
                 self.infer_script_items()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_native_declarations(&self) -> Result<(), String> {
+        let mut structs = BTreeSet::new();
+        let mut traits = BTreeSet::new();
+        for item in &self.unit.items {
+            match item {
+                TopLevelItem::Struct(structure) => {
+                    if !structs.insert(structure.name.clone()) {
+                        return Err(format!("struct `{}` is already declared", structure.name));
+                    }
+                    let mut fields = BTreeSet::new();
+                    for field in &structure.fields {
+                        if !fields.insert(field.name.clone()) {
+                            return Err(format!(
+                                "struct `{}` has duplicate field `{}`",
+                                structure.name, field.name
+                            ));
+                        }
+                    }
+                    let mut methods = BTreeSet::new();
+                    for method in &structure.methods {
+                        if !methods.insert(method.name.clone()) {
+                            return Err(format!(
+                                "struct `{}` has duplicate method `{}`",
+                                structure.name, method.name
+                            ));
+                        }
+                    }
+                }
+                TopLevelItem::Trait(trait_decl) => {
+                    if !traits.insert(trait_decl.name.clone()) {
+                        return Err(format!("trait `{}` is already declared", trait_decl.name));
+                    }
+                    let mut members = BTreeSet::new();
+                    for field in &trait_decl.fields {
+                        if !members.insert(field.name.clone()) {
+                            return Err(format!(
+                                "trait `{}` has duplicate field `{}`",
+                                trait_decl.name, field.name
+                            ));
+                        }
+                    }
+                    for method in &trait_decl.methods {
+                        if !members.insert(method.name.clone()) {
+                            return Err(format!(
+                                "trait `{}` has duplicate member `{}`",
+                                trait_decl.name, method.name
+                            ));
+                        }
+                    }
+                }
+                TopLevelItem::Impl(implementation) => {
+                    let trait_name = implementation.trait_name.to_source_string();
+                    let struct_name = implementation.struct_name.to_source_string();
+                    let trait_decl = self
+                        .unit
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            TopLevelItem::Trait(trait_decl)
+                                if trait_decl.name == trait_name => Some(trait_decl),
+                            _ => None,
+                        })
+                        .ok_or_else(|| format!("unknown trait `{trait_name}` in impl"))?;
+                    let structure = self
+                        .unit
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            TopLevelItem::Struct(structure)
+                                if structure.name == struct_name => Some(structure),
+                            _ => None,
+                        })
+                        .ok_or_else(|| format!("unknown struct `{struct_name}` in impl"))?;
+                    for field in trait_decl
+                        .fields
+                        .iter()
+                        .filter(|field| matches!(field.visibility, Visibility::Public))
+                    {
+                        let Some(implemented) = structure.fields.iter().find(|candidate| candidate.name == field.name) else {
+                            return Err(format!("struct `{struct_name}` is missing trait field `{}`", field.name));
+                        };
+                        if implemented.ty.to_source_string() != field.ty.to_source_string() {
+                            return Err(format!("trait field `{}` has incompatible type", field.name));
+                        }
+                    }
+                    for method in trait_decl
+                        .methods
+                        .iter()
+                        .filter(|method| matches!(method.visibility, Visibility::Public))
+                        .filter(|method| !method.associated)
+                    {
+                        let implemented = implementation
+                            .methods
+                            .iter()
+                            .chain(structure.methods.iter())
+                            .find(|candidate| candidate.name == method.name);
+                        if implemented.is_none() && method.body.is_none() {
+                            return Err(format!(
+                                "impl `{trait_name}` for `{struct_name}` is missing method `{}`",
+                                method.name
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -877,7 +1005,11 @@ impl<'a> TypeEngine<'a> {
                         },
                     );
                 }
-                TopLevelItem::Import(_) | TopLevelItem::Function(_) => {}
+                TopLevelItem::Import(_)
+                | TopLevelItem::Function(_)
+                | TopLevelItem::Struct(_)
+                | TopLevelItem::Trait(_)
+                | TopLevelItem::Impl(_) => {}
                 TopLevelItem::Statement(_) => {}
             }
         }
@@ -966,7 +1098,11 @@ impl<'a> TypeEngine<'a> {
         let mut finalized_values = BTreeMap::<String, BTreeSet<String>>::new();
         for item in &self.unit.items {
             match item {
-                TopLevelItem::Import(_) | TopLevelItem::Param(_) => {}
+                TopLevelItem::Import(_)
+                | TopLevelItem::Param(_)
+                | TopLevelItem::Struct(_)
+                | TopLevelItem::Trait(_)
+                | TopLevelItem::Impl(_) => {}
                 TopLevelItem::Function(function) => {
                     let captured = self.infer_function_body(function, &mut scope.clone())?;
                     for name in captured {
@@ -1717,6 +1853,19 @@ impl<'a> TypeEngine<'a> {
                     .ok_or_else(|| format!("record has no field `{name}`")),
                 other => Err(format!("cannot access field on `{}`", other.render())),
             },
+            ReplType::Named {
+                name: type_name,
+                ..
+            } => self
+                .local_types
+                .values()
+                .find(|ty| {
+                    ty.name.name == type_name
+                        || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == type_name
+                })
+                .and_then(|ty| ty.fields.iter().find(|field| field.name == name))
+                .map(|field| from_vox_host_type(&field.ty))
+                .ok_or_else(|| format!("type `{type_name}` has no field `{name}`")),
             other => Err(format!("cannot access field on `{}`", other.render())),
         }
     }
@@ -1825,6 +1974,12 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn named_type_exists(&self, raw: &str) -> bool {
+        if self.local_types.values().any(|ty| {
+            ty.name.name == raw
+                || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == raw
+        }) {
+            return true;
+        }
         self.manifests.values().any(|manifest| {
             manifest.types.iter().any(|ty| {
                 ty.name.name == raw
@@ -1834,6 +1989,12 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn trait_type_exists(&self, raw: &str) -> bool {
+        if self.local_traits.values().any(|trait_spec| {
+            trait_spec.name.name == raw
+                || format!("{}.{}", trait_spec.name.module.as_str(), trait_spec.name.name) == raw
+        }) {
+            return true;
+        }
         self.manifests.values().any(|manifest| {
             manifest.traits.iter().any(|trait_spec| {
                 trait_spec.name.name == raw
@@ -2111,6 +2272,9 @@ impl<'a> TypeEngine<'a> {
             if let Some(function) = self.functions.get(local) {
                 return Ok(self.function_repl_type(&function.summary));
             }
+            if let Some(ty) = self.local_constructor_type(local) {
+                return Ok(ty);
+            }
             if scope.generic_parameters.contains_key(local) {
                 return Err(type_name_used_as_value_error(local, "type parameter"));
             }
@@ -2123,6 +2287,12 @@ impl<'a> TypeEngine<'a> {
             return Err(format!("unknown name `{local}`"));
         }
 
+        if name.segments.len() == 2 {
+            if let Some(method) = self.local_associated_method_type(&name.segments[0], &name.segments[1]) {
+                return Ok(method);
+            }
+        }
+
         if let Some(local) = self.resolve_local_qualified_name(name) {
             if let Some(binding) = scope.values.get(&local) {
                 return Ok(binding.ty.clone());
@@ -2133,6 +2303,44 @@ impl<'a> TypeEngine<'a> {
         }
 
         self.resolve_imported_name(name)
+    }
+
+    fn local_constructor_type(&self, name: &str) -> Option<ReplType> {
+        let ty = self.local_types.get(name)?;
+        let parameters = ty.fields.iter().map(|field| from_vox_host_type(&field.ty)).collect();
+        Some(ReplType::Function {
+            parameters,
+            result: Box::new(ReplType::Named {
+                name: name.to_owned(),
+                arguments: Vec::new(),
+            }),
+        })
+    }
+
+    fn local_associated_method_type(&self, owner: &str, method: &str) -> Option<ReplType> {
+        let structure = self
+            .unit
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TopLevelItem::Struct(structure) if structure.name == owner => Some(structure),
+                _ => None,
+            })?;
+        let function = structure.methods.iter().find(|function| {
+            function.associated && function.name == method
+        })?;
+        Some(ReplType::Function {
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| from_type_syntax(&parameter.ty, &BTreeMap::new()))
+                .collect(),
+            result: Box::new(function
+                .return_type
+                .as_ref()
+                .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
+                .unwrap_or(ReplType::Unit)),
+        })
     }
 
     fn resolve_unqualified_name(&self, local: &str) -> Result<Option<ReplType>, String> {
@@ -2358,6 +2566,33 @@ impl<'a> TypeEngine<'a> {
 
         if let Some(method_type) = builtin_method_type_for_repl_type(target_type, method_name) {
             return Some(method_type);
+        }
+
+        if let ReplType::Named { name, .. } = target_type {
+            if let Some(structure) = self.local_types.get(name) {
+                if structure.fields.iter().any(|field| field.name == method_name) {
+                    return None;
+                }
+                if let Some(function) = self.unit.items.iter().find_map(|item| match item {
+                    TopLevelItem::Struct(structure) if structure.name == *name => {
+                        structure.methods.iter().find(|method| method.name == method_name)
+                    }
+                    _ => None,
+                }) {
+                    let mut parameters = vec![target_type.clone()];
+                    parameters.extend(function.parameters.iter().map(|parameter| {
+                        from_type_syntax(&parameter.ty, &BTreeMap::new())
+                    }));
+                    return Some(ReplType::Function {
+                        parameters,
+                        result: Box::new(function
+                            .return_type
+                            .as_ref()
+                            .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
+                            .unwrap_or(ReplType::Unit)),
+                    });
+                }
+            }
         }
 
         self.resolve_trait_method(target_type, method_name)

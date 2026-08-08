@@ -1862,6 +1862,19 @@ fn item_key(item: &TopLevelItem) -> StoredItemKey {
             name: param.name.clone(),
         },
         TopLevelItem::Statement(_) => StoredItemKey::Statement,
+        TopLevelItem::Struct(structure) => StoredItemKey::Function {
+            name: structure.name.clone(),
+        },
+        TopLevelItem::Trait(trait_decl) => StoredItemKey::Function {
+            name: trait_decl.name.clone(),
+        },
+        TopLevelItem::Impl(implementation) => StoredItemKey::Function {
+            name: format!(
+                "impl {} for {}",
+                implementation.trait_name.to_source_string(),
+                implementation.struct_name.to_source_string()
+            ),
+        },
     }
 }
 
@@ -1871,6 +1884,9 @@ fn slice_item_source(source: &str, item: &TopLevelItem) -> String {
         TopLevelItem::Param(param) => &param.span,
         TopLevelItem::Value(value) => &value.span,
         TopLevelItem::Function(function) => &function.span,
+        TopLevelItem::Struct(structure) => &structure.span,
+        TopLevelItem::Trait(trait_decl) => &trait_decl.span,
+        TopLevelItem::Impl(implementation) => &implementation.span,
         TopLevelItem::Statement(statement) => match statement {
             BlockItem::LocalValue(value) => &value.span,
             BlockItem::Assignment(assignment) => &assignment.span,

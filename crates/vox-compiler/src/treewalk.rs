@@ -38,7 +38,10 @@ impl TreewalkScript {
                 TopLevelItem::Param(param) => parameters.push(param.clone()),
                 TopLevelItem::Value(value) => values.push(value.clone()),
                 TopLevelItem::Function(function) => functions.push(function.clone()),
-                TopLevelItem::Statement(_) => {}
+                TopLevelItem::Statement(_)
+                | TopLevelItem::Struct(_)
+                | TopLevelItem::Trait(_)
+                | TopLevelItem::Impl(_) => {}
             }
         }
 

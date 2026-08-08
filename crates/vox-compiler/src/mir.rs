@@ -188,7 +188,12 @@ impl<'a> MirLowerer<'a> {
 
         for item in &unit.items {
             match item {
-                TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Function(_) => {}
+                TopLevelItem::Import(_)
+                | TopLevelItem::Param(_)
+                | TopLevelItem::Function(_)
+                | TopLevelItem::Struct(_)
+                | TopLevelItem::Trait(_)
+                | TopLevelItem::Impl(_) => {}
                 TopLevelItem::Value(value) => body.lower_value_decl(value),
                 TopLevelItem::Statement(statement) => body.lower_block_item(statement),
             }
