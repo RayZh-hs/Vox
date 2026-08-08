@@ -13,7 +13,7 @@ use crate::{
 };
 
 pub const EXTERNAL_LIBRARY_MAGIC: [u8; 4] = *b"VXLH";
-pub const EXTERNAL_LIBRARY_VERSION: u16 = 4;
+pub const EXTERNAL_LIBRARY_VERSION: u16 = 5;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
