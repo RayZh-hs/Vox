@@ -523,7 +523,10 @@ impl ModuleState {
         let artifact = runtime.artifacts.get(artifact_id)?.clone();
         let treewalk = runtime.artifacts.treewalk(artifact_id)?.clone();
         let module = Rc::new(ModuleState::new(&treewalk, &artifact, artifact_id));
-        module.native_instance_method(type_name, method)
+        module
+            .native_instance_method(type_name, method)
+            .or_else(|| module.trait_default_method(type_name, method))
+            .filter(|_| self.tier == LanguageTier::Debug || self.name == package.as_str())
     }
 
     fn native_package_associated_method(
@@ -537,7 +540,9 @@ impl ModuleState {
         let artifact = runtime.artifacts.get(artifact_id)?.clone();
         let treewalk = runtime.artifacts.treewalk(artifact_id)?.clone();
         let module = Rc::new(ModuleState::new(&treewalk, &artifact, artifact_id));
-        module.native_associated_method(type_name, method)
+        module
+            .native_associated_method(type_name, method)
+            .filter(|_| self.tier == LanguageTier::Debug || self.name == package.as_str())
     }
 
     fn trait_default_method(
