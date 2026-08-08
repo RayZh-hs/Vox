@@ -432,6 +432,32 @@ impl<'a> TypeEngine<'a> {
     fn new(unit: &'a CompilationUnit, manifests: &'a [PackageManifest]) -> Self {
         let local_frontend = vox_compiler::FrontendUnit::from_syntax(unit.clone());
         let local_manifest = vox_compiler::surface_manifest_from_frontend(&local_frontend);
+        let local_types = unit
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                TopLevelItem::Struct(structure) => Some((
+                    structure.name.clone(),
+                    TypeSpec {
+                        name: vox_core::types::QualifiedTypeName {
+                            module: unit.header.module.clone(),
+                            name: structure.name.clone(),
+                        },
+                        fields: structure
+                            .fields
+                            .iter()
+                            .map(|field| vox_core::host::FieldSpec {
+                                name: field.name.clone(),
+                                ty: vox_core::types::VoxType::opaque_surface(
+                                    field.ty.to_source_string(),
+                                ),
+                            })
+                            .collect(),
+                    },
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         Self {
             module: unit.header.module.as_str(),
             unit,
@@ -446,11 +472,15 @@ impl<'a> TypeEngine<'a> {
             functions: BTreeMap::new(),
             expr_types: RefCell::new(BTreeMap::new()),
             warnings: RefCell::new(Vec::new()),
-            local_types: local_manifest
-                .types
-                .into_iter()
-                .map(|ty| (ty.name.name.clone(), ty))
-                .collect(),
+            local_types: if local_types.is_empty() {
+                local_manifest
+                    .types
+                    .into_iter()
+                    .map(|ty| (ty.name.name.clone(), ty))
+                    .collect()
+            } else {
+                local_types
+            },
             local_traits: local_manifest
                 .traits
                 .into_iter()
@@ -2679,7 +2709,6 @@ impl<'a> TypeEngine<'a> {
                         function
                             .parameters
                             .iter()
-                            .skip(1)
                             .map(|parameter| from_type_syntax(&parameter.ty, &BTreeMap::new())),
                     );
                     return Some(ReplType::Function {

@@ -661,6 +661,12 @@ impl Runtime {
             arguments.to_vec()
         };
 
+        if treewalk.has_native_declarations() && artifact.optimization >= OptimizationLevel::IOpt {
+            return Interpreter::new(self, artifact.id)
+                .run_script(&treewalk, &artifact, &expanded_args)
+                .map_err(RuntimeError::ExecutionFailed);
+        }
+
         if artifact.optimization >= OptimizationLevel::SOpt {
             if let Some(reason) = sopt_unavailable_reason(&artifact) {
                 return Err(RuntimeError::SOptUnavailable(reason));

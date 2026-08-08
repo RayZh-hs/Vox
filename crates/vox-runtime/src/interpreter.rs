@@ -9,10 +9,10 @@ use vox_compiler::{
     TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
-        ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
-        ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral, StringPart,
-        TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
-        ValueDecl,
+        ExprKind, ForHeader, FunctionDecl, ImplDecl, ImportDecl, IntrinsicExpr, LambdaParameter,
+        Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral,
+        StringPart, StructDecl, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
+        UpdatedPathSegment, ValueDecl,
     },
 };
 use vox_core::{
@@ -257,12 +257,16 @@ fn eval_error_message(error: EvalError) -> String {
 struct ModuleState {
     artifact_id: ArtifactId,
     optimization: vox_core::opt::OptimizationLevel,
+    kind: vox_core::source::ModuleKind,
     name: String,
     imports: Vec<ImportDecl>,
     parameters: Vec<ParamDecl>,
     result: Option<Expr>,
     values: BTreeMap<String, ValueDecl>,
     functions: BTreeMap<String, FunctionDecl>,
+    structs: BTreeMap<String, StructDecl>,
+    traits: BTreeMap<String, vox_compiler::frontend::ast::TraitDecl>,
+    impls: Vec<ImplDecl>,
     function_return_types: BTreeMap<String, ReplType>,
     parameter_values: RefCell<BTreeMap<String, Value>>,
     script_bindings: RefCell<BTreeMap<String, Binding>>,
@@ -299,6 +303,7 @@ impl ModuleState {
         Self {
             artifact_id,
             optimization: artifact.optimization,
+            kind: artifact.kind,
             name: artifact.module.as_str(),
             imports: script.imports.clone(),
             parameters: script.parameters.clone(),
@@ -310,6 +315,19 @@ impl ModuleState {
                 .map(|value| (value.name.clone(), value))
                 .collect(),
             functions,
+            structs: script
+                .structs
+                .iter()
+                .cloned()
+                .map(|structure| (structure.name.clone(), structure))
+                .collect(),
+            traits: script
+                .traits
+                .iter()
+                .cloned()
+                .map(|trait_decl| (trait_decl.name.clone(), trait_decl))
+                .collect(),
+            impls: script.impls.clone(),
             function_return_types,
             parameter_values: RefCell::new(BTreeMap::new()),
             script_bindings: RefCell::new(BTreeMap::new()),
@@ -382,6 +400,121 @@ impl ModuleState {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn native_associated_method(
+        self: &Rc<Self>,
+        owner: &str,
+        method: &str,
+    ) -> Option<Rc<FunctionValue>> {
+        let structure = self.structs.get(owner)?;
+        let declaration = structure
+            .methods
+            .iter()
+            .find(|function| function.associated && function.name == method)
+            .cloned()?;
+        Some(Rc::new(FunctionValue::Native(NativeFunction {
+            module: self.clone(),
+            kind: NativeFunctionKind::Declaration { declaration },
+        })))
+    }
+
+    fn native_type_name(&self, local_name: &str) -> String {
+        if matches!(self.kind, vox_core::source::ModuleKind::Package) {
+            format!("{}.{}", self.name, local_name)
+        } else {
+            local_name.to_owned()
+        }
+    }
+
+    fn native_instance_method(
+        self: &Rc<Self>,
+        owner: &str,
+        method: &str,
+    ) -> Option<Rc<FunctionValue>> {
+        let structure = self.structs.get(owner)?;
+        let declaration = structure
+            .methods
+            .iter()
+            .find(|function| !function.associated && function.name == method)
+            .cloned()
+            .or_else(|| {
+                self.impls
+                    .iter()
+                    .filter(|implementation| implementation.struct_name.to_source_string() == owner)
+                    .flat_map(|implementation| implementation.methods.iter())
+                    .find(|function| function.name == method)
+                    .cloned()
+            })?;
+        Some(Rc::new(FunctionValue::Native(NativeFunction {
+            module: self.clone(),
+            kind: NativeFunctionKind::Declaration { declaration },
+        })))
+    }
+
+    fn native_package_instance_method(
+        self: &Rc<Self>,
+        runtime: &Runtime,
+        owner: &str,
+        method: &str,
+    ) -> Option<Rc<FunctionValue>> {
+        let mut segments = owner.rsplitn(2, '.');
+        let type_name = segments.next()?;
+        let package_name = segments.next()?;
+        let package = ModulePath::parse(package_name).ok()?;
+        let artifact_id = runtime.package_artifact(&package)?;
+        let artifact = runtime.artifacts.get(artifact_id)?.clone();
+        let treewalk = runtime.artifacts.treewalk(artifact_id)?.clone();
+        let module = Rc::new(ModuleState::new(&treewalk, &artifact, artifact_id));
+        module.native_instance_method(type_name, method)
+    }
+
+    fn native_package_associated_method(
+        &self,
+        runtime: &Runtime,
+        package: &ModulePath,
+        type_name: &str,
+        method: &str,
+    ) -> Option<Rc<FunctionValue>> {
+        let artifact_id = runtime.package_artifact(package)?;
+        let artifact = runtime.artifacts.get(artifact_id)?.clone();
+        let treewalk = runtime.artifacts.treewalk(artifact_id)?.clone();
+        let module = Rc::new(ModuleState::new(&treewalk, &artifact, artifact_id));
+        module.native_associated_method(type_name, method)
+    }
+
+    fn trait_default_method(
+        self: &Rc<Self>,
+        owner: &str,
+        method: &str,
+    ) -> Option<Rc<FunctionValue>> {
+        let implementation = self
+            .impls
+            .iter()
+            .find(|implementation| implementation.struct_name.to_source_string() == owner)?;
+        let trait_name = implementation.trait_name.to_source_string();
+        let trait_decl = self.traits.get(&trait_name)?;
+        let method_decl = trait_decl
+            .methods
+            .iter()
+            .find(|trait_method| trait_method.name == method && trait_method.body.is_some())?;
+        let body = method_decl.body.clone()?;
+        let declaration = FunctionDecl {
+            docs: method_decl.docs.clone(),
+            visibility: method_decl.visibility,
+            evil: method_decl.evil,
+            associated: method_decl.associated,
+            name: method_decl.name.clone(),
+            generic_parameters: method_decl.generic_parameters.clone(),
+            parameters: method_decl.parameters.clone(),
+            return_type: method_decl.return_type.clone(),
+            body,
+            span: method_decl.span.clone(),
+        };
+        Some(Rc::new(FunctionValue::Native(NativeFunction {
+            module: self.clone(),
+            kind: NativeFunctionKind::Declaration { declaration },
+        })))
     }
 
     fn assign_script_binding(&self, name: &str, value: Value) -> Result<(), EvalError> {
@@ -597,6 +730,42 @@ impl ModuleState {
             }
         }
 
+        Ok(None)
+    }
+
+    fn resolve_imported_type(
+        &self,
+        runtime: &Runtime,
+        name: &QualifiedName,
+    ) -> Result<Option<(ModulePath, String)>, String> {
+        if name.segments.len() < 2 {
+            return Ok(None);
+        }
+        for length in (1..name.segments.len()).rev() {
+            let package = name.segments[..length].join(".");
+            let Some(import_decl) = self.find_import_by_path(&package) else {
+                continue;
+            };
+            let module = ModulePath::parse(&import_decl.module.to_source_string())
+                .expect("parsed import paths should be valid module paths");
+            let Some(manifest) = runtime.package_manifest(&module) else {
+                return Err(format!("package `{package}` is not mounted"));
+            };
+            if name.segments.len() != length + 1 {
+                continue;
+            }
+            let symbol = &name.segments[length];
+            if import_decl.items.as_ref().is_some_and(|items| {
+                !items.iter().any(|item| {
+                    item.name == *symbol || item.alias.as_ref().is_some_and(|alias| alias == symbol)
+                })
+            }) {
+                continue;
+            }
+            if manifest.types.iter().any(|ty| ty.name.name == *symbol) {
+                return Ok(Some((module, symbol.clone())));
+            }
+        }
         Ok(None)
     }
 
@@ -1123,6 +1292,63 @@ impl<'a> EvalContext<'a> {
     }
 
     fn resolve_name(&mut self, name: &QualifiedName) -> Result<Value, EvalError> {
+        if name.segments.len() == 1 {
+            if self.module.structs.contains_key(&name.segments[0]) {
+                return Ok(Value::Function(Rc::new(FunctionValue::Native(
+                    NativeFunction {
+                        module: self.module.clone(),
+                        kind: NativeFunctionKind::Constructor(name.segments[0].clone()),
+                    },
+                ))));
+            }
+        }
+        if name.segments.len() == 2
+            && self.module.structs.contains_key(&name.segments[0])
+            && self
+                .module
+                .native_associated_method(&name.segments[0], &name.segments[1])
+                .is_some()
+        {
+            return Ok(Value::Function(Rc::new(FunctionValue::Native(
+                NativeFunction {
+                    module: self.module.clone(),
+                    kind: NativeFunctionKind::Associated {
+                        owner: name.segments[0].clone(),
+                        method: name.segments[1].clone(),
+                    },
+                },
+            ))));
+        }
+        if name.segments.len() >= 3 {
+            let mut type_name = name.clone();
+            let method = type_name.segments.pop().expect("checked non-empty name");
+            if let Some((package, type_name)) = self
+                .module
+                .resolve_imported_type(self.runtime, &type_name)
+                .map_err(EvalError::Message)?
+            {
+                if let Some(function) = self.module.native_package_associated_method(
+                    self.runtime,
+                    &package,
+                    &type_name,
+                    &method,
+                ) {
+                    return Ok(Value::Function(function));
+                }
+            }
+        }
+        if let Some((package, type_name)) = self
+            .module
+            .resolve_imported_type(self.runtime, name)
+            .map_err(EvalError::Message)?
+        {
+            return Ok(Value::Function(Rc::new(FunctionValue::Native(
+                NativeFunction {
+                    module: self.module.clone(),
+                    kind: NativeFunctionKind::PackageConstructor { package, type_name },
+                },
+            ))));
+        }
         if let Some(local_name) = self.module.resolve_qualified_local_name(name) {
             if let Some(value) = self.lookup_local(&local_name) {
                 return Ok(value);
@@ -1217,6 +1443,24 @@ impl<'a> EvalContext<'a> {
             segments: vec![method_name.to_owned()],
             span: TextSpan::new(0, 0),
         };
+
+        let native_method = match receiver_val.runtime_type() {
+            ReplType::Named { ref name, .. } => self
+                .module
+                .native_instance_method(name, method_name)
+                .or_else(|| {
+                    self.module
+                        .native_package_instance_method(self.runtime, name, method_name)
+                })
+                .or_else(|| self.module.trait_default_method(name, method_name)),
+            _ => None,
+        };
+        if let Some(function) = native_method {
+            let mut evaled_args = Vec::with_capacity(arguments.len() + 1);
+            evaled_args.push(CallArgument::Positional(receiver_val));
+            evaled_args.extend(self.eval_arguments(arguments)?);
+            return function.call(self.runtime, evaled_args);
+        }
 
         let function = if let Some(function) = self.module.resolve_function(method_name) {
             Some(function)
@@ -1429,6 +1673,9 @@ impl<'a> EvalContext<'a> {
             Value::Record(fields) => fields.get(name).cloned().ok_or_else(|| {
                 EvalError::Message(format!("record does not contain field `{name}`"))
             }),
+            Value::Struct { fields, .. } => fields.get(name).cloned().ok_or_else(|| {
+                EvalError::Message(format!("struct does not contain field `{name}`"))
+            }),
             other => Err(EvalError::Message(format!(
                 "field access is not supported for {}",
                 other.type_name()
@@ -1460,6 +1707,24 @@ impl<'a> EvalContext<'a> {
                 };
                 fields.insert(name.clone(), next);
                 Ok(Value::Record(fields))
+            }
+            (
+                Value::Struct {
+                    type_name,
+                    mut fields,
+                },
+                UpdatedPathSegment::Field(name),
+            ) => {
+                let current = fields.get(name).cloned().ok_or_else(|| {
+                    EvalError::Message(format!("struct does not contain field `{name}`"))
+                })?;
+                let next = if rest.is_empty() {
+                    replacement
+                } else {
+                    self.apply_updated_path(current, rest, replacement)?
+                };
+                fields.insert(name.clone(), next);
+                Ok(Value::Struct { type_name, fields })
             }
             (Value::Record(_), UpdatedPathSegment::Index(index)) => Err(EvalError::Message(
                 format!("record updates require a field name, found `#{index}`"),
@@ -1971,6 +2236,9 @@ impl<'a> EvalContext<'a> {
 
     fn matches_named_type(&self, value: &Value, ty_name: &str) -> Result<bool, EvalError> {
         match value {
+            Value::Struct { type_name, .. } => Ok(type_name == ty_name
+                || type_name.ends_with(&format!(".{ty_name}"))
+                || ty_name.ends_with(&format!(".{type_name}"))),
             Value::Handle(_, summary) => {
                 let handle_type = &summary.type_name;
                 Ok(handle_type == ty_name
@@ -1986,10 +2254,11 @@ impl<'a> EvalContext<'a> {
         value: &Value,
         trait_name: &QualifiedName,
     ) -> Result<bool, EvalError> {
-        let Value::Handle(_, summary) = value else {
-            return Ok(false);
+        let value_type = match value {
+            Value::Struct { type_name, .. } => type_name.clone(),
+            Value::Handle(_, summary) => summary.type_name.clone(),
+            _ => return Ok(false),
         };
-        let handle_type = &summary.type_name;
         let trait_str = trait_name.to_source_string();
 
         for manifest in self.runtime.host.packages() {
@@ -1999,7 +2268,7 @@ impl<'a> EvalContext<'a> {
                     for impl_qt in impl_types {
                         let full_impl_name =
                             format!("{}.{}", impl_qt.module.as_str(), impl_qt.name);
-                        if *handle_type == full_impl_name || *handle_type == impl_qt.name {
+                        if value_type == full_impl_name || value_type == impl_qt.name {
                             return Ok(true);
                         }
                     }
@@ -2515,6 +2784,7 @@ pub(crate) enum FunctionValue {
     User(UserFunction),
     Generic(GenericFunction),
     Host(HostFunction),
+    Native(NativeFunction),
 }
 
 impl FunctionValue {
@@ -2527,6 +2797,7 @@ impl FunctionValue {
             Self::User(function) => function.call(runtime, arguments),
             Self::Generic(function) => function.call(runtime, arguments),
             Self::Host(function) => function.call(runtime, arguments),
+            Self::Native(function) => function.call(runtime, arguments),
         }
     }
 
@@ -2545,6 +2816,7 @@ impl FunctionValue {
                     .map(CallArgument::Positional)
                     .collect(),
             ),
+            Self::Native(function) => function.call_positional(runtime, arguments),
         }
     }
 
@@ -2584,6 +2856,249 @@ impl FunctionValue {
                     .collect(),
                 result: Box::new(function.return_type.clone()),
             },
+            Self::Native(function) => function.runtime_type(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeFunction {
+    module: Rc<ModuleState>,
+    kind: NativeFunctionKind,
+}
+
+#[derive(Debug, Clone)]
+enum NativeFunctionKind {
+    Constructor(String),
+    PackageConstructor {
+        package: ModulePath,
+        type_name: String,
+    },
+    Associated {
+        owner: String,
+        method: String,
+    },
+    Declaration {
+        declaration: FunctionDecl,
+    },
+}
+
+impl fmt::Debug for NativeFunction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeFunction")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl NativeFunction {
+    fn declaration(&self) -> Option<&FunctionDecl> {
+        match &self.kind {
+            NativeFunctionKind::Declaration { declaration, .. } => Some(declaration),
+            NativeFunctionKind::Associated { owner, method } => {
+                self.module.structs.get(owner).and_then(|structure| {
+                    structure
+                        .methods
+                        .iter()
+                        .find(|f| f.associated && f.name == *method)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn runtime_type(&self) -> ReplType {
+        match &self.kind {
+            NativeFunctionKind::Constructor(owner) => {
+                let parameters = self
+                    .module
+                    .structs
+                    .get(owner)
+                    .map(|structure| {
+                        structure
+                            .fields
+                            .iter()
+                            .map(|field| runtime_type_from_syntax(&field.ty, &BTreeMap::new()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ReplType::Function {
+                    parameters,
+                    result: Box::new(ReplType::Named {
+                        name: owner.clone(),
+                        arguments: Vec::new(),
+                    }),
+                }
+            }
+            _ => {
+                let Some(declaration) = self.declaration() else {
+                    return ReplType::Unknown("native function".to_owned());
+                };
+                ReplType::Function {
+                    parameters: declaration
+                        .parameters
+                        .iter()
+                        .map(|parameter| runtime_type_from_syntax(&parameter.ty, &BTreeMap::new()))
+                        .collect(),
+                    result: Box::new(
+                        declaration
+                            .return_type
+                            .as_ref()
+                            .map(|ty| runtime_type_from_syntax(ty, &BTreeMap::new()))
+                            .unwrap_or(ReplType::Unit),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn call_positional(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        self.call(
+            runtime,
+            arguments
+                .into_iter()
+                .map(CallArgument::Positional)
+                .collect(),
+        )
+    }
+
+    fn call(
+        &self,
+        runtime: &mut Runtime,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
+        match &self.kind {
+            NativeFunctionKind::Constructor(owner) => {
+                let structure = self
+                    .module
+                    .structs
+                    .get(owner)
+                    .ok_or_else(|| EvalError::Message(format!("unknown struct `{owner}`")))?;
+                let fields = assign_arguments(
+                    owner,
+                    &structure
+                        .fields
+                        .iter()
+                        .map(|field| CallableParameter {
+                            name: field.name.clone(),
+                            ty: runtime_type_from_syntax(&field.ty, &BTreeMap::new()),
+                            default: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    arguments,
+                )?;
+                let mut values = BTreeMap::new();
+                for field in &structure.fields {
+                    let value = fields.get(&field.name).cloned().ok_or_else(|| {
+                        EvalError::Message(format!(
+                            "missing field `{}` in constructor `{owner}`",
+                            field.name
+                        ))
+                    })?;
+                    values.insert(field.name.clone(), value);
+                }
+                Ok(Value::Struct {
+                    type_name: self.module.native_type_name(owner),
+                    fields: values,
+                })
+            }
+            NativeFunctionKind::PackageConstructor { package, type_name } => {
+                let manifest = runtime.package_manifest(package).ok_or_else(|| {
+                    EvalError::Message(format!("package `{}` is not mounted", package.as_str()))
+                })?;
+                let structure = manifest
+                    .types
+                    .iter()
+                    .find(|ty| ty.name.name == *type_name)
+                    .ok_or_else(|| {
+                        EvalError::Message(format!(
+                            "unknown imported struct `{}.{type_name}`",
+                            package.as_str()
+                        ))
+                    })?;
+                let assigned = assign_arguments(
+                    type_name,
+                    &structure
+                        .fields
+                        .iter()
+                        .map(|field| CallableParameter {
+                            name: field.name.clone(),
+                            ty: runtime_type_from_host_type(&field.ty),
+                            default: None,
+                        })
+                        .collect::<Vec<_>>(),
+                    arguments,
+                )?;
+                Ok(Value::Struct {
+                    type_name: format!("{}.{}", package.as_str(), type_name),
+                    fields: assigned,
+                })
+            }
+            NativeFunctionKind::Associated { owner, method } => {
+                let declaration = self
+                    .module
+                    .structs
+                    .get(owner)
+                    .and_then(|structure| {
+                        structure
+                            .methods
+                            .iter()
+                            .find(|f| f.associated && f.name == *method)
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        EvalError::Message(format!(
+                            "unknown associated function `{owner}.{method}`"
+                        ))
+                    })?;
+                self.invoke_declaration(runtime, declaration, arguments)
+            }
+            NativeFunctionKind::Declaration { declaration, .. } => {
+                self.invoke_declaration(runtime, declaration.clone(), arguments)
+            }
+        }
+    }
+
+    fn invoke_declaration(
+        &self,
+        runtime: &mut Runtime,
+        declaration: FunctionDecl,
+        arguments: Vec<CallArgument>,
+    ) -> Result<Value, EvalError> {
+        let parameters = declaration
+            .parameters
+            .iter()
+            .cloned()
+            .map(|parameter| CallableParameter::from_parameter(parameter, &BTreeMap::new()))
+            .collect::<Vec<_>>();
+        let assigned = assign_arguments(&declaration.name, &parameters, arguments)?;
+        let mut context = EvalContext::new(runtime, self.module.clone());
+        context.push_scope(Scope::default());
+        for parameter in parameters {
+            let value = assigned
+                .get(&parameter.name)
+                .cloned()
+                .or_else(|| {
+                    parameter
+                        .default
+                        .as_ref()
+                        .and_then(|default| context.eval_expr(default).ok())
+                })
+                .ok_or_else(|| {
+                    EvalError::Message(format!(
+                        "missing required parameter `{}` in function `{}`",
+                        parameter.name, declaration.name
+                    ))
+                })?;
+            context.define_local(parameter.name, value, false);
+        }
+        match context.eval_expr(&declaration.body) {
+            Ok(value) | Err(EvalError::Return(value)) => Ok(value),
+            Err(error) => Err(error),
         }
     }
 }
@@ -3005,6 +3520,10 @@ pub(crate) enum Value {
     List(Vec<Value>),
     Tuple(Vec<Value>),
     Record(BTreeMap<String, Value>),
+    Struct {
+        type_name: String,
+        fields: BTreeMap<String, Value>,
+    },
     Range(RangeValue),
     Function(Rc<FunctionValue>),
     Econ(Rc<RefCell<EconValue>>),
@@ -3103,7 +3622,11 @@ impl Value {
                 .map(|(name, value)| Some((name.clone(), value.to_inline()?)))
                 .collect::<Option<BTreeMap<_, _>>>()
                 .map(InlineValue::Record),
-            Self::List(_) | Self::Range(_) | Self::Function(_) | Self::Econ(_) => None,
+            Self::List(_)
+            | Self::Struct { .. }
+            | Self::Range(_)
+            | Self::Function(_)
+            | Self::Econ(_) => None,
         }
     }
 
@@ -3131,7 +3654,7 @@ impl Value {
                 .map(|(name, value)| Some((name.clone(), value.to_handle_data()?)))
                 .collect::<Option<BTreeMap<_, _>>>()
                 .map(HandleData::Record),
-            Self::Range(_) | Self::Function(_) | Self::Econ(_) => None,
+            Self::Struct { .. } | Self::Range(_) | Self::Function(_) | Self::Econ(_) => None,
         }
     }
 
@@ -3162,6 +3685,25 @@ impl Value {
                             .unwrap_or(false)
                     })
             }
+            (
+                Self::Struct {
+                    type_name: left_name,
+                    fields: left,
+                },
+                Self::Struct {
+                    type_name: right_name,
+                    fields: right,
+                },
+            ) => {
+                left_name == right_name
+                    && left.len() == right.len()
+                    && left.iter().all(|(name, value)| {
+                        right
+                            .get(name)
+                            .map(|other| value.equals(other))
+                            .unwrap_or(false)
+                    })
+            }
             (Self::Range(left), Self::Range(right)) => left.equals(right),
             (Self::Econ(left), Self::Econ(right)) => {
                 left.borrow().snapshot.equals(&right.borrow().snapshot)
@@ -3171,21 +3713,22 @@ impl Value {
         }
     }
 
-    fn type_name(&self) -> &'static str {
+    fn type_name(&self) -> String {
         match self {
-            Self::Null => "Null",
-            Self::Bool(_) => "Bool",
-            Self::Int(_) => "Int",
-            Self::UInt(_) => "UInt",
-            Self::Float(_) => "Float",
-            Self::String(_) => "String",
-            Self::Handle(_, _) => "Handle",
-            Self::List(_) => "List",
-            Self::Tuple(_) => "Tuple",
-            Self::Record(_) => "Record",
-            Self::Range(_) => "Range",
-            Self::Function(_) => "Function",
-            Self::Econ(_) => "Econ",
+            Self::Null => "Null".to_owned(),
+            Self::Bool(_) => "Bool".to_owned(),
+            Self::Int(_) => "Int".to_owned(),
+            Self::UInt(_) => "UInt".to_owned(),
+            Self::Float(_) => "Float".to_owned(),
+            Self::String(_) => "String".to_owned(),
+            Self::Handle(_, _) => "Handle".to_owned(),
+            Self::List(_) => "List".to_owned(),
+            Self::Tuple(_) => "Tuple".to_owned(),
+            Self::Record(_) => "Record".to_owned(),
+            Self::Struct { type_name, .. } => type_name.clone(),
+            Self::Range(_) => "Range".to_owned(),
+            Self::Function(_) => "Function".to_owned(),
+            Self::Econ(_) => "Econ".to_owned(),
         }
     }
 
@@ -3213,6 +3756,13 @@ impl Value {
                     .collect::<Vec<_>>();
                 format!("{{{}}}", entries.join(", "))
             }
+            Self::Struct { type_name, fields } => {
+                let entries = fields
+                    .iter()
+                    .map(|(name, value)| format!("{name} = {}", value.render()))
+                    .collect::<Vec<_>>();
+                format!("{type_name}({})", entries.join(", "))
+            }
             Self::Range(range) => range.render(),
             Self::Function(function) => {
                 let sig = render_function_sig(&function.runtime_type());
@@ -3227,6 +3777,7 @@ impl Value {
                     FunctionValue::Host(function) => {
                         format!("<host function {} {}>", function.qualified_name(), sig)
                     }
+                    FunctionValue::Native(_) => format!("<native function {}>", sig),
                 }
             }
             Self::Econ(value) => format!("econ({})", value.borrow().snapshot.render()),
@@ -3278,6 +3829,10 @@ impl Value {
                     })
                     .collect(),
             ),
+            Self::Struct { type_name, .. } => ReplType::Named {
+                name: type_name.clone(),
+                arguments: Vec::new(),
+            },
             Self::Range(range) => ReplType::Range(Box::new(
                 range
                     .start
