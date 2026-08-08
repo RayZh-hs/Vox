@@ -9,5 +9,6 @@ pub mod mir;
 pub mod opt;
 pub mod plan;
 pub mod source;
+pub mod tier;
 pub mod types;
 pub mod value;

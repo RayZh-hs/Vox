@@ -576,9 +576,7 @@ fn mount_at_path<R: RuntimeRunner>(
     path: &Path,
 ) -> Result<Vec<vox_core::ids::LibraryId>, String> {
     if path.is_dir() {
-        runner
-            .mount_dir(path)
-            .map_err(|error| error.to_string())
+        runner.mount_dir(path).map_err(|error| error.to_string())
     } else {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("vox") => runner
@@ -708,13 +706,20 @@ fn render_optimization_statuses(statuses: &[OptimizationStatus]) -> String {
             } else {
                 dumps.join(",")
             };
+            let attrs = if status.attributes.is_empty() {
+                "-".to_owned()
+            } else {
+                status.attributes.join(",")
+            };
             let mut rendered = format!(
-                "{} mode={} rank={} artifact={} dumps={}",
+                "{} tier={} mode={} rank={} artifact={} dumps={} attrs={}",
                 status.object,
+                status.tier.as_str(),
                 status.requested.as_str(),
                 rank,
                 artifact,
-                dumps
+                dumps,
+                attrs
             );
             if let Some(note) = &status.runtime_note {
                 rendered.push_str(" note=");

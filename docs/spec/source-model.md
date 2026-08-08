@@ -2,6 +2,22 @@
 
 This chapter defines the file-level structure of Vox source code.
 
+## 0. Language Tiers
+
+Every compilation request selects a language tier. Tiers are cumulative:
+
+- tier 0 (`inline`) permits visible calls, operators, values, structs, traits,
+  and inline conditionals;
+- tier 1 (`eval`) adds blocks, `val`, loops, `when`, and `panic`;
+- tier 2 (`script`) adds functions, `var`, and imports;
+- tier 3 (`dev`) adds package authoring, native trait definitions, and `impl`;
+- tier 4 (`debug`) adds private-surface and debugger-only access.
+
+The compiler rejects syntax above the selected tier. Optimization metadata is
+attached to MIR bodies as `tier_inline`, `tier_eval`, `tier_script`,
+`tier_dev`, or `tier_debug`; a backend must not apply an attribute above the
+body's tier.
+
 ## 1. Files
 
 A Vox source file is exactly one of:
@@ -55,6 +71,7 @@ Package rules:
   with the same name are a collision;
 - a package exports its `public` declarations and `public import`s;
 - a package may contain `evil fun` declarations.
+- native `struct`, `trait`, and `impl` declarations require tier 3.
 
 ## 4. Script Files
 

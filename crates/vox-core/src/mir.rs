@@ -8,6 +8,7 @@ use crate::{
     host::Purity,
     opt::{OptimizationLevel, OptimizationRank},
     source::{ModuleKind, ModulePath},
+    tier::LanguageTier,
     types::VoxType,
     value::InlineValue,
 };
@@ -32,6 +33,8 @@ pub struct MirModule {
     pub module: ModulePath,
     pub kind: ModuleKind,
     pub optimization: OptimizationLevel,
+    pub tier: LanguageTier,
+    pub optimization_attributes: Vec<String>,
     pub bodies: Vec<MirBody>,
 }
 
@@ -66,6 +69,7 @@ pub struct MirBody {
     pub span: Option<TextSpan>,
     pub purity: Purity,
     pub optimization_rank: OptimizationRank,
+    pub optimization_attributes: Vec<String>,
     pub parameters: Vec<MirValueId>,
     pub captures: Vec<MirCapture>,
     pub bindings: Vec<MirBinding>,
@@ -80,14 +84,15 @@ impl MirBody {
     pub fn write_text(&self, out: &mut String) -> fmt::Result {
         writeln!(
             out,
-            "body @{} kind={} purity={} rank={} {{",
+            "body @{} kind={} purity={} rank={} attrs={} {{",
             self.name,
             self.kind.as_str(),
             match self.purity {
                 Purity::Pure => "pure",
                 Purity::Evil => "evil",
             },
-            self.optimization_rank.as_str()
+            self.optimization_rank.as_str(),
+            self.optimization_attributes.join(",")
         )?;
         self.analyses.write_text(out)?;
         for binding in &self.bindings {
@@ -403,20 +408,33 @@ pub enum MirOpKind {
     Bind(MirVersionId),
     Unary(String),
     Binary(String),
-    Tuple { shape: usize },
-    Record { fields: Vec<String> },
+    Tuple {
+        shape: usize,
+    },
+    Record {
+        fields: Vec<String>,
+    },
     List,
-    StringInterpolate { text: Vec<String> },
+    StringInterpolate {
+        text: Vec<String>,
+    },
     Project(MirProjection),
     Index,
-    Updated { path: Vec<MirPathSegment> },
-    Call { callee: String, purity: Purity },
+    Updated {
+        path: Vec<MirPathSegment>,
+    },
+    Call {
+        callee: String,
+        purity: Purity,
+    },
     Lambda {
         parameters: Vec<String>,
         captures: Vec<MirValueId>,
         body_id: MirBodyId,
     },
-    Econ { ty: String },
+    Econ {
+        ty: String,
+    },
     NonNull,
     SafeProject(String),
     TypeTest(String),

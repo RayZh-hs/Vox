@@ -48,3 +48,24 @@ pub struct OptimizationRanking {
     pub subject: OptimizationSubject,
     pub rank: OptimizationRank,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TierOptimization {
+    Baseline,
+    InteractiveCache,
+    SealedOwnership,
+    SealedDemand,
+    SealedMaterialization,
+}
+
+impl TierOptimization {
+    pub const fn attribute(self) -> &'static str {
+        match self {
+            Self::Baseline => "tier_inline",
+            Self::InteractiveCache => "tier_eval",
+            Self::SealedOwnership => "tier_script",
+            Self::SealedDemand => "tier_dev",
+            Self::SealedMaterialization => "tier_debug",
+        }
+    }
+}

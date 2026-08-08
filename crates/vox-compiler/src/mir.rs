@@ -40,10 +40,11 @@ pub struct MirPassReport {
 pub(crate) fn lower_mir(
     frontend: &FrontendUnit,
     optimization: OptimizationLevel,
+    tier: vox_core::tier::LanguageTier,
     rankings: &[vox_core::opt::OptimizationRanking],
     import_resolution: ImportResolution,
 ) -> MirModule {
-    MirLowerer::new(frontend, optimization, rankings, import_resolution).lower_module()
+    MirLowerer::new(frontend, optimization, tier, rankings, import_resolution).lower_module()
 }
 
 pub(crate) fn check_return_type_inference(
@@ -87,6 +88,7 @@ pub(crate) fn check_return_type_inference(
 struct MirLowerer<'a> {
     frontend: &'a FrontendUnit,
     optimization: OptimizationLevel,
+    tier: vox_core::tier::LanguageTier,
     rankings: &'a [vox_core::opt::OptimizationRanking],
     import_resolution: ImportResolution,
     function_return_types: BTreeMap<String, VoxType>,
@@ -98,6 +100,7 @@ impl<'a> MirLowerer<'a> {
     fn new(
         frontend: &'a FrontendUnit,
         optimization: OptimizationLevel,
+        tier: vox_core::tier::LanguageTier,
         rankings: &'a [vox_core::opt::OptimizationRanking],
         import_resolution: ImportResolution,
     ) -> Self {
@@ -105,6 +108,7 @@ impl<'a> MirLowerer<'a> {
         Self {
             frontend,
             optimization,
+            tier,
             rankings,
             import_resolution,
             function_return_types,
@@ -143,11 +147,19 @@ impl<'a> MirLowerer<'a> {
         }
 
         bodies.append(&mut self.lambda_bodies);
+        for body in &mut bodies {
+            body.optimization_attributes = vec![
+                format!("tier_{}", self.tier.as_str()),
+                format!("opt_{}", body.optimization_rank.as_str()),
+            ];
+        }
 
         MirModule {
             module: self.frontend.header.module.clone(),
             kind: self.frontend.header.kind,
             optimization: self.optimization,
+            tier: self.tier,
+            optimization_attributes: vec![format!("tier_{}", self.tier.as_str())],
             bodies,
         }
     }
@@ -385,6 +397,7 @@ impl BodyBuilder {
             span: self.span,
             purity: self.purity,
             optimization_rank: self.rank,
+            optimization_attributes: Vec::new(),
             parameters: self.parameters,
             captures: Vec::new(),
             bindings: self.bindings,
@@ -1633,7 +1646,11 @@ impl BodyBuilder {
             captures,
             Some(expr.span.clone()),
         );
-        if let Some(value) = self.values.iter_mut().find(|value| value.id == lambda_value) {
+        if let Some(value) = self
+            .values
+            .iter_mut()
+            .find(|value| value.id == lambda_value)
+        {
             value.ty = Some(VoxType::opaque_surface(format!(
                 "Function<{}>",
                 render_type_key(&result_ty)

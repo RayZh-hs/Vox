@@ -6,6 +6,7 @@ use std::{
 };
 
 use vox_compiler::{
+    TreewalkScript,
     frontend::ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompoundAssignmentOp, EconIntrinsic, Expr,
         ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LambdaParameter, Mutability,
@@ -13,7 +14,6 @@ use vox_compiler::{
         TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic, UpdatedPathSegment,
         ValueDecl,
     },
-    TreewalkScript,
 };
 use vox_core::{
     builtins::{self, BuiltinReceiver},
@@ -719,7 +719,11 @@ impl ModuleState {
             import.module.to_source_string() == path
                 || import.alias.as_ref().is_some_and(|alias| alias == path)
                 || (import.alias.is_none()
-                    && import.module.segments.last().is_some_and(|binding| binding == path))
+                    && import
+                        .module
+                        .segments
+                        .last()
+                        .is_some_and(|binding| binding == path))
         })
     }
 

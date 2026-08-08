@@ -12,10 +12,11 @@ use vox_core::{
     },
     opt::OptimizationLevel,
     source::{ModulePath, SourceText},
+    tier::LanguageTier,
     types::{QualifiedTypeName, VoxType},
 };
 use vox_runtime::infer_environment;
-use voxlib_sdk::{external_library::ExternalLibrary, vox_fn, VoxExport};
+use voxlib_sdk::{VoxExport, external_library::ExternalLibrary, vox_fn};
 
 use std::env;
 
@@ -50,11 +51,7 @@ fn point_distance(a: TestPoint, b: TestPoint) -> f64 {
 
 #[vox_fn(pure = true)]
 fn maybe_point(has: bool, x: i64, y: i64) -> Option<TestPoint> {
-    if has {
-        Some(TestPoint { x, y })
-    } else {
-        None
-    }
+    if has { Some(TestPoint { x, y }) } else { None }
 }
 
 #[vox_fn(pure = true)]
@@ -175,11 +172,17 @@ fn compile_with_registry(
 ) -> vox_compiler::CompileResult {
     let source = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", path.display()));
+    let tier = if source.trim_start().starts_with("package") {
+        LanguageTier::Dev
+    } else {
+        LanguageTier::Script
+    };
     Compiler::default().compile(CompileRequest {
         source: SourceText::new(path.display().to_string(), 1, source),
         optimization,
         optimization_overrides: Default::default(),
         host: registry,
+        tier,
     })
 }
 
@@ -405,6 +408,7 @@ fn voxlib_file_compile_write_and_mount_round_trip() {
         optimization: OptimizationLevel::SOpt,
         optimization_overrides: Default::default(),
         host: HostRegistry::default(),
+        tier: LanguageTier::Dev,
     };
     let voxlib_bytes =
         vox_compiler::compile_to_voxlib(request).expect("voxlib compilation should succeed");
@@ -541,6 +545,7 @@ fn image_manifest() -> PackageManifest {
         ],
         traits: vec![TraitSpec {
             name: qualified_type(&package, "Filter"),
+            fields: Vec::new(),
             methods: vec![TraitMethodSpec {
                 name: "apply".to_owned(),
                 lowered_by: "filter_apply".to_owned(),

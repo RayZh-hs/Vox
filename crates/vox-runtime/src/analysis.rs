@@ -5,7 +5,7 @@ use vox_compiler::frontend::ast::{
     Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, EconIntrinsic,
     Expr, ExprKind, ForHeader, FunctionDecl, ImportDecl, IntrinsicExpr, LocalValueDecl, Mutability,
     QualifiedName, StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
-    UpdatedPathSegment, ValueDecl, WhenExpr, Visibility,
+    UpdatedPathSegment, ValueDecl, Visibility, WhenExpr,
 };
 use vox_core::{
     builtins::{self, BuiltinReceiver},
@@ -495,6 +495,7 @@ impl<'a> TypeEngine<'a> {
         self.collect_function_headers()?;
         self.validate_native_declarations()?;
         self.check_method_guards()?;
+        self.infer_native_method_bodies()?;
         match self.unit.header.kind {
             ModuleKind::Package => {
                 self.collect_value_placeholders()?;
@@ -505,6 +506,62 @@ impl<'a> TypeEngine<'a> {
                 self.collect_parameter_bindings()?;
                 self.infer_parameter_defaults()?;
                 self.infer_script_items()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn infer_native_method_bodies(&mut self) -> Result<(), String> {
+        let methods = self
+            .unit
+            .items
+            .iter()
+            .flat_map(|item| match item {
+                TopLevelItem::Struct(structure) => structure
+                    .methods
+                    .iter()
+                    .map(|method| (method.clone(), structure.name.clone()))
+                    .collect::<Vec<_>>(),
+                TopLevelItem::Impl(implementation) => implementation
+                    .methods
+                    .iter()
+                    .map(|method| {
+                        (
+                            method.clone(),
+                            implementation.struct_name.to_source_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                TopLevelItem::Trait(_) => Vec::new(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        for (method, _) in methods {
+            let mut scope = self.top_level_scope();
+            self.infer_function_body(&method, &mut scope)?;
+        }
+        for trait_decl in self.unit.items.iter().filter_map(|item| match item {
+            TopLevelItem::Trait(trait_decl) => Some(trait_decl),
+            _ => None,
+        }) {
+            for method in &trait_decl.methods {
+                let Some(body) = &method.body else {
+                    continue;
+                };
+                let mut scope = self.top_level_scope();
+                let synthetic = FunctionDecl {
+                    docs: method.docs.clone(),
+                    visibility: method.visibility,
+                    evil: method.evil,
+                    associated: method.associated,
+                    name: method.name.clone(),
+                    generic_parameters: method.generic_parameters.clone(),
+                    parameters: method.parameters.clone(),
+                    return_type: method.return_type.clone(),
+                    body: body.clone(),
+                    span: method.span.clone(),
+                };
+                self.infer_function_body(&synthetic, &mut scope)?;
             }
         }
         Ok(())
@@ -568,8 +625,9 @@ impl<'a> TypeEngine<'a> {
                         .items
                         .iter()
                         .find_map(|item| match item {
-                            TopLevelItem::Trait(trait_decl)
-                                if trait_decl.name == trait_name => Some(trait_decl),
+                            TopLevelItem::Trait(trait_decl) if trait_decl.name == trait_name => {
+                                Some(trait_decl)
+                            }
                             _ => None,
                         })
                         .ok_or_else(|| format!("unknown trait `{trait_name}` in impl"))?;
@@ -578,8 +636,9 @@ impl<'a> TypeEngine<'a> {
                         .items
                         .iter()
                         .find_map(|item| match item {
-                            TopLevelItem::Struct(structure)
-                                if structure.name == struct_name => Some(structure),
+                            TopLevelItem::Struct(structure) if structure.name == struct_name => {
+                                Some(structure)
+                            }
                             _ => None,
                         })
                         .ok_or_else(|| format!("unknown struct `{struct_name}` in impl"))?;
@@ -588,11 +647,21 @@ impl<'a> TypeEngine<'a> {
                         .iter()
                         .filter(|field| matches!(field.visibility, Visibility::Public))
                     {
-                        let Some(implemented) = structure.fields.iter().find(|candidate| candidate.name == field.name) else {
-                            return Err(format!("struct `{struct_name}` is missing trait field `{}`", field.name));
+                        let Some(implemented) = structure
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.name == field.name)
+                        else {
+                            return Err(format!(
+                                "struct `{struct_name}` is missing trait field `{}`",
+                                field.name
+                            ));
                         };
                         if implemented.ty.to_source_string() != field.ty.to_source_string() {
-                            return Err(format!("trait field `{}` has incompatible type", field.name));
+                            return Err(format!(
+                                "trait field `{}` has incompatible type",
+                                field.name
+                            ));
                         }
                     }
                     for method in trait_decl
@@ -631,53 +700,53 @@ impl<'a> TypeEngine<'a> {
             })
             .flat_map(ImportDecl::expanded)
         {
-                let name = import.module.to_source_string();
-                let manifest = self
-                    .manifests
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| format!("imported package `{name}` is not mounted"))?;
+            let name = import.module.to_source_string();
+            let manifest = self
+                .manifests
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| format!("imported package `{name}` is not mounted"))?;
 
-                let selective = import.items.as_ref().map(|items| {
-                    items
-                        .iter()
-                        .map(|item| (item.name.clone(), item.alias.clone()))
-                        .collect::<Vec<_>>()
-                });
+            let selective = import.items.as_ref().map(|items| {
+                items
+                    .iter()
+                    .map(|item| (item.name.clone(), item.alias.clone()))
+                    .collect::<Vec<_>>()
+            });
 
-                if let Some(alias) = &import.alias {
-                    self.imports.insert(
-                        alias.clone(),
-                        ImportedPackage {
-                            manifest: Some(manifest.clone()),
-                            selective: selective.clone(),
-                        },
-                    );
-                    self.module_aliases.insert(alias.clone(), name.clone());
-                } else if let Some(binding) = import.module.segments.last() {
-                    self.imports.insert(
-                        binding.clone(),
-                        ImportedPackage {
-                            manifest: Some(manifest.clone()),
-                            selective: selective.clone(),
-                        },
-                    );
-                    self.module_aliases.insert(binding.clone(), name.clone());
-                }
-
+            if let Some(alias) = &import.alias {
                 self.imports.insert(
-                    name.clone(),
+                    alias.clone(),
                     ImportedPackage {
                         manifest: Some(manifest.clone()),
                         selective: selective.clone(),
                     },
                 );
+                self.module_aliases.insert(alias.clone(), name.clone());
+            } else if let Some(binding) = import.module.segments.last() {
+                self.imports.insert(
+                    binding.clone(),
+                    ImportedPackage {
+                        manifest: Some(manifest.clone()),
+                        selective: selective.clone(),
+                    },
+                );
+                self.module_aliases.insert(binding.clone(), name.clone());
+            }
 
-                if selective.is_none() {
-                    let mut seen = BTreeSet::new();
-                    seen.insert(name.clone());
-                    self.collect_reexported_imports(&name, &manifest, &mut seen)?;
-                }
+            self.imports.insert(
+                name.clone(),
+                ImportedPackage {
+                    manifest: Some(manifest.clone()),
+                    selective: selective.clone(),
+                },
+            );
+
+            if selective.is_none() {
+                let mut seen = BTreeSet::new();
+                seen.insert(name.clone());
+                self.collect_reexported_imports(&name, &manifest, &mut seen)?;
+            }
         }
         Ok(())
     }
@@ -1854,8 +1923,7 @@ impl<'a> TypeEngine<'a> {
                 other => Err(format!("cannot access field on `{}`", other.render())),
             },
             ReplType::Named {
-                name: type_name,
-                ..
+                name: type_name, ..
             } => self
                 .local_types
                 .values()
@@ -1866,6 +1934,20 @@ impl<'a> TypeEngine<'a> {
                 .and_then(|ty| ty.fields.iter().find(|field| field.name == name))
                 .map(|field| from_vox_host_type(&field.ty))
                 .ok_or_else(|| format!("type `{type_name}` has no field `{name}`")),
+            ReplType::DynTrait(trait_name) => self
+                .local_traits
+                .values()
+                .find(|trait_spec| {
+                    trait_spec.name.name == trait_name
+                        || format!(
+                            "{}.{}",
+                            trait_spec.name.module.as_str(),
+                            trait_spec.name.name
+                        ) == trait_name
+                })
+                .and_then(|trait_spec| trait_spec.fields.iter().find(|field| field.name == name))
+                .map(|field| from_vox_host_type(&field.ty))
+                .ok_or_else(|| format!("trait `{trait_name}` has no field `{name}`")),
             other => Err(format!("cannot access field on `{}`", other.render())),
         }
     }
@@ -1975,8 +2057,7 @@ impl<'a> TypeEngine<'a> {
 
     fn named_type_exists(&self, raw: &str) -> bool {
         if self.local_types.values().any(|ty| {
-            ty.name.name == raw
-                || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == raw
+            ty.name.name == raw || format!("{}.{}", ty.name.module.as_str(), ty.name.name) == raw
         }) {
             return true;
         }
@@ -1991,7 +2072,11 @@ impl<'a> TypeEngine<'a> {
     fn trait_type_exists(&self, raw: &str) -> bool {
         if self.local_traits.values().any(|trait_spec| {
             trait_spec.name.name == raw
-                || format!("{}.{}", trait_spec.name.module.as_str(), trait_spec.name.name) == raw
+                || format!(
+                    "{}.{}",
+                    trait_spec.name.module.as_str(),
+                    trait_spec.name.name
+                ) == raw
         }) {
             return true;
         }
@@ -2288,7 +2373,9 @@ impl<'a> TypeEngine<'a> {
         }
 
         if name.segments.len() == 2 {
-            if let Some(method) = self.local_associated_method_type(&name.segments[0], &name.segments[1]) {
+            if let Some(method) =
+                self.local_associated_method_type(&name.segments[0], &name.segments[1])
+            {
                 return Ok(method);
             }
         }
@@ -2307,7 +2394,11 @@ impl<'a> TypeEngine<'a> {
 
     fn local_constructor_type(&self, name: &str) -> Option<ReplType> {
         let ty = self.local_types.get(name)?;
-        let parameters = ty.fields.iter().map(|field| from_vox_host_type(&field.ty)).collect();
+        let parameters = ty
+            .fields
+            .iter()
+            .map(|field| from_vox_host_type(&field.ty))
+            .collect();
         Some(ReplType::Function {
             parameters,
             result: Box::new(ReplType::Named {
@@ -2318,28 +2409,27 @@ impl<'a> TypeEngine<'a> {
     }
 
     fn local_associated_method_type(&self, owner: &str, method: &str) -> Option<ReplType> {
-        let structure = self
-            .unit
-            .items
-            .iter()
-            .find_map(|item| match item {
-                TopLevelItem::Struct(structure) if structure.name == owner => Some(structure),
-                _ => None,
-            })?;
-        let function = structure.methods.iter().find(|function| {
-            function.associated && function.name == method
+        let structure = self.unit.items.iter().find_map(|item| match item {
+            TopLevelItem::Struct(structure) if structure.name == owner => Some(structure),
+            _ => None,
         })?;
+        let function = structure
+            .methods
+            .iter()
+            .find(|function| function.associated && function.name == method)?;
         Some(ReplType::Function {
             parameters: function
                 .parameters
                 .iter()
                 .map(|parameter| from_type_syntax(&parameter.ty, &BTreeMap::new()))
                 .collect(),
-            result: Box::new(function
-                .return_type
-                .as_ref()
-                .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
-                .unwrap_or(ReplType::Unit)),
+            result: Box::new(
+                function
+                    .return_type
+                    .as_ref()
+                    .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
+                    .unwrap_or(ReplType::Unit),
+            ),
         })
     }
 
@@ -2570,26 +2660,37 @@ impl<'a> TypeEngine<'a> {
 
         if let ReplType::Named { name, .. } = target_type {
             if let Some(structure) = self.local_types.get(name) {
-                if structure.fields.iter().any(|field| field.name == method_name) {
+                if structure
+                    .fields
+                    .iter()
+                    .any(|field| field.name == method_name)
+                {
                     return None;
                 }
                 if let Some(function) = self.unit.items.iter().find_map(|item| match item {
-                    TopLevelItem::Struct(structure) if structure.name == *name => {
-                        structure.methods.iter().find(|method| method.name == method_name)
-                    }
+                    TopLevelItem::Struct(structure) if structure.name == *name => structure
+                        .methods
+                        .iter()
+                        .find(|method| method.name == method_name),
                     _ => None,
                 }) {
-                    let mut parameters = vec![target_type.clone()];
-                    parameters.extend(function.parameters.iter().map(|parameter| {
-                        from_type_syntax(&parameter.ty, &BTreeMap::new())
-                    }));
+                    let mut parameters = Vec::with_capacity(function.parameters.len());
+                    parameters.extend(
+                        function
+                            .parameters
+                            .iter()
+                            .skip(1)
+                            .map(|parameter| from_type_syntax(&parameter.ty, &BTreeMap::new())),
+                    );
                     return Some(ReplType::Function {
                         parameters,
-                        result: Box::new(function
-                            .return_type
-                            .as_ref()
-                            .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
-                            .unwrap_or(ReplType::Unit)),
+                        result: Box::new(
+                            function
+                                .return_type
+                                .as_ref()
+                                .map(|ty| from_type_syntax(ty, &BTreeMap::new()))
+                                .unwrap_or(ReplType::Unit),
+                        ),
                     });
                 }
             }
@@ -3790,9 +3891,7 @@ fn method_receivers_overlap(left: &ReplType, right: &ReplType) -> bool {
             method_receivers_overlap(left, right)
         }
         (ReplType::List(left), ReplType::List(right))
-        | (ReplType::Range(left), ReplType::Range(right)) => {
-            method_receivers_overlap(left, right)
-        }
+        | (ReplType::Range(left), ReplType::Range(right)) => method_receivers_overlap(left, right),
         (ReplType::Tuple(left), ReplType::Tuple(right)) => {
             left.len() == right.len()
                 && left

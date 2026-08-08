@@ -10,12 +10,12 @@ use crate::frontend::{
         Argument, AssignmentStatement, BinaryOp, BlockExpr, BlockItem, BreakStatement,
         CompilationUnit, CompoundAssignmentOp, CompoundAssignmentStatement, ContinueStatement,
         EconIntrinsic, Expr, ExprKind, ForExpr, ForHeader, FrontendUnit, FunctionDecl,
-        GenericParameter, IfBranch, IfExpr, ImportDecl, ImportItem, IntrinsicExpr, LambdaExpr,
-        LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl, Parameter,
-        QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement, StringLiteral,
-        StringPart, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedArg, UpdatedIntrinsic,
-        UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr, StructDecl,
-        StructFieldDecl, TraitDecl, TraitMethodDecl, ImplDecl,
+        GenericParameter, IfBranch, IfExpr, ImplDecl, ImportDecl, ImportItem, IntrinsicExpr,
+        LambdaExpr, LambdaParameter, LocalValueDecl, Mutability, PanicStatement, ParamDecl,
+        Parameter, QualifiedName, RangeExpr, RecordFieldInit, RecordTypeField, ReturnStatement,
+        StringLiteral, StringPart, StructDecl, StructFieldDecl, TopLevelItem, TraitDecl,
+        TraitMethodDecl, TypeKind, TypeSyntax, UnaryOp, UpdatedArg, UpdatedIntrinsic,
+        UpdatedPathSegment, ValueDecl, Visibility, WhenArm, WhenExpr,
     },
     lexer::{LexedStringPart, Lexer, Token, TokenKind},
 };
@@ -348,9 +348,7 @@ impl Parser {
                 TokenKind::Public | TokenKind::Private
             )
         {
-            return self.error_here(
-                "visibility modifiers apply only to declarations",
-            );
+            return self.error_here("visibility modifiers apply only to declarations");
         }
 
         Ok(None)
@@ -502,8 +500,7 @@ impl Parser {
             let item_start = self.current().span.start;
             let (name, _) = self.expect_identifier("expected imported name")?;
             let item_alias = if self.consume(TokenKind::As) {
-                let (alias_name, _) =
-                    self.expect_identifier("expected alias name after `as`")?;
+                let (alias_name, _) = self.expect_identifier("expected alias name after `as`")?;
                 Some(alias_name)
             } else {
                 None
@@ -825,7 +822,10 @@ impl Parser {
                 self.expect_simple(TokenKind::Semicolon, "expected `;` after trait method")?;
                 Some(expr)
             } else {
-                self.expect_simple(TokenKind::Semicolon, "expected `;` after trait method signature")?;
+                self.expect_simple(
+                    TokenKind::Semicolon,
+                    "expected `;` after trait method signature",
+                )?;
                 None
             };
             methods.push(TraitMethodDecl {
@@ -959,7 +959,10 @@ impl Parser {
         };
         let body = if self.consume(TokenKind::Assign) {
             let expr = self.parse_expr()?;
-            self.expect_simple(TokenKind::Semicolon, "expected `;` after expression-bodied function")?;
+            self.expect_simple(
+                TokenKind::Semicolon,
+                "expected `;` after expression-bodied function",
+            )?;
             expr
         } else {
             self.parse_block_expr_required()?

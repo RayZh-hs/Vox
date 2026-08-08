@@ -5,6 +5,7 @@ use crate::{
     mir::MirModule,
     opt::{OptimizationLevel, OptimizationRank, OptimizationRanking},
     source::{ModuleKind, ModulePath},
+    tier::LanguageTier,
     types::VoxType,
     value::InlineValue,
 };
@@ -77,6 +78,7 @@ pub struct CompiledArtifact {
     pub module: ModulePath,
     pub kind: ModuleKind,
     pub optimization: OptimizationLevel,
+    pub tier: LanguageTier,
     pub optimization_rankings: Vec<OptimizationRanking>,
     pub parameters: Vec<ParameterSpec>,
     pub result_type: Option<VoxType>,

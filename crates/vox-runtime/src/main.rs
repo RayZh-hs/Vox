@@ -1,7 +1,4 @@
-use std::{
-    env, error::Error,
-    path::PathBuf,
-};
+use std::{env, error::Error, path::PathBuf};
 
 use vox_runtime::{Runtime, RuntimeServer};
 
@@ -38,9 +35,7 @@ fn parse_args() -> Result<(String, Vec<PathBuf>), Box<dyn Error>> {
                 mount_paths.push(PathBuf::from(path));
             }
             "--help" | "-h" => {
-                println!(
-                    "Usage: vox-runtime [--listen host:port] [--mount <path>]..."
-                );
+                println!("Usage: vox-runtime [--listen host:port] [--mount <path>]...");
                 std::process::exit(0);
             }
             other => {
@@ -64,11 +59,7 @@ fn mount_at_path(runtime: &mut Runtime, path: &std::path::Path) -> Result<(), Bo
                 runtime.mount_voxlib_file(path)?;
             }
             other => {
-                return Err(format!(
-                    "unsupported file extension for mounting: {:?}",
-                    other
-                )
-                .into());
+                return Err(format!("unsupported file extension for mounting: {:?}", other).into());
             }
         }
     }

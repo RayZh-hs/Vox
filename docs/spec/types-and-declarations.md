@@ -116,7 +116,27 @@ fun mix[T: Numeric](a: T, b: T, t: Float): T = a;
 fun pair[A: Show, B: Show](a: A, b: B): (A, B) = (a, b);
 ```
 
-## 4. Imports
+## 4. Native Structs and Traits
+
+Native structs and traits are available at their declared tier. Struct fields
+and methods are public by default and accept `private` for debug-only access.
+
+```ebnf
+StructDecl ::= VisibilityModifier? "struct" Identifier "{" StructMember* "}"
+StructMember ::= VisibilityModifier? ("val" | "var") Identifier ":" Type ";"
+               | VisibilityModifier? "struct"? EvilModifier? "fun" Identifier
+                 "(" ParameterList? ")" ReturnTypeAnnotation? FunctionBody
+TraitDecl ::= VisibilityModifier? "trait" Identifier "{" TraitMember* "}"
+ImplDecl ::= "impl" QualifiedIdentifier "for" QualifiedIdentifier
+             (";" | "{" FunctionDecl* "}")
+```
+
+An instance method receives an implicit `self` parameter. `struct fun` declares
+an associated function and does not receive `self`. A trait implementation must
+provide every public trait field and method, either in the struct, in the
+implementation block, or through a visible function with the same receiver.
+
+## 5. Imports
 
 ```ebnf
 ImportDecl
@@ -136,7 +156,7 @@ Selective imports, nested selective imports, and explicit module/item aliasing
 are supported by the frontend and runtime. An explicit module alias replaces
 the implicit final segment binding.
 
-## 5. Script Parameters
+## 6. Script Parameters
 
 ```ebnf
 ParamDecl
@@ -152,7 +172,7 @@ Rules:
 - script parameters define the script entrypoint inputs;
 - a parameter with a default value may be omitted by the caller.
 
-## 6. Value Declarations
+## 7. Value Declarations
 
 ```ebnf
 ValueDecl
@@ -177,7 +197,7 @@ Rules:
 - package top-level value declarations must use `val`;
 - script top-level and local value declarations may use either `val` or `var`.
 
-## 7. Function Declarations
+## 8. Function Declarations
 
 ```ebnf
 FunctionDecl
@@ -212,7 +232,7 @@ Rules:
 - script function headers are visible throughout the whole script, including
   before the function body appears in source order.
 
-## 8. Visibility Modifiers
+## 9. Visibility Modifiers
 
 ```ebnf
 VisibilityModifier

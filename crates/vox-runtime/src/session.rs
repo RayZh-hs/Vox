@@ -746,6 +746,8 @@ impl<R: RuntimeRunner> SessionState<R> {
             mir_available: false,
             wasm_available: false,
             runtime_note: None,
+            tier: vox_core::tier::LanguageTier::Script,
+            attributes: Vec::new(),
         }];
         statuses.extend(functions.into_iter().map(|function| {
             OptimizationStatus {
@@ -760,6 +762,8 @@ impl<R: RuntimeRunner> SessionState<R> {
                 mir_available: false,
                 wasm_available: false,
                 runtime_note: None,
+                tier: vox_core::tier::LanguageTier::Script,
+                attributes: Vec::new(),
             }
         }));
         Ok(statuses)

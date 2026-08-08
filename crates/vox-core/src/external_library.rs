@@ -122,6 +122,11 @@ pub fn encode_package_manifest(
     writer.write_len(manifest.traits.len(), "trait list")?;
     for trait_spec in &manifest.traits {
         encode_qualified_type_name(&mut writer, &trait_spec.name)?;
+        writer.write_len(trait_spec.fields.len(), "trait field list")?;
+        for field in &trait_spec.fields {
+            writer.write_string(&field.name)?;
+            encode_vox_type(&mut writer, &field.ty)?;
+        }
         writer.write_len(trait_spec.methods.len(), "trait method list")?;
         for method in &trait_spec.methods {
             writer.write_string(&method.name)?;
@@ -201,6 +206,14 @@ pub fn decode_package_manifest(
     let mut traits = Vec::with_capacity(trait_count);
     for _ in 0..trait_count {
         let name = decode_qualified_type_name(&mut reader)?;
+        let field_count = reader.read_u32()? as usize;
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            fields.push(FieldSpec {
+                name: reader.read_string()?,
+                ty: decode_vox_type(&mut reader)?,
+            });
+        }
         let method_count = reader.read_u32()? as usize;
         let mut methods = Vec::with_capacity(method_count);
         for _ in 0..method_count {
@@ -221,7 +234,11 @@ pub fn decode_package_manifest(
                 purity,
             });
         }
-        traits.push(TraitSpec { name, methods });
+        traits.push(TraitSpec {
+            name,
+            fields,
+            methods,
+        });
     }
 
     let function_count = reader.read_u32()? as usize;

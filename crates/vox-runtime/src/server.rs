@@ -137,6 +137,14 @@ fn encode_optimization_statuses(
             })?);
         }
         writer.write_string(status.runtime_note.as_deref().unwrap_or_default())?;
+        writer.write_u8(status.tier.as_u8());
+        writer.write_u32(
+            u32::try_from(status.attributes.len())
+                .map_err(|_| ProtocolError::message("optimization attribute count exceeds u32"))?,
+        );
+        for attribute in &status.attributes {
+            writer.write_string(attribute)?;
+        }
     }
     Ok(())
 }

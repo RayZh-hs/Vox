@@ -14,6 +14,7 @@ use vox_core::{
     opt::{OptimizationLevel, OptimizationSubject},
     plan::{CompiledArtifact, DependencyFingerprint, ExecutablePlan},
     source::{ModuleKind, ModulePath, SourceText},
+    tier::LanguageTier,
     types::VoxType,
 };
 
@@ -31,6 +32,7 @@ pub struct CompileRequest {
     pub optimization: OptimizationLevel,
     pub optimization_overrides: BTreeMap<String, OptimizationLevel>,
     pub host: HostRegistry,
+    pub tier: LanguageTier,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,7 @@ impl Compiler {
     ) -> CompileResult {
         match analyze_source(&request.source) {
             Ok(frontend) => {
+                let tier_diagnostics = validate_tier(&frontend, request.tier);
                 let treewalk = TreewalkScript::lower(&frontend).ok();
                 let pipeline_optimization = request
                     .optimization_overrides
@@ -67,6 +70,7 @@ impl Compiler {
                 let optimization_rankings = derive_rankings(
                     &frontend,
                     request.optimization,
+                    request.tier,
                     &request.optimization_overrides,
                 );
                 let module_rank = optimization_rankings
@@ -79,6 +83,7 @@ impl Compiler {
                 let mut mir = lower_mir(
                     &frontend,
                     request.optimization,
+                    request.tier,
                     &optimization_rankings,
                     build_import_resolution(&frontend, &request.host),
                 );
@@ -93,6 +98,7 @@ impl Compiler {
                     module: frontend.header.module.clone(),
                     kind: frontend.header.kind,
                     optimization: request.optimization,
+                    tier: request.tier,
                     optimization_rankings,
                     parameters: frontend
                         .parameters
@@ -113,7 +119,7 @@ impl Compiler {
                         .with_mir(&mir, optimization_summary)
                         .with_wasm(backend.wasm),
                     mir: Some(mir),
-                    diagnostics: DiagnosticBag::default(),
+                    diagnostics: tier_diagnostics.clone(),
                     dependencies: collect_dependencies(&request),
                     source_revision: request.source.origin.revision,
                 };
@@ -122,7 +128,11 @@ impl Compiler {
                     artifact: Some(artifact),
                     frontend: Some(frontend),
                     treewalk,
-                    diagnostics: return_type_diagnostics,
+                    diagnostics: {
+                        let mut diagnostics = return_type_diagnostics;
+                        diagnostics.extend(tier_diagnostics.into_vec());
+                        diagnostics
+                    },
                 }
             }
             Err(diagnostics) => CompileResult {
@@ -133,6 +143,95 @@ impl Compiler {
             },
         }
     }
+}
+
+fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticBag {
+    let mut diagnostics = DiagnosticBag::default();
+    let required = |required: LanguageTier, span: &vox_core::diagnostics::TextSpan, name: &str| {
+        if !tier.supports(required) {
+            Some(
+                vox_core::diagnostics::Diagnostic::error(format!(
+                    "{name} requires the {} tier, but this unit is compiled at the {} tier",
+                    required.as_str(),
+                    tier.as_str()
+                ))
+                .with_span(span.clone()),
+            )
+        } else {
+            None
+        }
+    };
+    for item in &frontend.syntax.items {
+        match item {
+            TopLevelItem::Struct(structure) => {
+                let needed = if matches!(frontend.header.kind, ModuleKind::Package) {
+                    LanguageTier::Dev
+                } else {
+                    LanguageTier::Eval
+                };
+                if let Some(error) = required(needed, &structure.span, "struct declarations") {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                let needed = if matches!(frontend.header.kind, ModuleKind::Package) {
+                    LanguageTier::Dev
+                } else {
+                    LanguageTier::Inline
+                };
+                if let Some(error) = required(needed, &trait_decl.span, "trait declarations") {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                if let Some(error) = required(
+                    LanguageTier::Dev,
+                    &implementation.span,
+                    "trait implementations",
+                ) {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Function(function)
+                if matches!(frontend.header.kind, ModuleKind::Script { .. }) =>
+            {
+                if let Some(error) = required(
+                    LanguageTier::Script,
+                    &function.span,
+                    "function declarations",
+                ) {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Function(function) => {
+                if let Some(error) =
+                    required(LanguageTier::Dev, &function.span, "package functions")
+                {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Value(value)
+                if matches!(value.mutability, crate::frontend::ast::Mutability::Var) =>
+            {
+                if let Some(error) = required(LanguageTier::Script, &value.span, "mutable values") {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Value(value) => {
+                if let Some(error) = required(LanguageTier::Eval, &value.span, "value declarations")
+                {
+                    diagnostics.push(error);
+                }
+            }
+            TopLevelItem::Import(import) => {
+                if let Some(error) = required(LanguageTier::Script, &import.span, "imports") {
+                    diagnostics.push(error);
+                }
+            }
+            _ => {}
+        }
+    }
+    diagnostics
 }
 
 fn collect_dependencies(request: &CompileRequest) -> Vec<DependencyFingerprint> {
@@ -161,6 +260,9 @@ fn build_import_resolution(frontend: &FrontendUnit, host: &HostRegistry) -> Impo
 
 pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
     let result = Compiler::default().compile(request);
+    if result.diagnostics.has_errors() {
+        return Err(result.diagnostics.to_string());
+    }
     let artifact = result
         .artifact
         .ok_or_else(|| result.diagnostics.to_string())?;
@@ -240,6 +342,15 @@ pub fn surface_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifes
                             module: frontend.header.module.clone(),
                             name: trait_decl.name.clone(),
                         },
+                        fields: trait_decl
+                            .fields
+                            .iter()
+                            .filter(|field| matches!(field.visibility, Visibility::Public))
+                            .map(|field| vox_core::host::FieldSpec {
+                                name: field.name.clone(),
+                                ty: VoxType::opaque_surface(field.ty.to_source_string()),
+                            })
+                            .collect(),
                         methods: trait_decl
                             .methods
                             .iter()
@@ -250,9 +361,12 @@ pub fn surface_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifes
                                 parameters: method
                                     .parameters
                                     .iter()
+                                    .skip(if method.associated { 0 } else { 1 })
                                     .map(|parameter| ParameterSpec {
                                         name: parameter.name.clone(),
-                                        ty: VoxType::opaque_surface(parameter.ty.to_source_string()),
+                                        ty: VoxType::opaque_surface(
+                                            parameter.ty.to_source_string(),
+                                        ),
                                         has_default: parameter.default.is_some(),
                                     })
                                     .collect(),
@@ -260,8 +374,17 @@ pub fn surface_manifest_from_frontend(frontend: &FrontendUnit) -> PackageManifes
                                     .return_type
                                     .as_ref()
                                     .map(|ty| VoxType::opaque_surface(ty.to_source_string()))
-                                    .unwrap_or_else(|| VoxType::opaque_surface(format!("{} return type", method.name))),
-                                purity: if method.evil { Purity::Evil } else { Purity::Pure },
+                                    .unwrap_or_else(|| {
+                                        VoxType::opaque_surface(format!(
+                                            "{} return type",
+                                            method.name
+                                        ))
+                                    }),
+                                purity: if method.evil {
+                                    Purity::Evil
+                                } else {
+                                    Purity::Pure
+                                },
                             })
                             .collect(),
                     })

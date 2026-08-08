@@ -5,13 +5,11 @@ use std::{
     process,
 };
 
-use vox_core::{
-    external_library::decode_external_library_file,
-    host::HostRegistry,
-    opt::OptimizationLevel,
-    source::SourceText,
-};
 use vox_compiler::{CompileRequest, Compiler, compile_to_voxlib};
+use vox_core::{
+    external_library::decode_external_library_file, host::HostRegistry, opt::OptimizationLevel,
+    source::SourceText, tier::LanguageTier,
+};
 
 fn main() {
     if let Err(error) = run() {
@@ -30,11 +28,7 @@ fn run() -> Result<(), String> {
 
     let source_text = fs::read_to_string(&args.input)
         .map_err(|error| format!("cannot read `{}`: {error}", args.input.display()))?;
-    let source = SourceText::new(
-        &args.input.to_string_lossy(),
-        1,
-        &source_text,
-    );
+    let source = SourceText::new(&args.input.to_string_lossy(), 1, &source_text);
 
     let is_package = args.force_package || is_package_source(&source_text);
 
@@ -44,6 +38,7 @@ fn run() -> Result<(), String> {
             optimization: OptimizationLevel::SOpt,
             optimization_overrides: BTreeMap::new(),
             host,
+            tier: LanguageTier::Dev,
         };
         let voxlib_bytes = compile_to_voxlib(request)?;
         let output = output_path(&args.input, args.output.as_deref(), "voxlib");
@@ -56,8 +51,12 @@ fn run() -> Result<(), String> {
             optimization: OptimizationLevel::SOpt,
             optimization_overrides: BTreeMap::new(),
             host,
+            tier: args.tier,
         };
         let result = Compiler::default().compile(request);
+        if result.diagnostics.has_errors() {
+            return Err(result.diagnostics.to_string());
+        }
         let artifact = result
             .artifact
             .ok_or_else(|| result.diagnostics.to_string())?;
@@ -65,9 +64,7 @@ fn run() -> Result<(), String> {
             .plan
             .wasm
             .as_ref()
-            .ok_or_else(|| {
-                "wasm artifact was not produced (unsupported MIR shape)".to_owned()
-            })?
+            .ok_or_else(|| "wasm artifact was not produced (unsupported MIR shape)".to_owned())?
             .bytes
             .clone();
         let output = output_path(&args.input, args.output.as_deref(), "wasm");
@@ -80,9 +77,7 @@ fn run() -> Result<(), String> {
 }
 
 fn is_package_source(source: &str) -> bool {
-    source
-        .trim_start()
-        .starts_with("package")
+    source.trim_start().starts_with("package")
 }
 
 struct Args {
@@ -90,6 +85,7 @@ struct Args {
     output: Option<PathBuf>,
     mounts: Vec<PathBuf>,
     force_package: bool,
+    tier: LanguageTier,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -98,6 +94,7 @@ fn parse_args() -> Result<Args, String> {
     let mut output = None;
     let mut mounts = Vec::new();
     let mut force_package = false;
+    let mut tier = LanguageTier::Script;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -114,6 +111,15 @@ fn parse_args() -> Result<Args, String> {
                 output = Some(PathBuf::from(path));
             }
             "--package" => force_package = true,
+            "--tier" => {
+                let Some(raw) = args.next() else {
+                    return Err("`--tier` requires a number from 0 to 4".to_owned());
+                };
+                let value = raw
+                    .parse::<u8>()
+                    .map_err(|_| "`--tier` must be a number from 0 to 4".to_owned())?;
+                tier = LanguageTier::try_from(value).map_err(|error| error.to_owned())?;
+            }
             "--help" | "-h" => {
                 print_help();
                 process::exit(0);
@@ -144,14 +150,15 @@ fn parse_args() -> Result<Args, String> {
         output,
         mounts,
         force_package,
+        tier,
     })
 }
 
 fn mount_library(host: &mut HostRegistry, path: &Path) -> Result<(), String> {
     if path.is_dir() {
         let mut count = 0usize;
-        for entry in
-            fs::read_dir(path).map_err(|error| format!("cannot read `{}`: {error}", path.display()))?
+        for entry in fs::read_dir(path)
+            .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?
         {
             let entry = entry.map_err(|error| format!("cannot read entry: {error}"))?;
             let entry_path = entry.path();
@@ -162,7 +169,11 @@ fn mount_library(host: &mut HostRegistry, path: &Path) -> Result<(), String> {
                 }
             }
         }
-        eprintln!("mounted {count} librar{} from `{}`", if count == 1 { "y" } else { "ies" }, path.display());
+        eprintln!(
+            "mounted {count} librar{} from `{}`",
+            if count == 1 { "y" } else { "ies" },
+            path.display()
+        );
     } else {
         match path.extension().and_then(|ext| ext.to_str()) {
             Some("voxlib") => mount_voxlib(host, path)?,
@@ -174,10 +185,7 @@ fn mount_library(host: &mut HostRegistry, path: &Path) -> Result<(), String> {
                 ));
             }
             _ => {
-                return Err(format!(
-                    "unsupported mount file type: `{}`",
-                    path.display()
-                ));
+                return Err(format!("unsupported mount file type: `{}`", path.display()));
             }
         }
     }
@@ -185,8 +193,8 @@ fn mount_library(host: &mut HostRegistry, path: &Path) -> Result<(), String> {
 }
 
 fn mount_voxlib(host: &mut HostRegistry, path: &Path) -> Result<(), String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
+    let bytes =
+        fs::read(path).map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
     let header = decode_external_library_file(&bytes)
         .map_err(|error| format!("invalid .voxlib `{}`: {error}", path.display()))?;
     host.register_package(header.manifest);
@@ -212,6 +220,7 @@ fn print_help() {
     eprintln!("  --mount PATH    Mount a library directory, .vox, or .voxlib file (repeatable)");
     eprintln!("  -o OUTPUT       Output file path (default: input stem with .wasm or .voxlib)");
     eprintln!("  --package       Force .voxlib output even for script sources");
+    eprintln!("  --tier N        Compile at language tier 0 (inline) through 4 (debug)");
     eprintln!("  -h, --help      Show this help message");
     eprintln!();
     eprintln!("Examples:");

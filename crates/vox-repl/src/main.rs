@@ -62,7 +62,13 @@ const CONTINUATION_PROMPT: &str = "... ";
 const INDENT: &str = "    ";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let CliArgs { connect, script_path, interactive, silent, script_args } = parse_cli_args()?;
+    let CliArgs {
+        connect,
+        script_path,
+        interactive,
+        silent,
+        script_args,
+    } = parse_cli_args()?;
     let runner = match connect {
         Some(spec) => RunnerChoice::Remote {
             runner: RemoteRunner::connect(spec.addr)?,
@@ -87,7 +93,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 run_repl(session)?;
             }
         }
-        RunnerChoice::Remote { runner, session: session_req } => {
+        RunnerChoice::Remote {
+            runner,
+            session: session_req,
+        } => {
             let mut session = ReplSession::with_session_request(runner, session_req);
             if let Some(ref path) = script_path {
                 if let Err(error) = run_script_file(&mut session, path, silent, &script_args) {

@@ -27,6 +27,7 @@ use vox_core::{
     opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
     plan::CompiledArtifact,
     source::{ModuleKind, ModulePath, SourceText},
+    tier::LanguageTier,
     value::{HandleData, HandleSummary, RuntimeValue},
 };
 
@@ -99,6 +100,8 @@ pub struct OptimizationStatus {
     pub mir_available: bool,
     pub wasm_available: bool,
     pub runtime_note: Option<String>,
+    pub tier: LanguageTier,
+    pub attributes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +249,7 @@ impl Runtime {
             optimization: self.default_xopt,
             optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
+            tier: LanguageTier::Dev,
         });
 
         if result.diagnostics.has_errors() {
@@ -373,6 +377,7 @@ impl Runtime {
             optimization: requested,
             optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
+            tier: LanguageTier::Script,
         };
         let result = self.compiler.compile(request);
 
@@ -417,6 +422,7 @@ impl Runtime {
             optimization: xopt,
             optimization_overrides: BTreeMap::new(),
             host: self.host.clone(),
+            tier: LanguageTier::Script,
         };
         let result = self.compiler.compile(request);
 
@@ -460,6 +466,7 @@ impl Runtime {
             optimization: settings.default,
             optimization_overrides: settings.overrides,
             host: self.host.clone(),
+            tier: LanguageTier::Script,
         };
         let result = self.compiler.compile(request);
 
@@ -497,6 +504,7 @@ impl Runtime {
             optimization: settings.default,
             optimization_overrides: settings.overrides,
             host: self.host.clone(),
+            tier: LanguageTier::Script,
         };
         let result = self.compiler.compile(request);
 
@@ -963,6 +971,12 @@ fn artifact_optimization_statuses(
             .mir_execution_failures
             .get(&artifact_id)
             .map(|message| format!("MIR execution fell back to interpreter: {message}")),
+        tier: artifact.tier,
+        attributes: artifact
+            .mir
+            .as_ref()
+            .map(|mir| mir.optimization_attributes.clone())
+            .unwrap_or_default(),
     });
 
     for ranking in &artifact.optimization_rankings {
@@ -984,6 +998,13 @@ fn artifact_optimization_statuses(
                 .is_some_and(|mir| mir.bodies.iter().any(|body| body.name == *name)),
             wasm_available: false,
             runtime_note: None,
+            tier: artifact.tier,
+            attributes: artifact
+                .mir
+                .as_ref()
+                .and_then(|mir| mir.bodies.iter().find(|body| body.name == *name))
+                .map(|body| body.optimization_attributes.clone())
+                .unwrap_or_default(),
         });
     }
 

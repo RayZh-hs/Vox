@@ -4,6 +4,7 @@ use vox_core::{
     mir::MirModule,
     opt::{OptimizationLevel, OptimizationRank, OptimizationRanking, OptimizationSubject},
     source::ModuleKind,
+    tier::LanguageTier,
 };
 
 use crate::mir::{
@@ -113,12 +114,13 @@ impl OptimizationPipeline {
 pub fn derive_rankings(
     frontend: &FrontendUnit,
     level: OptimizationLevel,
+    tier: LanguageTier,
     overrides: &BTreeMap<String, OptimizationLevel>,
 ) -> Vec<OptimizationRanking> {
     let mut rankings = Vec::new();
     rankings.push(OptimizationRanking {
         subject: OptimizationSubject::Module,
-        rank: rank_module(&frontend.syntax, level),
+        rank: rank_module(&frontend.syntax, level, tier),
     });
 
     for function in frontend.syntax.items.iter().filter_map(|item| match item {
@@ -128,14 +130,18 @@ pub fn derive_rankings(
         let function_level = overrides.get(&function.name).copied().unwrap_or(level);
         rankings.push(OptimizationRanking {
             subject: OptimizationSubject::Function(function.name.clone()),
-            rank: rank_function(function, function_level),
+            rank: rank_function(function, function_level, tier),
         });
     }
 
     rankings
 }
 
-fn rank_module(unit: &CompilationUnit, level: OptimizationLevel) -> OptimizationRank {
+fn rank_module(
+    unit: &CompilationUnit,
+    level: OptimizationLevel,
+    tier: LanguageTier,
+) -> OptimizationRank {
     let mut features = RankFeatures::default();
     for item in &unit.items {
         match item {
@@ -154,24 +160,29 @@ fn rank_module(unit: &CompilationUnit, level: OptimizationLevel) -> Optimization
     }
 
     let evil = matches!(unit.header.kind, ModuleKind::Script { evil: true });
-    rank_from_features(level, evil, features)
+    rank_from_features(level, tier, evil, features)
 }
 
-fn rank_function(function: &FunctionDecl, level: OptimizationLevel) -> OptimizationRank {
+fn rank_function(
+    function: &FunctionDecl,
+    level: OptimizationLevel,
+    tier: LanguageTier,
+) -> OptimizationRank {
     let mut features = RankFeatures::default();
     visit_expr(&function.body, &mut features);
-    rank_from_features(level, function.evil, features)
+    rank_from_features(level, tier, function.evil, features)
 }
 
 fn rank_from_features(
     level: OptimizationLevel,
+    tier: LanguageTier,
     evil: bool,
     features: RankFeatures,
 ) -> OptimizationRank {
     match level {
         OptimizationLevel::NOpt => OptimizationRank::Baseline,
         OptimizationLevel::IOpt => OptimizationRank::Interactive,
-        OptimizationLevel::SOpt => {
+        OptimizationLevel::SOpt if tier.supports(LanguageTier::Dev) => {
             if evil {
                 return OptimizationRank::SealedOwnership;
             }
@@ -186,6 +197,7 @@ fn rank_from_features(
 
             OptimizationRank::SealedOwnership
         }
+        OptimizationLevel::SOpt => OptimizationRank::Interactive,
     }
 }
 

@@ -1082,6 +1082,14 @@ fn decode_optimization_statuses(bytes: &[u8]) -> Result<Vec<OptimizationStatus>,
             note if note.is_empty() => None,
             note => Some(note),
         };
+        let tier =
+            vox_core::tier::LanguageTier::try_from(reader.read_u8().map_err(protocol_to_runner)?)
+                .map_err(|error| RunnerError::Protocol(error.to_owned()))?;
+        let attribute_count = reader.read_u32().map_err(protocol_to_runner)? as usize;
+        let mut attributes = Vec::with_capacity(attribute_count);
+        for _ in 0..attribute_count {
+            attributes.push(reader.read_string().map_err(protocol_to_runner)?);
+        }
         statuses.push(OptimizationStatus {
             object,
             requested,
@@ -1090,6 +1098,8 @@ fn decode_optimization_statuses(bytes: &[u8]) -> Result<Vec<OptimizationStatus>,
             mir_available,
             wasm_available,
             runtime_note,
+            tier,
+            attributes,
         });
     }
     reader.finish().map_err(protocol_to_runner)?;

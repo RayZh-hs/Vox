@@ -430,11 +430,9 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let explicit_params = body.parameters.len().saturating_sub(capture_count);
-            *closure_type_indices
-                .get(&explicit_params)
-                .ok_or_else(|| {
-                    format!("missing wasm closure type for {explicit_params} explicit parameters")
-                })?
+            *closure_type_indices.get(&explicit_params).ok_or_else(|| {
+                format!("missing wasm closure type for {explicit_params} explicit parameters")
+            })?
         } else {
             *body_type_indices
                 .get(&body.parameters.len())
@@ -960,7 +958,10 @@ fn require_numeric_args(
                 render_mir_type(value_type(body, *arg))
             ));
         };
-        if !matches!(actual, WasmScalar::Int | WasmScalar::UInt | WasmScalar::Float) {
+        if !matches!(
+            actual,
+            WasmScalar::Int | WasmScalar::UInt | WasmScalar::Float
+        ) {
             return Err(format!(
                 "op `{op}` expected numeric operand, found {}",
                 actual.as_str()
@@ -993,8 +994,7 @@ fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
             matches!(
                 name.as_str(),
                 "Int" | "UInt" | "Float" | "Bool" | "String" | "Null"
-            )
-                || name.starts_with("Iterator<")
+            ) || name.starts_with("Iterator<")
                 || name.starts_with("Function<")
         }
         _ => false,

@@ -337,9 +337,9 @@ fn method_guard_import_span(
                 return None;
             }
             if let Some(item) = import.items.as_ref().and_then(|items| {
-                items.iter().find(|item| {
-                    message.contains(&format!("`{package}.{}", item.name))
-                })
+                items
+                    .iter()
+                    .find(|item| message.contains(&format!("`{package}.{}", item.name)))
             }) {
                 return Some(item.span.clone());
             }
@@ -2693,10 +2693,14 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
                     .or_insert(CompletionItemKind::MODULE);
             }
             TopLevelItem::Struct(s) => {
-                names.entry(s.name.clone()).or_insert(CompletionItemKind::STRUCT);
+                names
+                    .entry(s.name.clone())
+                    .or_insert(CompletionItemKind::STRUCT);
             }
             TopLevelItem::Trait(t) => {
-                names.entry(t.name.clone()).or_insert(CompletionItemKind::INTERFACE);
+                names
+                    .entry(t.name.clone())
+                    .or_insert(CompletionItemKind::INTERFACE);
             }
             TopLevelItem::Impl(_) => {}
         }

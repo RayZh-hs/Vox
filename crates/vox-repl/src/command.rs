@@ -220,8 +220,8 @@ mod tests {
 
     #[test]
     fn parses_mount_unquoted_paths() {
-        let command = ReplCommand::from_str(":mount /tmp/foo /tmp/bar")
-            .expect("command should parse");
+        let command =
+            ReplCommand::from_str(":mount /tmp/foo /tmp/bar").expect("command should parse");
         assert_eq!(
             command,
             ReplCommand::Mount(vec!["/tmp/foo".to_owned(), "/tmp/bar".to_owned()])
@@ -254,8 +254,7 @@ mod tests {
 
     #[test]
     fn parses_mount_empty() {
-        let command = ReplCommand::from_str(":mount")
-            .expect("command should parse");
+        let command = ReplCommand::from_str(":mount").expect("command should parse");
         assert_eq!(command, ReplCommand::Mount(vec![]));
     }
 }

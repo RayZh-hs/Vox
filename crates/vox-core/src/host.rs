@@ -73,6 +73,7 @@ pub struct TraitMethodSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraitSpec {
     pub name: QualifiedTypeName,
+    pub fields: Vec<FieldSpec>,
     pub methods: Vec<TraitMethodSpec>,
 }
 

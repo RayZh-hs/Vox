@@ -16,7 +16,7 @@ use vox_core::{
 };
 
 pub const MAGIC: u32 = 0x5658_5254;
-pub const CURRENT_PROTOCOL_VERSION: u16 = 4;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 5;
 pub const MAX_PAYLOAD_BYTES: u32 = 16 * 1024 * 1024;
 pub const DEFAULT_INLINE_VALUE_BYTES: u32 = 1024 * 1024;
 
