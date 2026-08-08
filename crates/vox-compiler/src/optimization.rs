@@ -35,7 +35,7 @@ struct OptimizationStage {
 }
 
 impl OptimizationPipeline {
-    pub(crate) fn for_level(level: OptimizationLevel) -> Self {
+    pub(crate) fn for_level(level: OptimizationLevel, tier: LanguageTier) -> Self {
         let mut stages = vec![
             OptimizationStage {
                 name: "analysis-prereq",
@@ -59,7 +59,7 @@ impl OptimizationPipeline {
                     passes: vec![enable_active_value_cache, build_def_use],
                 });
             }
-            OptimizationLevel::SOpt => {
+            OptimizationLevel::SOpt if tier.supports(LanguageTier::Dev) => {
                 stages.push(OptimizationStage {
                     name: "sealed-demand",
                     passes: vec![analyze_projection_demand, cull_unused_composite_outputs],
@@ -76,6 +76,12 @@ impl OptimizationPipeline {
                 stages.push(OptimizationStage {
                     name: "sealed-storage",
                     passes: vec![reuse_value_slots, seal_module],
+                });
+            }
+            OptimizationLevel::SOpt => {
+                stages.push(OptimizationStage {
+                    name: "tier-limited-sopt",
+                    passes: vec![enable_active_value_cache, build_def_use],
                 });
             }
         }

@@ -89,7 +89,7 @@ impl Compiler {
                 );
                 let return_type_diagnostics = check_return_type_inference(&frontend, &mir);
                 let mut optimization_summary =
-                    OptimizationPipeline::for_level(pipeline_optimization)
+                    OptimizationPipeline::for_level(pipeline_optimization, request.tier)
                         .run(&mut mir, custom_mir_passes);
                 let backend = BackendPipeline::default().lower(&mir);
                 optimization_summary.extend(backend.summaries);
