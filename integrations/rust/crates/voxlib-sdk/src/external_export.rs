@@ -278,6 +278,7 @@ pub fn collect_registered_package_exports(
             ExportedSurfaceKind::Trait => {
                 traits.push(TraitSpec {
                     name: qualified(package, surface.vox_name),
+                    fields: Vec::new(),
                     methods: methods_by_trait
                         .remove(surface.vox_name)
                         .unwrap_or_default(),
