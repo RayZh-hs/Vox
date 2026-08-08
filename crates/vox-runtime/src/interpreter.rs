@@ -12,7 +12,7 @@ use vox_compiler::{
         ExprKind, ForHeader, FunctionDecl, ImplDecl, ImportDecl, IntrinsicExpr, LambdaParameter,
         Mutability, ParamDecl, Parameter, QualifiedName, RangeExpr, RecordFieldInit, StringLiteral,
         StringPart, StructDecl, TopLevelItem, TypeKind, TypeSyntax, UnaryOp, UpdatedIntrinsic,
-        UpdatedPathSegment, ValueDecl,
+        UpdatedPathSegment, ValueDecl, Visibility,
     },
 };
 use vox_core::{
@@ -23,6 +23,7 @@ use vox_core::{
     mir::MirBodyKind,
     plan::CompiledArtifact,
     source::ModulePath,
+    tier::LanguageTier,
     types::VoxType,
     value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
 };
@@ -258,6 +259,7 @@ struct ModuleState {
     artifact_id: ArtifactId,
     optimization: vox_core::opt::OptimizationLevel,
     kind: vox_core::source::ModuleKind,
+    tier: LanguageTier,
     name: String,
     imports: Vec<ImportDecl>,
     parameters: Vec<ParamDecl>,
@@ -304,6 +306,7 @@ impl ModuleState {
             artifact_id,
             optimization: artifact.optimization,
             kind: artifact.kind,
+            tier: artifact.tier,
             name: artifact.module.as_str(),
             imports: script.imports.clone(),
             parameters: script.parameters.clone(),
@@ -438,6 +441,47 @@ impl ModuleState {
                     .find(|field| field.name == field_name)
             })
             .is_some_and(|field| matches!(field.mutability, Mutability::Var))
+    }
+
+    fn private_struct_field_denied(
+        &self,
+        runtime: &Runtime,
+        type_name: &str,
+        field_name: &str,
+    ) -> bool {
+        if self.tier == LanguageTier::Debug {
+            return false;
+        }
+        let owner_package = type_name.rsplit_once('.').map(|(package, _)| package);
+        if owner_package.is_none() || owner_package == Some(self.name.as_str()) {
+            return false;
+        }
+        let Some((package_name, local_type)) = type_name.rsplit_once('.') else {
+            return false;
+        };
+        if package_name == self.name {
+            return false;
+        }
+        let Ok(package) = ModulePath::parse(package_name) else {
+            return false;
+        };
+        let Some(artifact_id) = runtime.package_artifact(&package) else {
+            return false;
+        };
+        let Some(treewalk) = runtime.artifacts.treewalk(artifact_id) else {
+            return false;
+        };
+        treewalk
+            .structs
+            .iter()
+            .find(|structure| structure.name == local_type)
+            .and_then(|structure| {
+                structure
+                    .fields
+                    .iter()
+                    .find(|field| field.name == field_name)
+            })
+            .is_some_and(|field| matches!(field.visibility, Visibility::Private))
     }
 
     fn native_instance_method(
@@ -1698,9 +1742,19 @@ impl<'a> EvalContext<'a> {
             Value::Record(fields) => fields.get(name).cloned().ok_or_else(|| {
                 EvalError::Message(format!("record does not contain field `{name}`"))
             }),
-            Value::Struct { fields, .. } => fields.borrow().get(name).cloned().ok_or_else(|| {
-                EvalError::Message(format!("struct does not contain field `{name}`"))
-            }),
+            Value::Struct { type_name, fields } => {
+                if self
+                    .module
+                    .private_struct_field_denied(self.runtime, &type_name, name)
+                {
+                    return Err(EvalError::Message(format!(
+                        "private field `{name}` of `{type_name}` requires the debug tier"
+                    )));
+                }
+                fields.borrow().get(name).cloned().ok_or_else(|| {
+                    EvalError::Message(format!("struct does not contain field `{name}`"))
+                })
+            }
             other => Err(EvalError::Message(format!(
                 "field access is not supported for {}",
                 other.type_name()
