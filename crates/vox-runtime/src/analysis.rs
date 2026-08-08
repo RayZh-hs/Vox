@@ -359,6 +359,53 @@ struct FunctionInfo {
 }
 
 #[derive(Debug, Clone)]
+struct MethodCandidate {
+    name: String,
+    receiver: ReplType,
+    origin: MethodOrigin,
+}
+
+#[derive(Debug, Clone)]
+enum MethodOrigin {
+    LocalFunction,
+    ImportedFunction {
+        package: String,
+        symbol: String,
+        visible_name: String,
+    },
+    Builtin,
+    TraitMethod {
+        trait_name: String,
+    },
+}
+
+impl MethodCandidate {
+    fn describe_origin(&self) -> String {
+        match &self.origin {
+            MethodOrigin::LocalFunction => format!("local function `{}`", self.name),
+            MethodOrigin::ImportedFunction {
+                package,
+                symbol,
+                visible_name,
+            } => {
+                let qualified = format!("{package}.{symbol}");
+                if symbol == visible_name {
+                    format!("imported function `{qualified}`")
+                } else {
+                    format!("imported function `{qualified}` (visible as `{visible_name}`)")
+                }
+            }
+            MethodOrigin::Builtin => {
+                format!("built-in method `{}.{}`", self.receiver.render(), self.name)
+            }
+            MethodOrigin::TraitMethod { trait_name } => {
+                format!("trait method `{trait_name}.{}`", self.name)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ImportedPackage {
     manifest: Option<PackageManifest>,
     selective: Option<Vec<(String, Option<String>)>>,
@@ -429,6 +476,7 @@ impl<'a> TypeEngine<'a> {
     fn prime(&mut self) -> Result<(), String> {
         self.collect_imports()?;
         self.collect_function_headers()?;
+        self.check_method_guards()?;
         match self.unit.header.kind {
             ModuleKind::Package => {
                 self.collect_value_placeholders()?;
@@ -583,59 +631,219 @@ impl<'a> TypeEngine<'a> {
                     .push(summary.clone());
                 self.functions
                     .insert(function.name.clone(), FunctionInfo { summary });
+            }
+        }
 
-                let fn_name = &function.name;
-                let fn_first_param_ty = function
-                    .parameters
-                    .first()
-                    .map(|p| self.type_from_syntax_checked(&p.ty, &generic_parameters))
-                    .transpose()?;
+        Ok(())
+    }
 
-                if let Some(first_ty) = fn_first_param_ty {
-                    for (import_path, imported) in &self.imports {
-                        if let Some(manifest) = &imported.manifest {
-                            if let Some(selective) = &imported.selective {
-                                for (imported_name, alias) in selective {
-                                    let effective = alias.as_ref().unwrap_or(imported_name);
-                                    if effective != fn_name {
-                                        continue;
-                                    }
-                                    if let Some(host_fn) =
-                                        manifest.functions.iter().find(|f| &f.name == imported_name)
-                                    {
-                                        if let Some(host_first) = host_fn.parameters.first() {
-                                            let host_ty = from_vox_host_type(&host_first.ty);
-                                            if first_ty.is_assignable_to(&host_ty)
-                                                || host_ty.is_assignable_to(&first_ty)
-                                            {
-                                                self.warnings.borrow_mut().push(format!(
-                                                    "function `{fn_name}` may shadow method from `{import_path}`"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            } else if let Some(host_fn) =
-                                manifest.functions.iter().find(|f| f.name == *fn_name)
-                            {
-                                if let Some(host_first) = host_fn.parameters.first() {
-                                    let host_ty = from_vox_host_type(&host_first.ty);
-                                    if first_ty.is_assignable_to(&host_ty)
-                                        || host_ty.is_assignable_to(&first_ty)
-                                    {
-                                        self.warnings.borrow_mut().push(format!(
-                                            "function `{fn_name}` may shadow method from `{import_path}`"
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    }
+    fn check_method_guards(&self) -> Result<(), String> {
+        let mut candidates = self.local_method_candidates()?;
+        candidates.extend(self.imported_method_candidates());
+        candidates.extend(builtin_method_candidates());
+        candidates.extend(self.trait_method_candidates());
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            for other in candidates.iter().skip(index + 1) {
+                if candidate.name == other.name
+                    && method_receivers_overlap(&candidate.receiver, &other.receiver)
+                {
+                    return Err(format!(
+                        "method guard violation: method `{}` for receiver `{}` is provided by both {} and {}",
+                        candidate.name,
+                        collision_receiver_name(&candidate.receiver, &other.receiver),
+                        candidate.describe_origin(),
+                        other.describe_origin(),
+                    ));
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn local_method_candidates(&self) -> Result<Vec<MethodCandidate>, String> {
+        let mut candidates = Vec::new();
+        for function in self.unit.items.iter().filter_map(|item| match item {
+            TopLevelItem::Function(function) => Some(function),
+            _ => None,
+        }) {
+            let Some(parameter) = function.parameters.first() else {
+                continue;
+            };
+            let generic_parameters = generic_parameter_scope(&function.generic_parameters);
+            let receiver = self.type_from_syntax_checked(&parameter.ty, &generic_parameters)?;
+            self.push_function_method_candidates(
+                &mut candidates,
+                function.name.clone(),
+                receiver,
+                MethodOrigin::LocalFunction,
+            );
+        }
+        Ok(candidates)
+    }
+
+    fn imported_method_candidates(&self) -> Vec<MethodCandidate> {
+        let mut candidates = Vec::new();
+        for (import_path, imported) in &self.imports {
+            let Some(manifest) = &imported.manifest else {
+                continue;
+            };
+            if manifest.package.as_str() != *import_path {
+                continue;
+            }
+
+            if let Some(selective) = &imported.selective {
+                for (symbol, alias) in selective {
+                    let Some(function) = manifest.functions.iter().find(|function| {
+                        function.name == *symbol
+                            && matches!(
+                                function.export,
+                                vox_core::host::FunctionExportKind::Function
+                            )
+                    }) else {
+                        continue;
+                    };
+                    let Some(parameter) = function.parameters.first() else {
+                        continue;
+                    };
+                    let visible_name = alias.as_ref().unwrap_or(symbol).clone();
+                    self.push_function_method_candidates(
+                        &mut candidates,
+                        visible_name.clone(),
+                        from_vox_host_type(&parameter.ty),
+                        MethodOrigin::ImportedFunction {
+                            package: manifest.package.as_str(),
+                            symbol: symbol.clone(),
+                            visible_name,
+                        },
+                    );
+                }
+            } else {
+                for function in &manifest.functions {
+                    if !matches!(
+                        function.export,
+                        vox_core::host::FunctionExportKind::Function
+                    ) {
+                        continue;
+                    }
+                    let Some(parameter) = function.parameters.first() else {
+                        continue;
+                    };
+                    self.push_function_method_candidates(
+                        &mut candidates,
+                        function.name.clone(),
+                        from_vox_host_type(&parameter.ty),
+                        MethodOrigin::ImportedFunction {
+                            package: manifest.package.as_str(),
+                            symbol: function.name.clone(),
+                            visible_name: function.name.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        candidates
+    }
+
+    fn trait_method_candidates(&self) -> Vec<MethodCandidate> {
+        let mut candidates = Vec::new();
+        let mut implementations_by_trait = BTreeMap::<_, BTreeSet<_>>::new();
+        for manifest in self.manifests.values() {
+            for (trait_name, implementations) in &manifest.trait_impls {
+                implementations_by_trait
+                    .entry(trait_name.clone())
+                    .or_default()
+                    .extend(implementations.iter().cloned());
+            }
+        }
+
+        for (trait_name, implementations) in implementations_by_trait {
+            let Some(trait_spec) = self.manifests.values().find_map(|candidate_manifest| {
+                candidate_manifest
+                    .traits
+                    .iter()
+                    .find(|trait_spec| trait_spec.name == trait_name)
+            }) else {
+                continue;
+            };
+            let full_trait_name = format!(
+                "{}.{}",
+                trait_spec.name.module.as_str(),
+                trait_spec.name.name
+            );
+
+            for method in &trait_spec.methods {
+                candidates.push(MethodCandidate {
+                    name: method.name.clone(),
+                    receiver: ReplType::DynTrait(full_trait_name.clone()),
+                    origin: MethodOrigin::TraitMethod {
+                        trait_name: full_trait_name.clone(),
+                    },
+                });
+                for implementation in &implementations {
+                    candidates.push(MethodCandidate {
+                        name: method.name.clone(),
+                        receiver: ReplType::Named {
+                            name: format!(
+                                "{}.{}",
+                                implementation.module.as_str(),
+                                implementation.name
+                            ),
+                            arguments: Vec::new(),
+                        },
+                        origin: MethodOrigin::TraitMethod {
+                            trait_name: full_trait_name.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
+    fn push_function_method_candidates(
+        &self,
+        candidates: &mut Vec<MethodCandidate>,
+        name: String,
+        receiver: ReplType,
+        origin: MethodOrigin,
+    ) {
+        candidates.push(MethodCandidate {
+            name: name.clone(),
+            receiver: receiver.clone(),
+            origin: origin.clone(),
+        });
+
+        let ReplType::DynTrait(receiver_trait) = receiver else {
+            return;
+        };
+        let mut implementation_names = BTreeSet::new();
+        for manifest in self.manifests.values() {
+            for (trait_name, implementations) in &manifest.trait_impls {
+                let full_trait_name = format!("{}.{}", trait_name.module.as_str(), trait_name.name);
+                if !type_names_match(&receiver_trait, &full_trait_name) {
+                    continue;
+                }
+                for implementation in implementations {
+                    implementation_names.insert(format!(
+                        "{}.{}",
+                        implementation.module.as_str(),
+                        implementation.name
+                    ));
+                }
+            }
+        }
+        candidates.extend(implementation_names.into_iter().map(|implementation_name| {
+            MethodCandidate {
+                name: name.clone(),
+                receiver: ReplType::Named {
+                    name: implementation_name,
+                    arguments: Vec::new(),
+                },
+                origin: origin.clone(),
+            }
+        }));
     }
 
     fn collect_value_placeholders(&mut self) -> Result<(), String> {
@@ -3306,6 +3514,96 @@ fn list_item_type(ty: &ReplType) -> ReplType {
     match ty {
         ReplType::List(item) => (**item).clone(),
         _ => ReplType::Unknown("Unknown".to_owned()),
+    }
+}
+
+fn builtin_method_candidates() -> Vec<MethodCandidate> {
+    builtins::BUILTIN_METHODS
+        .iter()
+        .map(|method| MethodCandidate {
+            name: method.name.to_owned(),
+            receiver: match method.receiver {
+                BuiltinReceiver::Int => ReplType::Int,
+                BuiltinReceiver::UInt => ReplType::UInt,
+                BuiltinReceiver::Float => ReplType::Float,
+                BuiltinReceiver::Bool => ReplType::Bool,
+                BuiltinReceiver::String => ReplType::String,
+                BuiltinReceiver::List => ReplType::List(Box::new(ReplType::TypeParameter {
+                    name: "T".to_owned(),
+                    bound: None,
+                })),
+                BuiltinReceiver::Econ => ReplType::Named {
+                    name: "Econ".to_owned(),
+                    arguments: vec![ReplType::TypeParameter {
+                        name: "T".to_owned(),
+                        bound: None,
+                    }],
+                },
+            },
+            origin: MethodOrigin::Builtin,
+        })
+        .collect()
+}
+
+fn method_receivers_overlap(left: &ReplType, right: &ReplType) -> bool {
+    match (left, right) {
+        (ReplType::Unknown(_), _) | (_, ReplType::Unknown(_)) => true,
+        (ReplType::TypeParameter { .. }, _) | (_, ReplType::TypeParameter { .. }) => true,
+        (ReplType::DynTrait(name), _) | (_, ReplType::DynTrait(name)) if name == "Any" => true,
+        (ReplType::Nullable(_), ReplType::Nullable(_)) => true,
+        (ReplType::Nullable(left), right) | (right, ReplType::Nullable(left)) => {
+            method_receivers_overlap(left, right)
+        }
+        (ReplType::List(left), ReplType::List(right))
+        | (ReplType::Range(left), ReplType::Range(right)) => {
+            method_receivers_overlap(left, right)
+        }
+        (ReplType::Tuple(left), ReplType::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| method_receivers_overlap(left, right))
+        }
+        (ReplType::Record(left), ReplType::Record(right)) => {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.name == right.name && method_receivers_overlap(&left.ty, &right.ty)
+                })
+        }
+        (
+            ReplType::Named {
+                name: left_name,
+                arguments: left_arguments,
+            },
+            ReplType::Named {
+                name: right_name,
+                arguments: right_arguments,
+            },
+        ) => {
+            type_names_match(left_name, right_name)
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| method_receivers_overlap(left, right))
+        }
+        (ReplType::DynTrait(left), ReplType::DynTrait(right)) => type_names_match(left, right),
+        _ => left == right,
+    }
+}
+
+fn type_names_match(left: &str, right: &str) -> bool {
+    left == right
+        || left.rsplit_once('.').is_some_and(|(_, name)| name == right)
+        || right.rsplit_once('.').is_some_and(|(_, name)| name == left)
+}
+
+fn collision_receiver_name(left: &ReplType, right: &ReplType) -> String {
+    if matches!(left, ReplType::TypeParameter { .. } | ReplType::Unknown(_)) {
+        right.render()
+    } else {
+        left.render()
     }
 }
 

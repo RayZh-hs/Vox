@@ -250,6 +250,15 @@ fn semantic_error_span(
     message: &str,
 ) -> Option<vox_core::diagnostics::TextSpan> {
     if let Some(name) = message
+        .strip_prefix("method guard violation: method `")
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+    {
+        return declaration_name_span(source, unit, name)
+            .or_else(|| method_guard_import_span(unit, message))
+            .or_else(|| identifier_substring_span(source, name));
+    }
+
+    if let Some(name) = message
         .strip_prefix("Unknown type ")
         .map(|rest| rest.trim_end_matches('.'))
     {
@@ -306,6 +315,36 @@ fn semantic_error_span(
     }
 
     None
+}
+
+fn method_guard_import_span(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    message: &str,
+) -> Option<vox_core::diagnostics::TextSpan> {
+    use vox_compiler::frontend::ast::TopLevelItem;
+
+    unit.syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            TopLevelItem::Import(import) => Some(import.expanded()),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|import| {
+            let package = import.module.to_source_string();
+            if !message.contains(&format!("`{package}.")) {
+                return None;
+            }
+            if let Some(item) = import.items.as_ref().and_then(|items| {
+                items.iter().find(|item| {
+                    message.contains(&format!("`{package}.{}", item.name))
+                })
+            }) {
+                return Some(item.span.clone());
+            }
+            Some(import.module.span.clone())
+        })
 }
 
 fn assignability_subject_name(message: &str) -> Option<&str> {

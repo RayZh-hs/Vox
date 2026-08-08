@@ -7,5 +7,5 @@ public fun sharpen(input: image.Image, filter: dyn image.Filter): image.Image {
     image.filter_apply(filter, blurred)
 }
 
-public fun histogram(input: image.Image): {shadows: Int, mids: Int, highlights: Int} =
+public fun summarizeHistogram(input: image.Image): {shadows: Int, mids: Int, highlights: Int} =
     image.histogram(input);

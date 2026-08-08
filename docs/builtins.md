@@ -44,6 +44,10 @@ Resolution order:
 4. **Prelude** — `std` module functions, always implicitly available (**new**)
 5. **Trait methods** — trait impls from external `.voxlib` packages (existing)
 
+Before applying this order, the method guard rejects overlapping same-name
+definitions for one receiver type. Resolution precedence never silently chooses
+between a built-in, visible first-parameter function, and trait method.
+
 The prelude is a synthetic module `std`. Its function *signatures* are always
 in scope for type-checking, so `42.toString()` resolves to
 `std::toString(self: Int): String` without an explicit import.

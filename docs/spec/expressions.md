@@ -205,10 +205,12 @@ For external libraries, struct types expose trait methods as methods when the
 struct implements the corresponding trait. These are resolved through the
 package manifest's `trait_impls` during method resolution.
 
-If a function definition shadows an existing method (a function with the
-same name and a compatible first parameter), the LSP reports a warning.
-Defining two functions with the same name and indistinguishable parameter
-types (same count and same types at each position) is a compile-time error.
+For any receiver type, a method name may have only one applicable definition.
+An inherent or built-in method, a visible function whose first parameter is
+that receiver type, and a trait method implemented by that receiver therefore
+cannot overlap. Vox rejects the conflicting declaration or import as a method
+guard violation before resolving calls. Defining two functions with the same
+name and indistinguishable parameter types is also a compile-time error.
 
 ## 5. `if` Expressions
 

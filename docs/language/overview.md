@@ -102,8 +102,9 @@ For external libraries, struct methods from trait implementations are also
 available via this syntax.
 
 Method resolution order: fields, then methods, then qualified names. Defining
-two functions with the same name and identical parameter types is a compile-time
-error.
+more than one applicable method with the same name for a receiver type is a
+compile-time error. This includes conflicts between built-in methods, visible
+first-parameter functions, and trait methods implemented by the receiver.
 
 ## Nullability
 
