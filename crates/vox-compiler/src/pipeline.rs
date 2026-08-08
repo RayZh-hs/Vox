@@ -177,7 +177,7 @@ fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticBag {
                 let needed = if matches!(frontend.header.kind, ModuleKind::Package) {
                     LanguageTier::Dev
                 } else {
-                    LanguageTier::Inline
+                    LanguageTier::Eval
                 };
                 if let Some(error) = required(needed, &trait_decl.span, "trait declarations") {
                     diagnostics.push(error);
@@ -230,8 +230,313 @@ fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticBag {
             }
             _ => {}
         }
+        match item {
+            TopLevelItem::Value(value) => {
+                validate_expr_tier(&value.initializer, tier, &mut diagnostics)
+            }
+            TopLevelItem::Function(function) => {
+                validate_expr_tier(&function.body, tier, &mut diagnostics)
+            }
+            TopLevelItem::Struct(structure) => {
+                for method in &structure.methods {
+                    validate_expr_tier(&method.body, tier, &mut diagnostics);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                for method in &trait_decl.methods {
+                    if let Some(body) = &method.body {
+                        validate_expr_tier(body, tier, &mut diagnostics);
+                    }
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    validate_expr_tier(&method.body, tier, &mut diagnostics);
+                }
+            }
+            TopLevelItem::Statement(statement) => {
+                validate_block_item_tier(statement, tier, &mut diagnostics)
+            }
+            TopLevelItem::Param(param) => {
+                if let Some(default) = &param.default {
+                    validate_expr_tier(default, tier, &mut diagnostics);
+                }
+            }
+            TopLevelItem::Import(_) => {}
+        }
+    }
+    if let Some(result) = &frontend.syntax.result {
+        validate_expr_tier(result, tier, &mut diagnostics);
     }
     diagnostics
+}
+
+fn require_tier(
+    required: LanguageTier,
+    tier: LanguageTier,
+    span: &vox_core::diagnostics::TextSpan,
+    feature: &str,
+    diagnostics: &mut DiagnosticBag,
+) {
+    if !tier.supports(required) {
+        diagnostics.push(
+            vox_core::diagnostics::Diagnostic::error(format!(
+                "{feature} requires the {} tier, but this unit is compiled at the {} tier",
+                required.as_str(),
+                tier.as_str()
+            ))
+            .with_span(span.clone()),
+        );
+    }
+}
+
+fn validate_expr_tier(
+    expr: &crate::frontend::ast::Expr,
+    tier: LanguageTier,
+    diagnostics: &mut DiagnosticBag,
+) {
+    use crate::frontend::ast::ExprKind;
+    match &expr.kind {
+        ExprKind::If(if_expr) => {
+            for branch in &if_expr.branches {
+                validate_expr_tier(&branch.condition, tier, diagnostics);
+                for item in &branch.body.items {
+                    validate_block_item_tier(item, tier, diagnostics);
+                }
+                if let Some(trailing) = &branch.body.trailing {
+                    validate_expr_tier(trailing, tier, diagnostics);
+                }
+            }
+            if let Some(body) = &if_expr.else_branch {
+                for item in &body.items {
+                    validate_block_item_tier(item, tier, diagnostics);
+                }
+                if let Some(trailing) = &body.trailing {
+                    validate_expr_tier(trailing, tier, diagnostics);
+                }
+            }
+        }
+        ExprKind::Block(block) => {
+            require_tier(
+                LanguageTier::Eval,
+                tier,
+                &expr.span,
+                "block expressions",
+                diagnostics,
+            );
+            for item in &block.items {
+                validate_block_item_tier(item, tier, diagnostics);
+            }
+            if let Some(trailing) = &block.trailing {
+                validate_expr_tier(trailing, tier, diagnostics);
+            }
+        }
+        ExprKind::For(for_expr) => {
+            require_tier(LanguageTier::Eval, tier, &expr.span, "loops", diagnostics);
+            if let Some(init) = &for_expr.init {
+                validate_block_item_tier(init, tier, diagnostics);
+            }
+            match &for_expr.header {
+                crate::frontend::ast::ForHeader::In { iterable, .. } => {
+                    validate_expr_tier(iterable, tier, diagnostics)
+                }
+                crate::frontend::ast::ForHeader::Condition(condition) => {
+                    validate_expr_tier(condition, tier, diagnostics)
+                }
+            }
+            for item in &for_expr.body.items {
+                validate_block_item_tier(item, tier, diagnostics);
+            }
+            if let Some(trailing) = &for_expr.body.trailing {
+                validate_expr_tier(trailing, tier, diagnostics);
+            }
+        }
+        ExprKind::When(when_expr) => {
+            require_tier(
+                LanguageTier::Eval,
+                tier,
+                &expr.span,
+                "when expressions",
+                diagnostics,
+            );
+            validate_expr_tier(&when_expr.subject, tier, diagnostics);
+            for arm in &when_expr.arms {
+                validate_expr_tier(&arm.body, tier, diagnostics);
+            }
+            if let Some(else_arm) = &when_expr.else_arm {
+                validate_expr_tier(else_arm, tier, diagnostics);
+            }
+        }
+        ExprKind::Intrinsic(crate::frontend::ast::IntrinsicExpr::Econ(econ)) => {
+            require_tier(
+                LanguageTier::Eval,
+                tier,
+                &expr.span,
+                "econ expressions",
+                diagnostics,
+            );
+            for item in &econ.body.items {
+                validate_block_item_tier(item, tier, diagnostics);
+            }
+            if let Some(trailing) = &econ.body.trailing {
+                validate_expr_tier(trailing, tier, diagnostics);
+            }
+        }
+        ExprKind::Intrinsic(crate::frontend::ast::IntrinsicExpr::Updated(updated)) => {
+            validate_expr_tier(&updated.target, tier, diagnostics);
+            for update in &updated.updates {
+                validate_expr_tier(&update.value, tier, diagnostics);
+            }
+        }
+        ExprKind::Call { callee, arguments } => {
+            validate_expr_tier(callee, tier, diagnostics);
+            for argument in arguments {
+                match argument {
+                    crate::frontend::ast::Argument::Positional(expr)
+                    | crate::frontend::ast::Argument::Named { value: expr, .. } => {
+                        validate_expr_tier(expr, tier, diagnostics)
+                    }
+                }
+            }
+        }
+        ExprKind::Index { target, index } => {
+            validate_expr_tier(target, tier, diagnostics);
+            validate_expr_tier(index, tier, diagnostics);
+        }
+        ExprKind::Field { target, .. }
+        | ExprKind::SafeField { target, .. }
+        | ExprKind::NonNull { target } => validate_expr_tier(target, tier, diagnostics),
+        ExprKind::ReceiverCall {
+            receiver,
+            arguments,
+            ..
+        } => {
+            validate_expr_tier(receiver, tier, diagnostics);
+            for argument in arguments {
+                match argument {
+                    crate::frontend::ast::Argument::Positional(expr)
+                    | crate::frontend::ast::Argument::Named { value: expr, .. } => {
+                        validate_expr_tier(expr, tier, diagnostics)
+                    }
+                }
+            }
+        }
+        ExprKind::Unary { expr, .. } => validate_expr_tier(expr, tier, diagnostics),
+        ExprKind::Binary { left, right, .. } => {
+            validate_expr_tier(left, tier, diagnostics);
+            validate_expr_tier(right, tier, diagnostics);
+        }
+        ExprKind::Range(range) => {
+            if let Some(start) = &range.start {
+                validate_expr_tier(start, tier, diagnostics);
+            }
+            if let Some(end) = &range.end {
+                validate_expr_tier(end, tier, diagnostics);
+            }
+        }
+        ExprKind::Lambda(lambda) => validate_expr_tier(&lambda.body, tier, diagnostics),
+        ExprKind::List(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                validate_expr_tier(item, tier, diagnostics);
+            }
+        }
+        ExprKind::Record(fields) => {
+            for field in fields {
+                validate_expr_tier(&field.value, tier, diagnostics);
+            }
+        }
+        ExprKind::Integer(_)
+        | ExprKind::Float(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::String(_)
+        | ExprKind::Name(_) => {}
+    }
+}
+
+fn validate_block_item_tier(
+    item: &crate::frontend::ast::BlockItem,
+    tier: LanguageTier,
+    diagnostics: &mut DiagnosticBag,
+) {
+    use crate::frontend::ast::BlockItem;
+    match item {
+        BlockItem::LocalValue(value) => {
+            require_tier(
+                LanguageTier::Eval,
+                tier,
+                &value.span,
+                "local values",
+                diagnostics,
+            );
+            if matches!(value.mutability, crate::frontend::ast::Mutability::Var) {
+                require_tier(
+                    LanguageTier::Script,
+                    tier,
+                    &value.span,
+                    "mutable values",
+                    diagnostics,
+                );
+            }
+            validate_expr_tier(&value.initializer, tier, diagnostics);
+        }
+        BlockItem::Assignment(statement) => {
+            require_tier(
+                LanguageTier::Script,
+                tier,
+                &statement.span,
+                "assignments",
+                diagnostics,
+            );
+            validate_expr_tier(&statement.value, tier, diagnostics);
+        }
+        BlockItem::CompoundAssignment(statement) => {
+            require_tier(
+                LanguageTier::Script,
+                tier,
+                &statement.span,
+                "assignments",
+                diagnostics,
+            );
+            validate_expr_tier(&statement.value, tier, diagnostics);
+        }
+        BlockItem::Panic(statement) => require_tier(
+            LanguageTier::Eval,
+            tier,
+            &statement.span,
+            "panic statements",
+            diagnostics,
+        ),
+        BlockItem::Return(statement) => {
+            if let Some(value) = &statement.value {
+                validate_expr_tier(value, tier, diagnostics);
+            }
+        }
+        BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
+            validate_expr_tier(expr, tier, diagnostics)
+        }
+        BlockItem::Break(_) | BlockItem::Continue(_) => require_tier(
+            LanguageTier::Eval,
+            tier,
+            &item_span(item),
+            "loop control",
+            diagnostics,
+        ),
+    }
+}
+
+fn item_span(item: &crate::frontend::ast::BlockItem) -> vox_core::diagnostics::TextSpan {
+    match item {
+        crate::frontend::ast::BlockItem::LocalValue(value) => value.span.clone(),
+        crate::frontend::ast::BlockItem::Assignment(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::CompoundAssignment(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::Return(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::Panic(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::Break(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::Continue(statement) => statement.span.clone(),
+        crate::frontend::ast::BlockItem::BlockStatement(expr)
+        | crate::frontend::ast::BlockItem::Expr(expr) => expr.span.clone(),
+    }
 }
 
 fn collect_dependencies(request: &CompileRequest) -> Vec<DependencyFingerprint> {
