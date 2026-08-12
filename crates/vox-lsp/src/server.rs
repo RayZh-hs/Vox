@@ -10,6 +10,7 @@ use vox_core::builtins::BuiltinReceiver;
 use vox_core::diagnostics::DiagnosticBag;
 use vox_core::host::PackageManifest;
 use vox_core::source::SourceText;
+use vox_core::tier::LanguageTier;
 
 pub struct VoxLanguageServer {
     client: Client,
@@ -21,6 +22,7 @@ pub struct VoxLanguageServer {
 struct LspLibraries {
     manifests: Vec<PackageManifest>,
     load_errors: Vec<String>,
+    default_tier: LanguageTier,
 }
 
 impl VoxLanguageServer {
@@ -42,7 +44,15 @@ fn collect_diagnostics(
     let analysis = frontend::analyze_source_lossy(&source_text);
 
     let mut diagnostics = convert_diagnostics(&source_text.text, analysis.diagnostics);
+    let (tier, tier_annotation_diagnostic) = source_tier_or_default(source, libraries.default_tier);
+    if let Some(diagnostic) = tier_annotation_diagnostic {
+        diagnostics.push(diagnostic);
+    }
     if let Some(unit) = analysis.unit.as_ref() {
+        diagnostics.extend(convert_diagnostics(
+            source,
+            vox_compiler::validate_tier(unit, tier),
+        ));
         diagnostics.extend(collect_semantic_diagnostics(
             source,
             unit,
@@ -112,7 +122,7 @@ fn collect_library_load_diagnostics(source: &str, libraries: &LspLibraries) -> V
         .collect()
 }
 
-fn load_libraries(paths: &[PathBuf]) -> LspLibraries {
+fn load_libraries(paths: &[PathBuf], default_tier: LanguageTier) -> LspLibraries {
     let mut runtime = vox_runtime::Runtime::default();
     let mut load_errors = Vec::new();
 
@@ -139,6 +149,7 @@ fn load_libraries(paths: &[PathBuf]) -> LspLibraries {
     LspLibraries {
         manifests: runtime.package_manifests(),
         load_errors,
+        default_tier,
     }
 }
 
@@ -194,6 +205,75 @@ fn mount_lsp_library_file(
     }
 }
 
+fn source_tier_or_default(
+    source: &str,
+    default_tier: LanguageTier,
+) -> (LanguageTier, Option<Diagnostic>) {
+    match source_tier_annotation(source) {
+        Ok(Some(tier)) => (tier, None),
+        Ok(None) => (default_tier, None),
+        Err((message, span)) => (
+            default_tier,
+            Some(Diagnostic {
+                range: byte_span_to_range(source, span.start, span.end),
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("vox-lsp".to_string()),
+                message,
+                ..Default::default()
+            }),
+        ),
+    }
+}
+
+fn source_tier_annotation(
+    source: &str,
+) -> std::result::Result<Option<LanguageTier>, (String, vox_core::diagnostics::TextSpan)> {
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        let trimmed = line_without_newline.trim_start();
+        let line_start = offset + (line_without_newline.len() - trimmed.len());
+        let line_end = offset + line_without_newline.len();
+
+        if trimmed.is_empty() {
+            offset += line.len();
+            continue;
+        }
+
+        let Some(doc) = trimmed.strip_prefix("///") else {
+            break;
+        };
+        let text = doc.trim_start();
+        if let Some(raw) = text.strip_prefix("@tier:") {
+            let raw = raw.trim();
+            let span = vox_core::diagnostics::TextSpan::new(line_start, line_end);
+            return parse_language_tier(raw)
+                .map(Some)
+                .map_err(|message| (message, span));
+        }
+        offset += line.len();
+    }
+
+    Ok(None)
+}
+
+fn parse_language_tier(raw: &str) -> std::result::Result<LanguageTier, String> {
+    match raw {
+        "inline" | "0" => Ok(LanguageTier::Inline),
+        "eval" | "1" => Ok(LanguageTier::Eval),
+        "script" | "2" => Ok(LanguageTier::Script),
+        "dev" | "3" => Ok(LanguageTier::Dev),
+        "debug" | "4" => Ok(LanguageTier::Debug),
+        "" => Err(
+            "tier annotation must specify inline, eval, script, dev, debug, or 0 through 4"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unknown language tier `{other}`; expected inline, eval, script, dev, debug, or 0 through 4"
+        )),
+    }
+}
+
 fn library_paths_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(options) = &params.initialization_options {
@@ -212,6 +292,47 @@ fn library_paths_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
     }
 
     paths
+}
+
+fn default_tier_from_initialize(params: &InitializeParams) -> (LanguageTier, Option<String>) {
+    let Some(options) = &params.initialization_options else {
+        return (LanguageTier::Script, None);
+    };
+    match language_tier_from_value(options) {
+        Some(Ok(tier)) => (tier, None),
+        Some(Err(message)) => (LanguageTier::Script, Some(message)),
+        None => (LanguageTier::Script, None),
+    }
+}
+
+fn language_tier_from_value(
+    value: &serde_json::Value,
+) -> Option<std::result::Result<LanguageTier, String>> {
+    match value {
+        serde_json::Value::String(raw) => Some(parse_language_tier(raw)),
+        serde_json::Value::Number(number) => number.as_u64().map(|value| {
+            u8::try_from(value)
+                .map_err(|_| "language tier must be between 0 and 4".to_string())
+                .and_then(|value| LanguageTier::try_from(value).map_err(str::to_owned))
+        }),
+        serde_json::Value::Object(map) => {
+            for key in [
+                "defaultTier",
+                "default_tier",
+                "languageTier",
+                "language_tier",
+                "tier",
+            ] {
+                if let Some(value) = map.get(key) {
+                    if let Some(tier) = language_tier_from_value(value) {
+                        return Some(tier);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn collect_library_paths_from_value(value: &serde_json::Value, paths: &mut Vec<PathBuf>) {
@@ -544,6 +665,52 @@ fn type_name_span(
         }
     }
 
+    fn visit_function(
+        function: &FunctionDecl,
+        name: &str,
+    ) -> Option<vox_core::diagnostics::TextSpan> {
+        function
+            .generic_parameters
+            .iter()
+            .find_map(|parameter| (parameter.bound == name).then(|| parameter.span.clone()))
+            .or_else(|| {
+                function
+                    .parameters
+                    .iter()
+                    .find_map(|parameter| visit_type(&parameter.ty, name))
+            })
+            .or_else(|| {
+                function
+                    .return_type
+                    .as_ref()
+                    .and_then(|ty| visit_type(ty, name))
+            })
+            .or_else(|| visit_expr(&function.body, name))
+    }
+
+    fn visit_trait_method(
+        method: &TraitMethodDecl,
+        name: &str,
+    ) -> Option<vox_core::diagnostics::TextSpan> {
+        method
+            .generic_parameters
+            .iter()
+            .find_map(|parameter| (parameter.bound == name).then(|| parameter.span.clone()))
+            .or_else(|| {
+                method
+                    .parameters
+                    .iter()
+                    .find_map(|parameter| visit_type(&parameter.ty, name))
+            })
+            .or_else(|| {
+                method
+                    .return_type
+                    .as_ref()
+                    .and_then(|ty| visit_type(ty, name))
+            })
+            .or_else(|| method.body.as_ref().and_then(|body| visit_expr(body, name)))
+    }
+
     unit.syntax.items.iter().find_map(|item| match item {
         TopLevelItem::Param(parameter) => visit_type(&parameter.ty, name),
         TopLevelItem::Value(value) => value
@@ -551,22 +718,41 @@ fn type_name_span(
             .as_ref()
             .and_then(|ty| visit_type(ty, name))
             .or_else(|| visit_expr(&value.initializer, name)),
-        TopLevelItem::Function(function) => function
-            .parameters
+        TopLevelItem::Function(function) => visit_function(function, name),
+        TopLevelItem::Struct(structure) => structure
+            .fields
             .iter()
-            .find_map(|parameter| visit_type(&parameter.ty, name))
+            .find_map(|field| visit_type(&field.ty, name))
             .or_else(|| {
-                function
-                    .return_type
-                    .as_ref()
-                    .and_then(|ty| visit_type(ty, name))
-            })
-            .or_else(|| visit_expr(&function.body, name)),
+                structure
+                    .methods
+                    .iter()
+                    .find_map(|method| visit_function(method, name))
+            }),
+        TopLevelItem::Trait(trait_decl) => trait_decl
+            .fields
+            .iter()
+            .find_map(|field| visit_type(&field.ty, name))
+            .or_else(|| {
+                trait_decl
+                    .methods
+                    .iter()
+                    .find_map(|method| visit_trait_method(method, name))
+            }),
+        TopLevelItem::Impl(implementation) => {
+            if implementation.trait_name.to_source_string() == name {
+                Some(implementation.trait_name.span.clone())
+            } else if implementation.struct_name.to_source_string() == name {
+                Some(implementation.struct_name.span.clone())
+            } else {
+                implementation
+                    .methods
+                    .iter()
+                    .find_map(|method| visit_function(method, name))
+            }
+        }
         TopLevelItem::Statement(item) => visit_block_item(item, name),
-        TopLevelItem::Import(_)
-        | TopLevelItem::Struct(_)
-        | TopLevelItem::Trait(_)
-        | TopLevelItem::Impl(_) => None,
+        TopLevelItem::Import(_) => None,
     })
 }
 
@@ -740,13 +926,58 @@ fn declaration_name_span(
             find_identifier_span_in(source, &function.span, name)
         }
         TopLevelItem::Function(function) => visit_expr(source, &function.body, name),
+        TopLevelItem::Struct(structure) if structure.name == name => {
+            find_identifier_span_in(source, &structure.span, name)
+        }
+        TopLevelItem::Struct(structure) => structure
+            .fields
+            .iter()
+            .find_map(|field| {
+                (field.name == name)
+                    .then(|| find_identifier_span_in(source, &field.span, name))
+                    .flatten()
+            })
+            .or_else(|| {
+                structure.methods.iter().find_map(|method| {
+                    if method.name == name {
+                        find_identifier_span_in(source, &method.span, name)
+                    } else {
+                        visit_expr(source, &method.body, name)
+                    }
+                })
+            }),
+        TopLevelItem::Trait(trait_decl) if trait_decl.name == name => {
+            find_identifier_span_in(source, &trait_decl.span, name)
+        }
+        TopLevelItem::Trait(trait_decl) => trait_decl
+            .fields
+            .iter()
+            .find_map(|field| {
+                (field.name == name)
+                    .then(|| find_identifier_span_in(source, &field.span, name))
+                    .flatten()
+            })
+            .or_else(|| {
+                trait_decl.methods.iter().find_map(|method| {
+                    if method.name == name {
+                        find_identifier_span_in(source, &method.span, name)
+                    } else {
+                        method
+                            .body
+                            .as_ref()
+                            .and_then(|body| visit_expr(source, body, name))
+                    }
+                })
+            }),
+        TopLevelItem::Impl(implementation) => implementation.methods.iter().find_map(|method| {
+            if method.name == name {
+                find_identifier_span_in(source, &method.span, name)
+            } else {
+                visit_expr(source, &method.body, name)
+            }
+        }),
         TopLevelItem::Statement(item) => visit_block_item(source, item, name),
-        TopLevelItem::Import(_)
-        | TopLevelItem::Param(_)
-        | TopLevelItem::Value(_)
-        | TopLevelItem::Struct(_)
-        | TopLevelItem::Trait(_)
-        | TopLevelItem::Impl(_) => None,
+        TopLevelItem::Import(_) | TopLevelItem::Param(_) | TopLevelItem::Value(_) => None,
     })
 }
 
@@ -757,9 +988,11 @@ fn import_module_span(
     use vox_compiler::frontend::ast::TopLevelItem;
 
     unit.syntax.items.iter().find_map(|item| match item {
-        TopLevelItem::Import(import) if import.module.to_source_string() == package => {
-            Some(import.module.span.clone())
-        }
+        TopLevelItem::Import(import) => import.expanded().into_iter().find_map(|expanded| {
+            (expanded.module.to_source_string() == package
+                || expanded.alias.as_deref() == Some(package))
+            .then(|| expanded.module.span.clone())
+        }),
         _ => None,
     })
 }
@@ -864,6 +1097,12 @@ fn is_valid_doc_comment(
         return true;
     }
 
+    if let TokenKind::DocComment(text) = &tokens[pos].kind {
+        if text.trim().starts_with("@tier:") && source[..tokens[pos].span.start].trim().is_empty() {
+            return true;
+        }
+    }
+
     if let Some(unit) = unit {
         let span = &tokens[pos].span;
         for item in &unit.syntax.items {
@@ -904,6 +1143,9 @@ fn is_valid_doc_comment(
             | TokenKind::Script
             | TokenKind::Evil
             | TokenKind::Import
+            | TokenKind::Struct
+            | TokenKind::Trait
+            | TokenKind::Impl
             | TokenKind::Val
             | TokenKind::Var
             | TokenKind::Fun
@@ -1148,18 +1390,67 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
 
     for item in &unit.syntax.items {
-        let (name, kind, span) = match item {
-            TopLevelItem::Function(f) => (f.name.clone(), SymbolKind::FUNCTION, f.span.clone()),
-            TopLevelItem::Value(v) => (v.name.clone(), SymbolKind::VARIABLE, v.span.clone()),
-            TopLevelItem::Param(p) => (p.name.clone(), SymbolKind::VARIABLE, p.span.clone()),
+        let (name, kind, span, children) = match item {
+            TopLevelItem::Function(f) => {
+                (f.name.clone(), SymbolKind::FUNCTION, f.span.clone(), None)
+            }
+            TopLevelItem::Value(v) => (v.name.clone(), SymbolKind::VARIABLE, v.span.clone(), None),
+            TopLevelItem::Param(p) => (p.name.clone(), SymbolKind::VARIABLE, p.span.clone(), None),
             TopLevelItem::Import(i) => (
                 i.module.to_source_string(),
                 SymbolKind::MODULE,
                 i.span.clone(),
+                None,
             ),
-            TopLevelItem::Struct(s) => (s.name.clone(), SymbolKind::STRUCT, s.span.clone()),
-            TopLevelItem::Trait(t) => (t.name.clone(), SymbolKind::INTERFACE, t.span.clone()),
-            TopLevelItem::Impl(_) => continue,
+            TopLevelItem::Struct(s) => (
+                s.name.clone(),
+                SymbolKind::STRUCT,
+                s.span.clone(),
+                Some(
+                    s.fields
+                        .iter()
+                        .map(|field| {
+                            child_symbol(source, &field.name, SymbolKind::FIELD, &field.span)
+                        })
+                        .chain(s.methods.iter().map(|method| {
+                            child_symbol(source, &method.name, SymbolKind::METHOD, &method.span)
+                        }))
+                        .collect(),
+                ),
+            ),
+            TopLevelItem::Trait(t) => (
+                t.name.clone(),
+                SymbolKind::INTERFACE,
+                t.span.clone(),
+                Some(
+                    t.fields
+                        .iter()
+                        .map(|field| {
+                            child_symbol(source, &field.name, SymbolKind::FIELD, &field.span)
+                        })
+                        .chain(t.methods.iter().map(|method| {
+                            child_symbol(source, &method.name, SymbolKind::METHOD, &method.span)
+                        }))
+                        .collect(),
+                ),
+            ),
+            TopLevelItem::Impl(i) => (
+                format!(
+                    "impl {} for {}",
+                    i.trait_name.to_source_string(),
+                    i.struct_name.to_source_string()
+                ),
+                SymbolKind::OBJECT,
+                i.span.clone(),
+                Some(
+                    i.methods
+                        .iter()
+                        .map(|method| {
+                            child_symbol(source, &method.name, SymbolKind::METHOD, &method.span)
+                        })
+                        .collect(),
+                ),
+            ),
             TopLevelItem::Statement(_) => continue,
         };
 
@@ -1173,11 +1464,34 @@ fn compute_document_symbols(source: &str) -> Vec<DocumentSymbol> {
             deprecated: None,
             range,
             selection_range: range,
-            children: None,
+            children,
         });
     }
 
     symbols
+}
+
+#[allow(deprecated)]
+fn child_symbol(
+    source: &str,
+    name: &str,
+    kind: SymbolKind,
+    span: &vox_core::diagnostics::TextSpan,
+) -> DocumentSymbol {
+    let range = byte_span_to_range(source, span.start, span.end);
+    let selection_range = find_identifier_span_in(source, span, name)
+        .map(|name_span| byte_span_to_range(source, name_span.start, name_span.end))
+        .unwrap_or(range);
+    DocumentSymbol {
+        name: name.to_owned(),
+        detail: None,
+        kind,
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range,
+        children: None,
+    }
 }
 
 fn build_symbol_table(
@@ -1368,14 +1682,40 @@ fn build_symbol_table(
         }
     }
 
+    fn add_function_symbols(
+        function: &FunctionDecl,
+        symbols: &mut HashMap<String, vox_core::diagnostics::TextSpan>,
+    ) {
+        symbols.insert(function.name.clone(), function.span.clone());
+        for parameter in &function.parameters {
+            symbols.insert(parameter.name.clone(), parameter.span.clone());
+            if let Some(ref default) = parameter.default {
+                walk_expr(default, symbols);
+            }
+        }
+        walk_expr(&function.body, symbols);
+    }
+
+    fn add_trait_method_symbols(
+        method: &TraitMethodDecl,
+        symbols: &mut HashMap<String, vox_core::diagnostics::TextSpan>,
+    ) {
+        symbols.insert(method.name.clone(), method.span.clone());
+        for parameter in &method.parameters {
+            symbols.insert(parameter.name.clone(), parameter.span.clone());
+            if let Some(ref default) = parameter.default {
+                walk_expr(default, symbols);
+            }
+        }
+        if let Some(ref body) = method.body {
+            walk_expr(body, symbols);
+        }
+    }
+
     for item in &unit.syntax.items {
         match item {
             TopLevelItem::Function(f) => {
-                symbols.insert(f.name.clone(), f.span.clone());
-                for param in &f.parameters {
-                    symbols.insert(param.name.clone(), param.span.clone());
-                }
-                walk_expr(&f.body, &mut symbols);
+                add_function_symbols(f, &mut symbols);
             }
             TopLevelItem::Value(v) => {
                 symbols.insert(v.name.clone(), v.span.clone());
@@ -1385,11 +1725,44 @@ fn build_symbol_table(
                 symbols.insert(p.name.clone(), p.span.clone());
             }
             TopLevelItem::Import(i) => {
-                if let Some(last) = i.module.segments.last() {
-                    symbols.insert(last.clone(), i.span.clone());
+                for import in i.expanded() {
+                    if let Some(items) = &import.items {
+                        for item in items {
+                            symbols.insert(
+                                item.alias.clone().unwrap_or_else(|| item.name.clone()),
+                                item.span.clone(),
+                            );
+                        }
+                    } else if let Some(alias) = &import.alias {
+                        symbols.insert(alias.clone(), import.span.clone());
+                    } else if let Some(last) = import.module.segments.last() {
+                        symbols.insert(last.clone(), import.span.clone());
+                    }
                 }
             }
-            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
+            TopLevelItem::Struct(structure) => {
+                symbols.insert(structure.name.clone(), structure.span.clone());
+                for field in &structure.fields {
+                    symbols.insert(field.name.clone(), field.span.clone());
+                }
+                for method in &structure.methods {
+                    add_function_symbols(method, &mut symbols);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                symbols.insert(trait_decl.name.clone(), trait_decl.span.clone());
+                for field in &trait_decl.fields {
+                    symbols.insert(field.name.clone(), field.span.clone());
+                }
+                for method in &trait_decl.methods {
+                    add_trait_method_symbols(method, &mut symbols);
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    add_function_symbols(method, &mut symbols);
+                }
+            }
             TopLevelItem::Statement(s) => match s {
                 BlockItem::LocalValue(lv) => {
                     symbols.insert(lv.name.clone(), lv.span.clone());
@@ -1680,10 +2053,76 @@ fn find_name_at_offset(
         }
     }
 
+    fn find_in_parameter(parameter: &Parameter, source: &str, offset: usize) -> Option<String> {
+        if offset >= parameter.span.start && offset < parameter.span.end {
+            if let Some(ident) = identifier_at_offset(source, offset) {
+                if ident == parameter.name {
+                    return Some(parameter.name.clone());
+                }
+                if parameter.ty.span.start <= offset && offset < parameter.ty.span.end {
+                    return Some(ident.to_owned());
+                }
+            }
+        }
+        parameter
+            .default
+            .as_ref()
+            .and_then(|default| find_in_expr(default, source, offset))
+    }
+
+    fn find_in_function(function: &FunctionDecl, source: &str, offset: usize) -> Option<String> {
+        if offset >= function.span.start && offset < function.span.end {
+            if let Some(ident) = identifier_at_offset(source, offset) {
+                if ident == function.name {
+                    return Some(function.name.clone());
+                }
+            }
+        }
+        for parameter in &function.parameters {
+            if let Some(name) = find_in_parameter(parameter, source, offset) {
+                return Some(name);
+            }
+        }
+        if let Some(ref ty) = function.return_type {
+            if offset >= ty.span.start && offset < ty.span.end {
+                return identifier_at_offset(source, offset).map(str::to_owned);
+            }
+        }
+        find_in_expr(&function.body, source, offset)
+    }
+
+    fn find_in_trait_method(
+        method: &TraitMethodDecl,
+        source: &str,
+        offset: usize,
+    ) -> Option<String> {
+        if offset >= method.span.start && offset < method.span.end {
+            if let Some(ident) = identifier_at_offset(source, offset) {
+                if ident == method.name {
+                    return Some(method.name.clone());
+                }
+            }
+        }
+        for parameter in &method.parameters {
+            if let Some(name) = find_in_parameter(parameter, source, offset) {
+                return Some(name);
+            }
+        }
+        if let Some(ref ty) = method.return_type {
+            if offset >= ty.span.start && offset < ty.span.end {
+                return identifier_at_offset(source, offset).map(str::to_owned);
+            }
+        }
+        method
+            .body
+            .as_ref()
+            .and_then(|body| find_in_expr(body, source, offset))
+    }
+
     for item in &unit.syntax.items {
         match item {
             TopLevelItem::Function(f) => {
-                if let Some(name) = find_in_expr(&f.body, source, offset) {
+                if let Some(name) = find_in_function(f, source, offset) {
                     return Some(name);
                 }
             }
@@ -1705,7 +2144,75 @@ fn find_name_at_offset(
                 }
             }
             TopLevelItem::Import(_) => {}
-            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
+            TopLevelItem::Struct(structure) => {
+                if offset >= structure.span.start && offset < structure.span.end {
+                    if let Some(ident) = identifier_at_offset(source, offset) {
+                        if ident == structure.name {
+                            return Some(structure.name.clone());
+                        }
+                    }
+                }
+                for field in &structure.fields {
+                    if offset >= field.span.start && offset < field.span.end {
+                        if let Some(ident) = identifier_at_offset(source, offset) {
+                            if ident == field.name {
+                                return Some(field.name.clone());
+                            }
+                            if offset >= field.ty.span.start && offset < field.ty.span.end {
+                                return Some(ident.to_owned());
+                            }
+                        }
+                    }
+                }
+                for method in &structure.methods {
+                    if let Some(name) = find_in_function(method, source, offset) {
+                        return Some(name);
+                    }
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                if offset >= trait_decl.span.start && offset < trait_decl.span.end {
+                    if let Some(ident) = identifier_at_offset(source, offset) {
+                        if ident == trait_decl.name {
+                            return Some(trait_decl.name.clone());
+                        }
+                    }
+                }
+                for field in &trait_decl.fields {
+                    if offset >= field.span.start && offset < field.span.end {
+                        if let Some(ident) = identifier_at_offset(source, offset) {
+                            if ident == field.name {
+                                return Some(field.name.clone());
+                            }
+                            if offset >= field.ty.span.start && offset < field.ty.span.end {
+                                return Some(ident.to_owned());
+                            }
+                        }
+                    }
+                }
+                for method in &trait_decl.methods {
+                    if let Some(name) = find_in_trait_method(method, source, offset) {
+                        return Some(name);
+                    }
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                if offset >= implementation.trait_name.span.start
+                    && offset < implementation.trait_name.span.end
+                {
+                    return identifier_at_offset(source, offset).map(str::to_owned);
+                }
+                if offset >= implementation.struct_name.span.start
+                    && offset < implementation.struct_name.span.end
+                {
+                    return identifier_at_offset(source, offset).map(str::to_owned);
+                }
+                for method in &implementation.methods {
+                    if let Some(name) = find_in_function(method, source, offset) {
+                        return Some(name);
+                    }
+                }
+            }
         }
     }
 
@@ -2044,19 +2551,46 @@ fn collect_references(
         }
     }
 
+    fn collect_in_function(
+        function: &FunctionDecl,
+        target: &str,
+        spans: &mut Vec<vox_core::diagnostics::TextSpan>,
+    ) {
+        for parameter in &function.parameters {
+            collect_type_syntax(&parameter.ty, target, spans);
+            if let Some(ref default) = parameter.default {
+                collect_in_expr(default, target, spans);
+            }
+        }
+        if let Some(ref ret) = function.return_type {
+            collect_type_syntax(ret, target, spans);
+        }
+        collect_in_expr(&function.body, target, spans);
+    }
+
+    fn collect_in_trait_method(
+        method: &TraitMethodDecl,
+        target: &str,
+        spans: &mut Vec<vox_core::diagnostics::TextSpan>,
+    ) {
+        for parameter in &method.parameters {
+            collect_type_syntax(&parameter.ty, target, spans);
+            if let Some(ref default) = parameter.default {
+                collect_in_expr(default, target, spans);
+            }
+        }
+        if let Some(ref ret) = method.return_type {
+            collect_type_syntax(ret, target, spans);
+        }
+        if let Some(ref body) = method.body {
+            collect_in_expr(body, target, spans);
+        }
+    }
+
     for item in &unit.syntax.items {
         match item {
             TopLevelItem::Function(f) => {
-                for param in &f.parameters {
-                    collect_type_syntax(&param.ty, target, &mut spans);
-                    if let Some(ref default) = param.default {
-                        collect_in_expr(default, target, &mut spans);
-                    }
-                }
-                if let Some(ref ret) = f.return_type {
-                    collect_type_syntax(ret, target, &mut spans);
-                }
-                collect_in_expr(&f.body, target, &mut spans);
+                collect_in_function(f, target, &mut spans);
             }
             TopLevelItem::Value(v) => {
                 if let Some(ref ty) = v.ty {
@@ -2071,11 +2605,66 @@ fn collect_references(
                 }
             }
             TopLevelItem::Import(i) => {
-                if i.module.segments.last().map(|s| s.as_str()) == Some(target) {
-                    spans.push(i.module.span.clone());
+                for import in i.expanded() {
+                    if import.module.segments.last().map(|s| s.as_str()) == Some(target)
+                        || import.alias.as_deref() == Some(target)
+                    {
+                        spans.push(import.module.span.clone());
+                    }
+                    if let Some(items) = &import.items {
+                        for item in items {
+                            if item.name == target || item.alias.as_deref() == Some(target) {
+                                spans.push(item.span.clone());
+                            }
+                        }
+                    }
                 }
             }
-            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
+            TopLevelItem::Struct(structure) => {
+                if structure.name == target {
+                    spans.push(structure.span.clone());
+                }
+                for field in &structure.fields {
+                    collect_type_syntax(&field.ty, target, &mut spans);
+                }
+                for method in &structure.methods {
+                    collect_in_function(method, target, &mut spans);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                if trait_decl.name == target {
+                    spans.push(trait_decl.span.clone());
+                }
+                for field in &trait_decl.fields {
+                    collect_type_syntax(&field.ty, target, &mut spans);
+                }
+                for method in &trait_decl.methods {
+                    collect_in_trait_method(method, target, &mut spans);
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                if implementation
+                    .trait_name
+                    .segments
+                    .last()
+                    .map(|s| s.as_str())
+                    == Some(target)
+                {
+                    spans.push(implementation.trait_name.span.clone());
+                }
+                if implementation
+                    .struct_name
+                    .segments
+                    .last()
+                    .map(|s| s.as_str())
+                    == Some(target)
+                {
+                    spans.push(implementation.struct_name.span.clone());
+                }
+                for method in &implementation.methods {
+                    collect_in_function(method, target, &mut spans);
+                }
+            }
             TopLevelItem::Statement(s) => collect_in_block_item(s, target, &mut spans),
         }
     }
@@ -2389,7 +2978,23 @@ fn find_call_at_offset(
                 _ => {}
             },
             TopLevelItem::Import(_) => {}
-            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
+            TopLevelItem::Struct(structure) => {
+                for method in &structure.methods {
+                    walk_expr(&method.body, offset, &mut best);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                for method in &trait_decl.methods {
+                    if let Some(ref body) = method.body {
+                        walk_expr(body, offset, &mut best);
+                    }
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    walk_expr(&method.body, offset, &mut best);
+                }
+            }
         }
     }
 
@@ -2413,6 +3018,104 @@ fn format_function_summary_detail(function: &vox_runtime::FunctionSummary) -> St
     format!("({params}) -> {}", function.return_type.render())
 }
 
+fn signature_help_for_function(
+    function: &vox_compiler::frontend::ast::FunctionDecl,
+    call_info: &CallInfo,
+    skip_self: bool,
+) -> SignatureHelp {
+    let parameters = function
+        .parameters
+        .iter()
+        .skip(usize::from(skip_self && !function.parameters.is_empty()))
+        .collect::<Vec<_>>();
+    let params: Vec<ParameterInformation> = parameters
+        .iter()
+        .map(|p| {
+            let label = format!("{}: {}", p.name, p.ty.to_source_string());
+            ParameterInformation {
+                label: ParameterLabel::Simple(label),
+                documentation: None,
+            }
+        })
+        .collect();
+
+    let param_count = params.len().max(1);
+    let sig = SignatureInformation {
+        label: format!(
+            "{}({}){}",
+            function.name,
+            parameters
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.ty.to_source_string()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            function
+                .return_type
+                .as_ref()
+                .map(|t| format!(" -> {}", t.to_source_string()))
+                .unwrap_or_default()
+        ),
+        documentation: None,
+        parameters: Some(params),
+        active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+    };
+
+    SignatureHelp {
+        signatures: vec![sig],
+        active_signature: Some(0),
+        active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+    }
+}
+
+fn signature_help_for_trait_method(
+    method: &vox_compiler::frontend::ast::TraitMethodDecl,
+    call_info: &CallInfo,
+    skip_self: bool,
+) -> SignatureHelp {
+    let parameters = method
+        .parameters
+        .iter()
+        .skip(usize::from(skip_self && !method.parameters.is_empty()))
+        .collect::<Vec<_>>();
+    let params: Vec<ParameterInformation> = parameters
+        .iter()
+        .map(|p| {
+            let label = format!("{}: {}", p.name, p.ty.to_source_string());
+            ParameterInformation {
+                label: ParameterLabel::Simple(label),
+                documentation: None,
+            }
+        })
+        .collect();
+
+    let param_count = params.len().max(1);
+    let sig = SignatureInformation {
+        label: format!(
+            "{}({}){}",
+            method.name,
+            parameters
+                .iter()
+                .map(|p| format!("{}: {}", p.name, p.ty.to_source_string()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            method
+                .return_type
+                .as_ref()
+                .map(|t| format!(" -> {}", t.to_source_string()))
+                .unwrap_or_default()
+        ),
+        documentation: None,
+        parameters: Some(params),
+        active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+    };
+
+    SignatureHelp {
+        signatures: vec![sig],
+        active_signature: Some(0),
+        active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
+    }
+}
+
 fn compute_signature_help(source: &str, position: Position) -> Option<SignatureHelp> {
     use vox_compiler::frontend::ast::*;
     let source_text = SourceText::new("", 0, source);
@@ -2421,46 +3124,40 @@ fn compute_signature_help(source: &str, position: Position) -> Option<SignatureH
     let call_info = find_call_at_offset(&unit, offset)?;
 
     for item in &unit.syntax.items {
-        if let TopLevelItem::Function(f) = item {
-            if f.name == call_info.callee_name {
-                let params: Vec<ParameterInformation> = f
-                    .parameters
-                    .iter()
-                    .map(|p| {
-                        let label = format!("{}: {}", p.name, p.ty.to_source_string());
-                        ParameterInformation {
-                            label: ParameterLabel::Simple(label),
-                            documentation: None,
-                        }
-                    })
-                    .collect();
-
-                let param_count = f.parameters.len().max(1);
-                let sig = SignatureInformation {
-                    label: format!(
-                        "{}({}){}",
-                        f.name,
-                        f.parameters
-                            .iter()
-                            .map(|p| format!("{}: {}", p.name, p.ty.to_source_string()))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        f.return_type
-                            .as_ref()
-                            .map(|t| format!(" -> {}", t.to_source_string()))
-                            .unwrap_or_default()
-                    ),
-                    documentation: None,
-                    parameters: Some(params),
-                    active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
-                };
-
-                return Some(SignatureHelp {
-                    signatures: vec![sig],
-                    active_signature: Some(0),
-                    active_parameter: Some(call_info.active_parameter.min(param_count - 1) as u32),
-                });
+        match item {
+            TopLevelItem::Function(f) if f.name == call_info.callee_name => {
+                return Some(signature_help_for_function(f, &call_info, false));
             }
+            TopLevelItem::Struct(structure) => {
+                for method in &structure.methods {
+                    if method.name == call_info.callee_name {
+                        return Some(signature_help_for_function(
+                            method,
+                            &call_info,
+                            !method.associated,
+                        ));
+                    }
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                for method in &trait_decl.methods {
+                    if method.name == call_info.callee_name {
+                        return Some(signature_help_for_trait_method(
+                            method,
+                            &call_info,
+                            !method.associated,
+                        ));
+                    }
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    if method.name == call_info.callee_name {
+                        return Some(signature_help_for_function(method, &call_info, true));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2469,6 +3166,121 @@ fn compute_signature_help(source: &str, position: Position) -> Option<SignatureH
     }
 
     None
+}
+
+fn type_name_matches(candidate: &str, name: &str) -> bool {
+    candidate == name
+        || candidate.rsplit('.').next() == Some(name)
+        || name.rsplit('.').next() == Some(candidate)
+}
+
+fn function_completion_detail(
+    function: &vox_compiler::frontend::ast::FunctionDecl,
+    skip_self: bool,
+) -> String {
+    let parameters = function
+        .parameters
+        .iter()
+        .skip(usize::from(skip_self && !function.parameters.is_empty()))
+        .map(|parameter| format!("{}: {}", parameter.name, parameter.ty.to_source_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = function
+        .return_type
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string)
+        .unwrap_or_else(|| "Unit".to_owned());
+    format!("({parameters}) -> {result}")
+}
+
+fn trait_method_completion_detail(
+    method: &vox_compiler::frontend::ast::TraitMethodDecl,
+    skip_self: bool,
+) -> String {
+    let parameters = method
+        .parameters
+        .iter()
+        .skip(usize::from(skip_self && !method.parameters.is_empty()))
+        .map(|parameter| format!("{}: {}", parameter.name, parameter.ty.to_source_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = method
+        .return_type
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string)
+        .unwrap_or_else(|| "Unit".to_owned());
+    format!("({parameters}) -> {result}")
+}
+
+fn native_member_completions(
+    unit: &vox_compiler::frontend::ast::FrontendUnit,
+    current_type: &vox_runtime::ReplType,
+) -> Vec<CompletionItem> {
+    use vox_compiler::frontend::ast::TopLevelItem;
+    use vox_runtime::ReplType;
+
+    let mut items = Vec::new();
+    match current_type {
+        ReplType::Named { name, .. } => {
+            for item in &unit.syntax.items {
+                match item {
+                    TopLevelItem::Struct(structure) if type_name_matches(&structure.name, name) => {
+                        items.extend(structure.fields.iter().map(|field| CompletionItem {
+                            label: field.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(field.ty.to_source_string()),
+                            ..Default::default()
+                        }));
+                        items.extend(structure.methods.iter().map(|method| CompletionItem {
+                            label: method.name.clone(),
+                            kind: Some(CompletionItemKind::METHOD),
+                            detail: Some(function_completion_detail(method, !method.associated)),
+                            ..Default::default()
+                        }));
+                    }
+                    TopLevelItem::Impl(implementation)
+                        if type_name_matches(
+                            &implementation.struct_name.to_source_string(),
+                            name,
+                        ) =>
+                    {
+                        items.extend(implementation.methods.iter().map(|method| CompletionItem {
+                            label: method.name.clone(),
+                            kind: Some(CompletionItemKind::METHOD),
+                            detail: Some(function_completion_detail(method, true)),
+                            ..Default::default()
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ReplType::DynTrait(name) => {
+            for item in &unit.syntax.items {
+                if let TopLevelItem::Trait(trait_decl) = item {
+                    if type_name_matches(&trait_decl.name, name) {
+                        items.extend(trait_decl.fields.iter().map(|field| CompletionItem {
+                            label: field.name.clone(),
+                            kind: Some(CompletionItemKind::FIELD),
+                            detail: Some(field.ty.to_source_string()),
+                            ..Default::default()
+                        }));
+                        items.extend(trait_decl.methods.iter().map(|method| CompletionItem {
+                            label: method.name.clone(),
+                            kind: Some(CompletionItemKind::METHOD),
+                            detail: Some(trait_method_completion_detail(
+                                method,
+                                !method.associated,
+                            )),
+                            ..Default::default()
+                        }));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    items
 }
 
 fn try_dot_completion(source: &str, position: Position) -> Option<Vec<CompletionItem>> {
@@ -2550,6 +3362,7 @@ fn try_dot_completion(source: &str, position: Position) -> Option<Vec<Completion
             ..Default::default()
         }));
     }
+    items.extend(native_member_completions(&unit, &current_type));
     items.extend(
         vox_runtime::builtin_method_summaries_for_type(&current_type)
             .into_iter()
@@ -2683,26 +3496,64 @@ fn compute_completion(source: &str, position: Position) -> Option<Vec<Completion
                 }
             }
             TopLevelItem::Import(i) => {
-                if let Some(last) = i.module.segments.last() {
+                for import in i.expanded() {
+                    if let Some(items) = &import.items {
+                        for item in items {
+                            names
+                                .entry(item.alias.clone().unwrap_or_else(|| item.name.clone()))
+                                .or_insert(CompletionItemKind::REFERENCE);
+                        }
+                    } else if let Some(alias) = &import.alias {
+                        names
+                            .entry(alias.clone())
+                            .or_insert(CompletionItemKind::MODULE);
+                    } else if let Some(last) = import.module.segments.last() {
+                        names
+                            .entry(last.clone())
+                            .or_insert(CompletionItemKind::MODULE);
+                    }
                     names
-                        .entry(last.clone())
+                        .entry(import.module.to_source_string())
                         .or_insert(CompletionItemKind::MODULE);
                 }
-                names
-                    .entry(i.module.to_source_string())
-                    .or_insert(CompletionItemKind::MODULE);
             }
             TopLevelItem::Struct(s) => {
                 names
                     .entry(s.name.clone())
                     .or_insert(CompletionItemKind::STRUCT);
+                for field in &s.fields {
+                    names
+                        .entry(field.name.clone())
+                        .or_insert(CompletionItemKind::FIELD);
+                }
+                for method in &s.methods {
+                    names
+                        .entry(method.name.clone())
+                        .or_insert(CompletionItemKind::METHOD);
+                }
             }
             TopLevelItem::Trait(t) => {
                 names
                     .entry(t.name.clone())
                     .or_insert(CompletionItemKind::INTERFACE);
+                for field in &t.fields {
+                    names
+                        .entry(field.name.clone())
+                        .or_insert(CompletionItemKind::FIELD);
+                }
+                for method in &t.methods {
+                    names
+                        .entry(method.name.clone())
+                        .or_insert(CompletionItemKind::METHOD);
+                }
             }
-            TopLevelItem::Impl(_) => {}
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    names
+                        .entry(method.name.clone())
+                        .or_insert(CompletionItemKind::METHOD);
+                }
+            }
         }
     }
 
@@ -3172,7 +4023,135 @@ fn build_hover_decls(
                 }
             }
             TopLevelItem::Import(_) => {}
-            TopLevelItem::Struct(_) | TopLevelItem::Trait(_) | TopLevelItem::Impl(_) => {}
+            TopLevelItem::Struct(structure) => {
+                if let Some(name_span) =
+                    find_identifier_span_in(source, &structure.span, &structure.name)
+                {
+                    declarations.push(HoverDecl {
+                        name: structure.name.clone(),
+                        span: structure.span.clone(),
+                        name_span,
+                        signature: format!("struct {}", structure.name),
+                        docs: declaration_docs_for_span(source, &structure.span, false),
+                    });
+                }
+                for field in &structure.fields {
+                    declarations.extend(struct_field_hover_decl(source, field));
+                }
+                for method in &structure.methods {
+                    if let Some(name_span) =
+                        find_identifier_span_in(source, &method.span, &method.name)
+                    {
+                        declarations.push(HoverDecl {
+                            name: method.name.clone(),
+                            span: method.span.clone(),
+                            name_span,
+                            signature: function_hover_signature(method, env),
+                            docs: function_docs(source, method),
+                        });
+                    }
+                    for parameter in &method.parameters {
+                        if let Some(name_span) =
+                            find_identifier_span_in(source, &parameter.span, &parameter.name)
+                        {
+                            declarations.push(HoverDecl {
+                                name: parameter.name.clone(),
+                                span: parameter.span.clone(),
+                                name_span,
+                                signature: format!(
+                                    "param {}: {}",
+                                    parameter.name,
+                                    parameter.ty.to_source_string()
+                                ),
+                                docs: Vec::new(),
+                            });
+                        }
+                    }
+                    walk_expr(source, &method.body, env, &mut declarations);
+                }
+            }
+            TopLevelItem::Trait(trait_decl) => {
+                if let Some(name_span) =
+                    find_identifier_span_in(source, &trait_decl.span, &trait_decl.name)
+                {
+                    declarations.push(HoverDecl {
+                        name: trait_decl.name.clone(),
+                        span: trait_decl.span.clone(),
+                        name_span,
+                        signature: format!("trait {}", trait_decl.name),
+                        docs: declaration_docs_for_span(source, &trait_decl.span, false),
+                    });
+                }
+                for field in &trait_decl.fields {
+                    declarations.extend(struct_field_hover_decl(source, field));
+                }
+                for method in &trait_decl.methods {
+                    if let Some(name_span) =
+                        find_identifier_span_in(source, &method.span, &method.name)
+                    {
+                        declarations.push(HoverDecl {
+                            name: method.name.clone(),
+                            span: method.span.clone(),
+                            name_span,
+                            signature: trait_method_hover_signature(method),
+                            docs: declaration_docs_for_span(source, &method.span, false),
+                        });
+                    }
+                    for parameter in &method.parameters {
+                        if let Some(name_span) =
+                            find_identifier_span_in(source, &parameter.span, &parameter.name)
+                        {
+                            declarations.push(HoverDecl {
+                                name: parameter.name.clone(),
+                                span: parameter.span.clone(),
+                                name_span,
+                                signature: format!(
+                                    "param {}: {}",
+                                    parameter.name,
+                                    parameter.ty.to_source_string()
+                                ),
+                                docs: Vec::new(),
+                            });
+                        }
+                    }
+                    if let Some(ref body) = method.body {
+                        walk_expr(source, body, env, &mut declarations);
+                    }
+                }
+            }
+            TopLevelItem::Impl(implementation) => {
+                for method in &implementation.methods {
+                    if let Some(name_span) =
+                        find_identifier_span_in(source, &method.span, &method.name)
+                    {
+                        declarations.push(HoverDecl {
+                            name: method.name.clone(),
+                            span: method.span.clone(),
+                            name_span,
+                            signature: function_hover_signature(method, env),
+                            docs: function_docs(source, method),
+                        });
+                    }
+                    for parameter in &method.parameters {
+                        if let Some(name_span) =
+                            find_identifier_span_in(source, &parameter.span, &parameter.name)
+                        {
+                            declarations.push(HoverDecl {
+                                name: parameter.name.clone(),
+                                span: parameter.span.clone(),
+                                name_span,
+                                signature: format!(
+                                    "param {}: {}",
+                                    parameter.name,
+                                    parameter.ty.to_source_string()
+                                ),
+                                docs: Vec::new(),
+                            });
+                        }
+                    }
+                    walk_expr(source, &method.body, env, &mut declarations);
+                }
+            }
             TopLevelItem::Statement(statement) => {
                 walk_block_item(source, statement, env, &mut declarations);
             }
@@ -3246,6 +4225,68 @@ fn local_like_hover_decl(
     })
 }
 
+fn struct_field_hover_decl(
+    source: &str,
+    field: &vox_compiler::frontend::ast::StructFieldDecl,
+) -> Option<HoverDecl> {
+    let name_span = find_identifier_span_in(source, &field.span, &field.name)?;
+    let keyword = match field.mutability {
+        vox_compiler::frontend::ast::Mutability::Val => "val",
+        vox_compiler::frontend::ast::Mutability::Var => "var",
+    };
+    Some(HoverDecl {
+        name: field.name.clone(),
+        span: field.span.clone(),
+        name_span,
+        signature: format!("{keyword} {}: {}", field.name, field.ty.to_source_string()),
+        docs: declaration_docs_for_span(source, &field.span, true),
+    })
+}
+
+fn trait_method_hover_signature(method: &vox_compiler::frontend::ast::TraitMethodDecl) -> String {
+    let generics = if method.generic_parameters.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "[{}]",
+            method
+                .generic_parameters
+                .iter()
+                .map(|parameter| format!("{}: {}", parameter.name, parameter.bound))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let parameters = method
+        .parameters
+        .iter()
+        .map(|parameter| {
+            let default = if parameter.default.is_some() {
+                " = ..."
+            } else {
+                ""
+            };
+            format!(
+                "{}: {}{default}",
+                parameter.name,
+                parameter.ty.to_source_string()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let effect = if method.evil { "evil " } else { "" };
+    let associated = if method.associated { "struct " } else { "" };
+    let result = method
+        .return_type
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string)
+        .unwrap_or_else(|| "Unit".to_owned());
+    format!(
+        "{associated}{effect}fun {}{generics}({parameters}) -> {result}",
+        method.name
+    )
+}
+
 fn function_hover_signature(
     function: &vox_compiler::frontend::ast::FunctionDecl,
     env: Option<&vox_runtime::TypeEnvironment>,
@@ -3276,8 +4317,9 @@ fn function_hover_signature(
             .collect::<Vec<_>>()
             .join(", ");
         let effect = if summary.evil { "evil " } else { "" };
+        let associated = if function.associated { "struct " } else { "" };
         return format!(
-            "{effect}fun {}{generics}({parameters}) -> {}",
+            "{associated}{effect}fun {}{generics}({parameters}) -> {}",
             summary.name,
             summary.return_type.render()
         );
@@ -3314,13 +4356,14 @@ fn function_hover_signature(
         .collect::<Vec<_>>()
         .join(", ");
     let effect = if function.evil { "evil " } else { "" };
+    let associated = if function.associated { "struct " } else { "" };
     let result = function
         .return_type
         .as_ref()
         .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string)
         .unwrap_or_else(|| "Unknown".to_owned());
     format!(
-        "{effect}fun {}{generics}({parameters}) -> {result}",
+        "{associated}{effect}fun {}{generics}({parameters}) -> {result}",
         function.name
     )
 }
@@ -3567,10 +4610,14 @@ fn is_line_leading(source: &str, offset: usize) -> bool {
 impl LanguageServer for VoxLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let library_paths = library_paths_from_initialize(&params);
-        let libraries = load_libraries(&library_paths);
+        let (default_tier, tier_error) = default_tier_from_initialize(&params);
+        let libraries = load_libraries(&library_paths, default_tier);
         let load_errors = libraries.load_errors.clone();
         *self.libraries.lock().unwrap() = libraries;
 
+        if let Some(error) = tier_error {
+            self.client.show_message(MessageType::ERROR, error).await;
+        }
         for error in load_errors {
             self.client.show_message(MessageType::ERROR, error).await;
         }

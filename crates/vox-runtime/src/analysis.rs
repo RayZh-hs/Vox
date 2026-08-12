@@ -4047,9 +4047,9 @@ fn type_name_used_as_value_error(name: &str, kind: &str) -> String {
 
 pub fn language_keywords() -> Vec<String> {
     [
-        "as", "dyn", "econ", "else", "evil", "false", "for", "fun", "if", "import", "in", "is",
-        "null", "package", "panic", "param", "private", "public", "return", "script", "true",
-        "val", "var", "when",
+        "as", "dyn", "econ", "else", "evil", "false", "for", "fun", "if", "impl", "import", "in",
+        "is", "null", "package", "panic", "param", "private", "public", "return", "script",
+        "struct", "trait", "true", "val", "var", "when",
     ]
     .into_iter()
     .map(str::to_owned)

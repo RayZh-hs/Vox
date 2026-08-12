@@ -145,7 +145,7 @@ impl Compiler {
     }
 }
 
-fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticBag {
+pub fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticBag {
     let mut diagnostics = DiagnosticBag::default();
     let required = |required: LanguageTier, span: &vox_core::diagnostics::TextSpan, name: &str| {
         if !tier.supports(required) {
