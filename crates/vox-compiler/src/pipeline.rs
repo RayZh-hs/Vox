@@ -192,21 +192,12 @@ pub fn validate_tier(frontend: &FrontendUnit, tier: LanguageTier) -> DiagnosticB
                     diagnostics.push(error);
                 }
             }
-            TopLevelItem::Function(function)
-                if matches!(frontend.header.kind, ModuleKind::Script { .. }) =>
-            {
+            TopLevelItem::Function(function) => {
                 if let Some(error) = required(
                     LanguageTier::Script,
                     &function.span,
                     "function declarations",
                 ) {
-                    diagnostics.push(error);
-                }
-            }
-            TopLevelItem::Function(function) => {
-                if let Some(error) =
-                    required(LanguageTier::Dev, &function.span, "package functions")
-                {
                     diagnostics.push(error);
                 }
             }

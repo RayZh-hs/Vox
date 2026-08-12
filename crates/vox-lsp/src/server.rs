@@ -9,7 +9,7 @@ use vox_compiler::frontend;
 use vox_core::builtins::BuiltinReceiver;
 use vox_core::diagnostics::DiagnosticBag;
 use vox_core::host::PackageManifest;
-use vox_core::source::SourceText;
+use vox_core::source::{ModuleKind, SourceText};
 use vox_core::tier::LanguageTier;
 
 pub struct VoxLanguageServer {
@@ -176,18 +176,30 @@ fn collect_library_files(dir: &Path, files: &mut Vec<PathBuf>) -> std::result::R
         let path = entry.path();
         if path.is_dir() {
             collect_library_files(&path, files)?;
-        } else if is_lsp_library_file(&path) {
+        } else if is_lsp_library_file(&path)? {
             files.push(path);
         }
     }
     Ok(())
 }
 
-fn is_lsp_library_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("vox") | Some("voxlib")
-    )
+fn is_lsp_library_file(path: &Path) -> std::result::Result<bool, String> {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("voxlib") => Ok(true),
+        Some("vox") => is_vox_package_file(path),
+        _ => Ok(false),
+    }
+}
+
+fn is_vox_package_file(path: &Path) -> std::result::Result<bool, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let source = SourceText::new(path.display().to_string(), 0, text);
+    let analysis = frontend::analyze_source_lossy(&source);
+    Ok(analysis
+        .unit
+        .as_ref()
+        .is_some_and(|unit| matches!(unit.header.kind, ModuleKind::Package)))
 }
 
 fn mount_lsp_library_file(
@@ -276,6 +288,7 @@ fn parse_language_tier(raw: &str) -> std::result::Result<LanguageTier, String> {
 
 fn library_paths_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    collect_workspace_library_paths(params, &mut paths);
     if let Some(options) = &params.initialization_options {
         collect_library_paths_from_value(options, &mut paths);
     }
@@ -291,7 +304,34 @@ fn library_paths_from_initialize(params: &InitializeParams) -> Vec<PathBuf> {
         }
     }
 
-    paths
+    dedup_paths(paths)
+}
+
+fn collect_workspace_library_paths(params: &InitializeParams, paths: &mut Vec<PathBuf>) {
+    if let Some(workspace_folders) = &params.workspace_folders {
+        for folder in workspace_folders {
+            if let Ok(path) = folder.uri.to_file_path() {
+                paths.push(path);
+            }
+        }
+        return;
+    }
+
+    if let Some(root_uri) = &params.root_uri {
+        if let Ok(path) = root_uri.to_file_path() {
+            paths.push(path);
+        }
+    }
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|existing| existing == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 fn default_tier_from_initialize(params: &InitializeParams) -> (LanguageTier, Option<String>) {
@@ -4171,12 +4211,17 @@ fn value_hover_decl(
     env: Option<&vox_runtime::TypeEnvironment>,
 ) -> Option<HoverDecl> {
     let docs = declaration_docs_for_span(source, &value.span, true);
+    let explicit_type = value
+        .ty
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string);
     local_like_hover_decl(
         source,
         &value.name,
         &value.span,
         value.mutability,
         env,
+        explicit_type,
         docs,
     )
 }
@@ -4188,12 +4233,17 @@ fn local_value_hover_decl(
     docs: Option<Vec<String>>,
 ) -> Option<HoverDecl> {
     let docs = docs.unwrap_or_else(|| declaration_docs_for_span(source, &value.span, true));
+    let explicit_type = value
+        .ty
+        .as_ref()
+        .map(vox_compiler::frontend::ast::TypeSyntax::to_source_string);
     local_like_hover_decl(
         source,
         &value.name,
         &value.span,
         value.mutability,
         env,
+        explicit_type,
         docs,
     )
 }
@@ -4204,12 +4254,14 @@ fn local_like_hover_decl(
     span: &vox_core::diagnostics::TextSpan,
     mutability: vox_compiler::frontend::ast::Mutability,
     env: Option<&vox_runtime::TypeEnvironment>,
+    explicit_type: Option<String>,
     docs: Vec<String>,
 ) -> Option<HoverDecl> {
     let name_span = find_identifier_span_in(source, span, name)?;
     let ty = env
         .and_then(|env| env.find_type_at_offset(span.start))
         .map(|ty| ty.render())
+        .or(explicit_type)
         .unwrap_or_else(|| "Unknown".to_owned());
     let keyword = match mutability {
         vox_compiler::frontend::ast::Mutability::Val => "val",
@@ -4604,6 +4656,52 @@ fn is_line_leading(source: &str, offset: usize) -> bool {
     let offset = offset.min(source.len());
     let line_start = source[..offset].rfind('\n').map(|idx| idx + 1).unwrap_or(0);
     source[line_start..offset].chars().all(char::is_whitespace)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn library_dir_mounts_packages_and_skips_scripts() {
+        let unique = format!(
+            "vox-lsp-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(
+            dir.join("support.vox"),
+            "package guide.support;\n\npublic val maximumPriority: Int = 100;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main.vox"),
+            "script guide.main;\n\nimport guide.support.(maximumPriority);\n\nval raw: Int = maximumPriority;\n",
+        )
+        .unwrap();
+
+        let libraries = load_libraries(&[dir.clone()], LanguageTier::Script);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            libraries.load_errors.is_empty(),
+            "unexpected load errors: {:?}",
+            libraries.load_errors
+        );
+        assert!(
+            libraries
+                .manifests
+                .iter()
+                .any(|manifest| manifest.package.as_str() == "guide.support"),
+            "guide.support package was not mounted"
+        );
+    }
 }
 
 #[tower_lsp::async_trait]

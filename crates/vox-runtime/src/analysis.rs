@@ -309,6 +309,14 @@ impl ReplType {
         }
     }
 
+    fn is_known_assignable_to(&self, target: &Self) -> bool {
+        !self.is_unknown_type() && !target.is_unknown_type() && self.is_assignable_to(target)
+    }
+
+    fn is_unknown_type(&self) -> bool {
+        matches!(self, Self::Unknown(name) if name != "Never")
+    }
+
     fn unify(left: Self, right: Self) -> Self {
         if left == right {
             return left;
@@ -1146,7 +1154,7 @@ impl<'a> TypeEngine<'a> {
             let inferred = self.infer_expr(default, &mut scope)?;
             let explicit =
                 self.type_from_syntax_checked(&parameter.ty, &scope.generic_parameters)?;
-            if !inferred.is_assignable_to(&explicit) {
+            if !inferred.is_known_assignable_to(&explicit) {
                 return Err(format!(
                     "parameter `{}` has default type `{}`, which is not assignable to `{}`",
                     parameter.name,
@@ -1263,7 +1271,7 @@ impl<'a> TypeEngine<'a> {
         let inferred = self.infer_expr(&function.body, scope)?;
         let return_type = if let Some(explicit) = &function.return_type {
             let explicit = self.type_from_syntax_checked(explicit, &scope.generic_parameters)?;
-            if !inferred.is_assignable_to(&explicit) {
+            if !inferred.is_known_assignable_to(&explicit) {
                 return Err(format!(
                     "function `{}` returns `{}`, which is not assignable to `{}`",
                     function.name,
@@ -1321,7 +1329,7 @@ impl<'a> TypeEngine<'a> {
             .transpose()?;
         let inferred = self.infer_expr(&value.initializer, scope)?;
         if let Some(explicit) = explicit {
-            if !inferred.is_assignable_to(&explicit) {
+            if !inferred.is_known_assignable_to(&explicit) {
                 return Err(format!(
                     "value `{}` has initializer type `{}`, which is not assignable to `{}`",
                     value.name,
@@ -1901,7 +1909,7 @@ impl<'a> TypeEngine<'a> {
             .transpose()?;
         let inferred = self.infer_expr(&value.initializer, scope)?;
         let ty = if let Some(explicit) = explicit {
-            if !inferred.is_assignable_to(&explicit) {
+            if !inferred.is_known_assignable_to(&explicit) {
                 return Err(format!(
                     "local `{}` has initializer type `{}`, which is not assignable to `{}`",
                     value.name,
