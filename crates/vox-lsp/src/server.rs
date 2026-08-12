@@ -475,6 +475,14 @@ fn semantic_error_span(
             .or_else(|| identifier_substring_span(source, name));
     }
 
+    if let Some(method) = message
+        .strip_prefix('`')
+        .and_then(|rest| rest.split_once('`').map(|(name, _)| name))
+        .filter(|_| message.contains(" expects ") && message.contains(" argument(s), got "))
+    {
+        return collect_references(unit, source, method).into_iter().next();
+    }
+
     None
 }
 
@@ -3323,37 +3331,44 @@ fn native_member_completions(
     items
 }
 
-fn try_dot_completion(source: &str, position: Position) -> Option<Vec<CompletionItem>> {
+fn try_dot_completion(
+    source: &str,
+    position: Position,
+    manifests: &[PackageManifest],
+) -> Option<Vec<CompletionItem>> {
     use vox_runtime::ReplType;
 
     let offset = position_to_byte_offset(source, position);
     let bytes = source.as_bytes();
 
-    // Detect if cursor is right after `.` or `?.`
+    // Find the member-access separator before the current completion prefix.
     if offset == 0 || offset > source.len() {
         return None;
     }
 
-    let mut dot_end = offset;
-    let is_safe = dot_end >= 2 && bytes[dot_end - 2] == b'.' && bytes[dot_end - 1] == b'?';
-    if !is_safe && (dot_end == 0 || bytes[dot_end - 1] != b'.') {
+    let mut member_start = offset;
+    while member_start > 0 && is_ident_byte(bytes[member_start - 1]) {
+        member_start -= 1;
+    }
+    let Some(mut dot_start) = member_start.checked_sub(1) else {
+        return None;
+    };
+    if bytes[dot_start] != b'.' {
         return None;
     }
-    if is_safe {
-        dot_end -= 2;
-    } else {
-        dot_end -= 1;
+    if dot_start > 0 && bytes[dot_start - 1] == b'?' {
+        dot_start -= 1;
     }
 
     // Extract receiver chain: scan backwards from dot to find identifier segments separated by dots
-    let prefix_before_dot = &source[..dot_end];
+    let prefix_before_dot = &source[..dot_start];
     let chain = extract_receiver_chain(prefix_before_dot)?;
 
     // Try to parse the prefix (source up to the dot, excluding the dot and trailing content)
     // We use the prefix before the dot to avoid the incomplete dot access parsing error
     let source_text = SourceText::new("", 0, prefix_before_dot);
     let unit = frontend::analyze_source_lossy(&source_text).unit?;
-    let env = vox_runtime::infer_environment(&unit.syntax, &[]).ok()?;
+    let env = vox_runtime::infer_environment(&unit.syntax, manifests).ok()?;
 
     // Resolve the first segment in bindings
     let first = &chain[0];
@@ -3473,8 +3488,12 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn compute_completion(source: &str, position: Position) -> Option<Vec<CompletionItem>> {
-    if let Some(items) = try_dot_completion(source, position) {
+fn compute_completion(
+    source: &str,
+    position: Position,
+    manifests: &[PackageManifest],
+) -> Option<Vec<CompletionItem>> {
+    if let Some(items) = try_dot_completion(source, position, manifests) {
         return Some(items);
     }
 
@@ -4967,7 +4986,12 @@ impl LanguageServer for VoxLanguageServer {
 
         match source {
             Some(text) => {
-                let items = compute_completion(&text, params.text_document_position.position);
+                let libraries = self.libraries.lock().unwrap().clone();
+                let items = compute_completion(
+                    &text,
+                    params.text_document_position.position,
+                    &libraries.manifests,
+                );
                 Ok(items.map(CompletionResponse::Array))
             }
             None => Ok(None),

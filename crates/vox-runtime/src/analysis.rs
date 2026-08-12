@@ -2303,9 +2303,16 @@ impl<'a> TypeEngine<'a> {
             }
         }
 
-        let Some(BuiltinReceiver::List) = builtin_receiver_for_repl_type(&receiver_type) else {
+        let builtin_receiver = builtin_receiver_for_repl_type(&receiver_type);
+        if let Some(receiver) = builtin_receiver
+            && builtins::builtin_method(receiver, method_name).is_some()
+        {
+            validate_builtin_method_arity(method_name, &method_type, arguments.len())?;
+        }
+
+        if builtin_receiver != Some(BuiltinReceiver::List) {
             return self.apply_call(method_type, method_args);
-        };
+        }
         if builtins::builtin_method(BuiltinReceiver::List, method_name).is_none() {
             return self.apply_call(method_type, method_args);
         }
@@ -3925,6 +3932,24 @@ fn infer_higher_order_list_method(
             ])))))
         }
         _ => Ok(None),
+    }
+}
+
+fn validate_builtin_method_arity(
+    method_name: &str,
+    method_type: &ReplType,
+    argument_count: usize,
+) -> Result<(), String> {
+    let ReplType::Function { parameters, .. } = method_type else {
+        return Ok(());
+    };
+    let expected = parameters.len().saturating_sub(1);
+    if argument_count == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{method_name}` expects {expected} argument(s), got {argument_count}"
+        ))
     }
 }
 
