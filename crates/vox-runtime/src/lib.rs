@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -19,7 +19,10 @@ mod session;
 mod wasm_executor;
 
 use thiserror::Error;
-use vox_compiler::{CompileRequest, Compiler, package_manifest_from_frontend};
+use vox_compiler::{
+    CompileRequest, Compiler, package_manifest_from_frontend,
+    frontend::lexer::{Lexer, TokenKind},
+};
 use vox_core::{
     external_library::decode_external_library_file,
     host::{HostRegistry, PackageManifest},
@@ -183,6 +186,52 @@ impl fmt::Debug for RegisteredHostFunction {
     }
 }
 
+fn collect_mount_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
+    let mut entries = entries
+        .map(|entry| entry.map_err(|error| format!("directory read error: {error}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+        if file_type.is_dir() {
+            files.extend(collect_mount_files(&path)?);
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn is_voxlib_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("voxlib")
+}
+
+fn is_vox_file(path: &Path) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("vox")
+}
+
+fn is_package_vox_file(path: &Path) -> Result<bool, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(has_package_header(&text))
+}
+
+fn has_package_header(source: &str) -> bool {
+    let (tokens, _) = Lexer::new(source, 0).lex_lossy();
+    tokens.into_iter().find_map(|token| match token.kind {
+        TokenKind::DocComment(_) => None,
+        TokenKind::Package => Some(true),
+        _ => Some(false),
+    }) == Some(true)
+}
+
 impl Runtime {
     pub fn mount_library(&mut self, manifest: PackageManifest) -> LibraryId {
         self.mount_library_with_artifact(manifest, None)
@@ -224,12 +273,8 @@ impl Runtime {
     }
 
     pub fn mount_voxlib_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
-        let entries = fs::read_dir(dir)
-            .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
         let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("directory read error: {error}"))?;
-            let path = entry.path();
+        for path in collect_mount_files(dir)? {
             if path.extension().and_then(|ext| ext.to_str()) == Some("voxlib") {
                 ids.push(self.mount_voxlib_file(&path)?);
             }
@@ -240,6 +285,12 @@ impl Runtime {
     pub fn mount_vox_file(&mut self, path: &Path) -> Result<LibraryId, String> {
         let text = fs::read_to_string(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+        if !has_package_header(&text) {
+            return Err(format!(
+                "script files cannot be compiled as importable libraries: {}",
+                path.display()
+            ));
+        }
         let path_str = path
             .to_str()
             .ok_or_else(|| format!("non-UTF8 path: {}", path.display()))?;
@@ -278,19 +329,15 @@ impl Runtime {
     }
 
     pub fn mount_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
-        let entries = fs::read_dir(dir)
-            .map_err(|error| format!("failed to read directory {}: {error}", dir.display()))?;
         let mut ids = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("directory read error: {error}"))?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            match path.extension().and_then(|ext| ext.to_str()) {
-                Some("vox") => ids.push(self.mount_vox_file(&path)?),
-                Some("voxlib") => ids.push(self.mount_voxlib_file(&path)?),
-                _ => {}
+        let files = collect_mount_files(dir)?;
+
+        for path in files.iter().filter(|path| is_voxlib_file(path)) {
+            ids.push(self.mount_voxlib_file(path)?);
+        }
+        for path in files.iter().filter(|path| is_vox_file(path)) {
+            if is_package_vox_file(path)? {
+                ids.push(self.mount_vox_file(path)?);
             }
         }
         Ok(ids)
