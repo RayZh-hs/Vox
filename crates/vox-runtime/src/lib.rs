@@ -20,11 +20,12 @@ mod wasm_executor;
 
 use thiserror::Error;
 use vox_compiler::{
-    CompileRequest, Compiler, package_manifest_from_frontend,
+    CompileRequest, Compiler,
     frontend::lexer::{Lexer, TokenKind},
+    package_manifest_from_frontend,
 };
 use vox_core::{
-    external_library::decode_external_library_file,
+    external_library::{decode_external_library_file, voxlib_function_export, voxlib_value_export},
     host::{HostRegistry, PackageManifest},
     ids::{ArtifactId, HandleId, LibraryId},
     opt::{OptimizationLevel, OptimizationRank, OptimizationSubject},
@@ -55,6 +56,7 @@ pub use runner::{
 pub use server::{RuntimeServer, RuntimeServerError};
 pub(crate) use session::SessionState;
 pub use session::{InteractiveSession, SessionCompletion, SessionError};
+use wasm_executor::{CompiledVoxlib, compile_voxlib_wasm, try_wasm_execute_export};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountedLibrary {
@@ -62,6 +64,8 @@ pub struct MountedLibrary {
     pub revision: u64,
     pub manifest: PackageManifest,
     pub artifact: Option<ArtifactId>,
+    pub wasm_bytes: Option<Vec<u8>>,
+    pub metadata: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,6 +166,7 @@ pub struct Runtime {
     mir_execution_failures: BTreeMap<ArtifactId, String>,
     generic_handles: std::collections::BTreeMap<GenericFunctionKey, CachedGenericFunction>,
     libraries: Vec<MountedLibrary>,
+    voxlib_modules: BTreeMap<LibraryId, CompiledVoxlib>,
     package_artifacts: BTreeMap<ModulePath, ArtifactId>,
     next_library_id: u64,
     next_library_revision: u64,
@@ -178,6 +183,28 @@ struct CachedGenericFunction {
 #[derive(Clone)]
 struct RegisteredHostFunction {
     handler: HostFunctionHandler,
+}
+
+#[derive(Debug, Clone)]
+enum PackageWasm {
+    Voxlib(CompiledVoxlib),
+    Artifact(Vec<u8>),
+}
+
+impl PackageWasm {
+    fn execute(
+        &self,
+        runtime: &mut Runtime,
+        export_name: &str,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, String> {
+        match self {
+            Self::Voxlib(module) => module.execute(runtime, export_name, arguments),
+            Self::Artifact(bytes) => {
+                try_wasm_execute_export(runtime, bytes, export_name, arguments)
+            }
+        }
+    }
 }
 
 impl fmt::Debug for RegisteredHostFunction {
@@ -234,13 +261,23 @@ fn has_package_header(source: &str) -> bool {
 
 impl Runtime {
     pub fn mount_library(&mut self, manifest: PackageManifest) -> LibraryId {
-        self.mount_library_with_artifact(manifest, None)
+        self.mount_library_with_implementation(manifest, None, None, None)
     }
 
     fn mount_library_with_artifact(
         &mut self,
         manifest: PackageManifest,
         artifact: Option<ArtifactId>,
+    ) -> LibraryId {
+        self.mount_library_with_implementation(manifest, artifact, None, None)
+    }
+
+    fn mount_library_with_implementation(
+        &mut self,
+        manifest: PackageManifest,
+        artifact: Option<ArtifactId>,
+        wasm_bytes: Option<Vec<u8>>,
+        metadata: Option<Vec<u8>>,
     ) -> LibraryId {
         self.host_functions
             .retain(|(package, _), _| package != &manifest.package);
@@ -260,6 +297,8 @@ impl Runtime {
             revision: self.next_library_revision,
             manifest,
             artifact,
+            wasm_bytes,
+            metadata,
         });
         id
     }
@@ -267,9 +306,21 @@ impl Runtime {
     pub fn mount_voxlib_file(&mut self, path: &Path) -> Result<LibraryId, String> {
         let bytes = fs::read(path)
             .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-        let header = decode_external_library_file(&bytes)
-            .map_err(|error| format!("invalid .voxlib file {}: {error}", path.display()))?;
-        Ok(self.mount_library(header.manifest))
+        self.mount_voxlib_bytes(&bytes)
+            .map_err(|error| format!("invalid .voxlib file {}: {error}", path.display()))
+    }
+
+    pub fn mount_voxlib_bytes(&mut self, bytes: &[u8]) -> Result<LibraryId, String> {
+        let header = decode_external_library_file(&bytes).map_err(|error| error.to_string())?;
+        let module = compile_voxlib_wasm(&header.wasm_bytes, &header.manifest)?;
+        let id = self.mount_library_with_implementation(
+            header.manifest,
+            None,
+            Some(header.wasm_bytes),
+            header.metadata,
+        );
+        self.voxlib_modules.insert(id, module);
+        Ok(id)
     }
 
     pub fn mount_voxlib_dir(&mut self, dir: &Path) -> Result<Vec<LibraryId>, String> {
@@ -630,6 +681,7 @@ impl Runtime {
             .iter()
             .any(|library| library.manifest.package == package);
         self.libraries.remove(index);
+        self.voxlib_modules.remove(&library_id);
         if let Some(artifact_id) = artifact {
             self.clear_generic_handles(Some(artifact_id));
             self.mir_execution_failures.remove(&artifact_id);
@@ -830,18 +882,70 @@ impl Runtime {
         function: &str,
         arguments: &[HostCallArgument],
     ) -> Result<RuntimeValue, String> {
-        let Some(entry) = self
+        if let Some(entry) = self
             .host_functions
             .get(&(package.clone(), function.to_owned()))
             .cloned()
-        else {
-            return Err(format!(
+        {
+            return (entry.handler)(self, arguments);
+        }
+
+        let values = arguments
+            .iter()
+            .map(|argument| {
+                argument.value.clone().ok_or_else(|| {
+                    format!(
+                        "wasm package call `{}` requires argument `{}`; omitted default arguments are not materialized by the caller",
+                        qualified_host_name(package, function),
+                        argument.name
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let wasm = self.active_package_wasm(package).ok_or_else(|| {
+            format!(
                 "host function implementation is not mounted for `{}`",
                 qualified_host_name(package, function)
-            ));
-        };
+            )
+        })?;
+        wasm.execute(self, &voxlib_function_export(function), &values)
+    }
 
-        (entry.handler)(self, arguments)
+    pub(crate) fn invoke_package_value(
+        &mut self,
+        package: &ModulePath,
+        value: &str,
+    ) -> Result<RuntimeValue, String> {
+        let wasm = self.active_package_wasm(package).ok_or_else(|| {
+            format!(
+                "package value implementation is not mounted for `{}.{}`",
+                package.as_str(),
+                value
+            )
+        })?;
+        wasm.execute(self, &voxlib_value_export(value), &[])
+    }
+
+    fn active_package_wasm(&self, package: &ModulePath) -> Option<PackageWasm> {
+        let library = self
+            .libraries
+            .iter()
+            .rev()
+            .find(|library| &library.manifest.package == package)?;
+        if library.wasm_bytes.is_some() {
+            return self
+                .voxlib_modules
+                .get(&library.id)
+                .cloned()
+                .map(PackageWasm::Voxlib);
+        }
+        let artifact = library.artifact?;
+        self.artifacts
+            .get(artifact)?
+            .plan
+            .wasm
+            .as_ref()
+            .map(|wasm| PackageWasm::Artifact(wasm.bytes.clone()))
     }
 
     pub fn set_default_xopt(&mut self, xopt: OptimizationLevel) {

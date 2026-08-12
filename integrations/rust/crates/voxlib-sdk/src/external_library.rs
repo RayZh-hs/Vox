@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -7,7 +7,10 @@ use std::{
 use vox_core::{
     diagnostics::Diagnostic,
     external_library::{
-        encode_external_library_file, ExternalLibraryFormatError, ExternalLibraryHeader,
+        ExternalLibraryFormatError, ExternalLibraryHeader, VOXLIB_HEAP_TOP_EXPORT_NAME,
+        VOXLIB_HOST_IMPORT_NAME, VOXLIB_MEMORY_EXPORT_NAME, VOXLIB_MEMORY_IMPORT_MODULE,
+        VOXLIB_MEMORY_IMPORT_NAME, VOXLIB_OPERATION_IMPORT_NAME, encode_external_library_file,
+        voxlib_function_export, voxlib_value_export,
     },
     host::PackageManifest,
     source::ModulePath,
@@ -74,6 +77,7 @@ impl ExternalLibrary {
     ) -> Result<GeneratedExternalLibrary, ExternalLibraryFormatError> {
         let (manifest, metadata) = self.build().map_err(ExternalLibraryFormatError::Message)?;
         let wasm_bytes = wasm_bytes.into();
+        validate_package_wasm(&manifest, &wasm_bytes)?;
         let header = ExternalLibraryHeader {
             manifest,
             wasm_bytes,
@@ -122,6 +126,98 @@ impl GeneratedExternalLibrary {
 
         Ok(GeneratedExternalLibraryFiles { library_path })
     }
+}
+
+fn validate_package_wasm(
+    manifest: &PackageManifest,
+    wasm_bytes: &[u8],
+) -> Result<(), ExternalLibraryFormatError> {
+    wasmparser::Validator::new()
+        .validate_all(wasm_bytes)
+        .map_err(|error| {
+            ExternalLibraryFormatError::Message(format!("invalid package wasm: {error}"))
+        })?;
+    if manifest.functions.is_empty() && manifest.values.is_empty() {
+        return Ok(());
+    }
+
+    let mut imports = Vec::new();
+    let mut function_exports = BTreeSet::new();
+    let mut memory_exported = false;
+    let mut heap_top_exported = false;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
+        match payload.map_err(|error| ExternalLibraryFormatError::Message(error.to_string()))? {
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section {
+                    let import = import
+                        .map_err(|error| ExternalLibraryFormatError::Message(error.to_string()))?;
+                    imports.push((import.module.to_owned(), import.name.to_owned()));
+                }
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export
+                        .map_err(|error| ExternalLibraryFormatError::Message(error.to_string()))?;
+                    match export.kind {
+                        wasmparser::ExternalKind::Func => {
+                            function_exports.insert(export.name.to_owned());
+                        }
+                        wasmparser::ExternalKind::Memory
+                            if export.name == VOXLIB_MEMORY_EXPORT_NAME =>
+                        {
+                            memory_exported = true;
+                        }
+                        wasmparser::ExternalKind::Global
+                            if export.name == VOXLIB_HEAP_TOP_EXPORT_NAME =>
+                        {
+                            heap_top_exported = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let required_imports = [
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_MEMORY_IMPORT_NAME),
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_OPERATION_IMPORT_NAME),
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_HOST_IMPORT_NAME),
+    ];
+    if imports.len() != required_imports.len()
+        || imports
+            .iter()
+            .zip(required_imports)
+            .any(|(actual, expected)| actual.0 != expected.0 || actual.1 != expected.1)
+    {
+        return Err(ExternalLibraryFormatError::Message(
+            "package wasm must import `vox.memory`, `vox.__vox_op`, and `vox.__vox_host` in that order"
+                .to_owned(),
+        ));
+    }
+    if !memory_exported || !heap_top_exported {
+        return Err(ExternalLibraryFormatError::Message(format!(
+            "package wasm must export `{VOXLIB_MEMORY_EXPORT_NAME}` memory and `{VOXLIB_HEAP_TOP_EXPORT_NAME}` global"
+        )));
+    }
+    for function in &manifest.functions {
+        let export = voxlib_function_export(&function.name);
+        if !function_exports.contains(&export) {
+            return Err(ExternalLibraryFormatError::Message(format!(
+                "package wasm is missing function export `{export}`"
+            )));
+        }
+    }
+    for value in &manifest.values {
+        let export = voxlib_value_export(&value.name);
+        if !function_exports.contains(&export) {
+            return Err(ExternalLibraryFormatError::Message(format!(
+                "package wasm is missing value export `{export}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn encode_docstring_metadata(docstrings: &BTreeMap<String, String>) -> Vec<u8> {

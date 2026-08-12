@@ -66,6 +66,7 @@ pub struct MirBody {
     pub id: MirBodyId,
     pub name: String,
     pub kind: MirBodyKind,
+    pub exported: bool,
     pub span: Option<TextSpan>,
     pub purity: Purity,
     pub optimization_rank: OptimizationRank,

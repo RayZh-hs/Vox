@@ -562,18 +562,24 @@ pub fn compile_to_voxlib(request: CompileRequest) -> Result<Vec<u8>, String> {
     let artifact = result
         .artifact
         .ok_or_else(|| result.diagnostics.to_string())?;
-    let wasm_bytes = artifact
-        .plan
-        .wasm
-        .as_ref()
-        .map(|wasm| wasm.bytes.clone())
-        .unwrap_or_else(|| MINIMAL_WASM_MODULE.to_vec());
-
     let frontend = result
         .frontend
         .as_ref()
         .expect("successful compilation should produce a frontend unit");
     let manifest = package_manifest_from_frontend(frontend)?;
+    let wasm_bytes = match artifact.plan.wasm.as_ref() {
+        Some(wasm) => wasm.bytes.clone(),
+        None if manifest.functions.is_empty() && manifest.values.is_empty() => {
+            MINIMAL_WASM_MODULE.to_vec()
+        }
+        None => {
+            return Err(format!(
+                "package `{}` has executable exports but could not be lowered to the .voxlib wasm ABI: {}",
+                manifest.package.as_str(),
+                artifact.plan.optimization_summary.join("; ")
+            ));
+        }
+    };
     let header = ExternalLibraryHeader {
         manifest,
         wasm_bytes,

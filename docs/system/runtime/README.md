@@ -12,6 +12,10 @@ It owns:
 It can run in-process through `EmbeddedRunner` or as a TCP server through the
 `vox-runtime` binary.
 
+File-backed `.voxlib` packages use the versioned
+[Voxlib package ABI](voxlib-abi.md). Their wasm implementations are validated,
+retained, and used for imported functions and package values.
+
 ## Start the Runtime
 
 Run a shared runtime server with:

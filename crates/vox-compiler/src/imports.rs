@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use vox_core::host::HostRegistry;
+use vox_core::{host::HostRegistry, types::VoxType};
 
 use crate::frontend::ast::ImportDecl;
 
@@ -8,12 +8,14 @@ use crate::frontend::ast::ImportDecl;
 pub struct ImportResolution {
     pub unqualified: BTreeMap<String, String>,
     pub module_aliases: BTreeMap<String, String>,
+    pub function_return_types: BTreeMap<String, VoxType>,
 }
 
 pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportResolution {
     let mut module_aliases = BTreeMap::new();
     let mut unqualified_sources: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut explicit: BTreeMap<String, String> = BTreeMap::new();
+    let mut function_return_types = BTreeMap::new();
 
     for import in imports.iter().flat_map(ImportDecl::expanded) {
         let module_str = import.module.to_source_string();
@@ -28,6 +30,14 @@ pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportRes
             &vox_core::source::ModulePath::parse(&module_str)
                 .unwrap_or_else(|_| vox_core::source::ModulePath::parse("unknown").unwrap()),
         );
+        if let Some(manifest) = manifest {
+            for function in &manifest.functions {
+                function_return_types.insert(
+                    format!("{}.{}", module_str, function.name),
+                    function.return_type.clone(),
+                );
+            }
+        }
 
         match &import.items {
             None => {
@@ -70,5 +80,6 @@ pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportRes
     ImportResolution {
         unqualified,
         module_aliases,
+        function_return_types,
     }
 }

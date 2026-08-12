@@ -1785,6 +1785,7 @@ dependencies = [
  "inventory",
  "vox-core",
  "voxlib-macros",
+ "wasmparser 0.221.3",
 ]
 
 [[package]]

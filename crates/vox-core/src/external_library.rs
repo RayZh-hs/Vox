@@ -13,8 +13,38 @@ use crate::{
 };
 
 pub const EXTERNAL_LIBRARY_MAGIC: [u8; 4] = *b"VXLH";
-pub const EXTERNAL_LIBRARY_VERSION: u16 = 5;
+pub const EXTERNAL_LIBRARY_VERSION: u16 = 6;
+pub const EXTERNAL_LIBRARY_ABI_VERSION: u16 = 1;
 pub const MINIMAL_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
+
+pub const VOXLIB_FUNCTION_EXPORT_PREFIX: &str = "vox:function:";
+pub const VOXLIB_VALUE_EXPORT_PREFIX: &str = "vox:value:";
+pub const VOXLIB_MEMORY_IMPORT_MODULE: &str = "vox";
+pub const VOXLIB_MEMORY_IMPORT_NAME: &str = "memory";
+pub const VOXLIB_OPERATION_IMPORT_NAME: &str = "__vox_op";
+pub const VOXLIB_HOST_IMPORT_NAME: &str = "__vox_host";
+pub const VOXLIB_MEMORY_EXPORT_NAME: &str = "memory";
+pub const VOXLIB_HEAP_TOP_EXPORT_NAME: &str = "__vox_heap_top";
+
+pub const VOXLIB_TAG_INT: i32 = 0;
+pub const VOXLIB_TAG_FLOAT: i32 = 1;
+pub const VOXLIB_TAG_BOOL: i32 = 2;
+pub const VOXLIB_TAG_STRING: i32 = 3;
+pub const VOXLIB_TAG_TUPLE: i32 = 4;
+pub const VOXLIB_TAG_RECORD: i32 = 5;
+pub const VOXLIB_TAG_LIST: i32 = 6;
+pub const VOXLIB_TAG_HANDLE: i32 = 7;
+pub const VOXLIB_TAG_NULL: i32 = 8;
+pub const VOXLIB_TAG_UINT: i32 = 9;
+pub const VOXLIB_TAG_CLOSURE: i32 = 10;
+
+pub fn voxlib_function_export(name: &str) -> String {
+    format!("{VOXLIB_FUNCTION_EXPORT_PREFIX}{name}")
+}
+
+pub fn voxlib_value_export(name: &str) -> String {
+    format!("{VOXLIB_VALUE_EXPORT_PREFIX}{name}")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLibraryHeader {
@@ -46,8 +76,8 @@ impl From<io::Error> for ExternalLibraryFormatError {
     }
 }
 
-// .voxlib binary format (version 4):
-// magic(4B) | version(u16) | reserved(u16) | manifest(len+bytes)
+// .voxlib binary format (version 6):
+// magic(4B) | version(u16) | ABI version(u16) | manifest(len+bytes)
 // | wasm(len+bytes) | metadata(len+bytes)?
 
 pub fn encode_external_library_file(
@@ -56,7 +86,7 @@ pub fn encode_external_library_file(
     let mut writer = BinaryWriter::new();
     writer.write_fixed(&EXTERNAL_LIBRARY_MAGIC);
     writer.write_u16(EXTERNAL_LIBRARY_VERSION);
-    writer.write_u16(0);
+    writer.write_u16(EXTERNAL_LIBRARY_ABI_VERSION);
     writer.write_bytes(&encode_package_manifest(&header.manifest)?)?;
     writer.write_bytes(&header.wasm_bytes)?;
     if let Some(metadata) = &header.metadata {
@@ -83,7 +113,12 @@ pub fn decode_external_library_file(
         )));
     }
 
-    let _reserved = reader.read_u16()?;
+    let abi_version = reader.read_u16()?;
+    if abi_version != EXTERNAL_LIBRARY_ABI_VERSION {
+        return Err(ExternalLibraryFormatError::Message(format!(
+            "unsupported external library ABI version {abi_version}"
+        )));
+    }
     let manifest = decode_package_manifest(&reader.read_bytes()?)?;
     let wasm_bytes = reader.read_bytes()?;
     let metadata = if reader.cursor < reader.bytes.len() {

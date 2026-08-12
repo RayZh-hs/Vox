@@ -835,23 +835,29 @@ impl RuntimeConnection {
         let source = payload.read_bytes().map_err(WireFailure::bad_argument)?;
         payload.finish().map_err(WireFailure::bad_argument)?;
 
-        if source_kind != 1 {
-            return Err(WireFailure::recoverable(
-                ErrorCode::UnsupportedOpcode,
-                "only manifest-byte library mounts are implemented",
-            ));
-        }
-
-        let mut manifest_payload = PayloadReader::new(&source);
-        let manifest = decode_manifest(&mut manifest_payload).map_err(WireFailure::bad_argument)?;
-        manifest_payload
-            .finish()
-            .map_err(WireFailure::bad_argument)?;
-
         let library = self
             .runner
             .with_runtime(|runtime| {
-                let actual_id = runtime.mount_library(manifest);
+                let actual_id = match source_kind {
+                    1 => {
+                        let mut manifest_payload = PayloadReader::new(&source);
+                        let manifest = decode_manifest(&mut manifest_payload)
+                            .map_err(|error| RunnerError::Session(error.to_string()))?;
+                        manifest_payload
+                            .finish()
+                            .map_err(|error| RunnerError::Session(error.to_string()))?;
+                        runtime.mount_library(manifest)
+                    }
+                    2 => runtime
+                        .mount_voxlib_bytes(&source)
+                        .map_err(RunnerError::Session)?,
+                    _ => {
+                        return Err(RunnerError::Session(
+                            "library mount source kind must be 1 (manifest) or 2 (.voxlib bundle)"
+                                .to_owned(),
+                        ));
+                    }
+                };
                 let mounted = runtime.library(actual_id).cloned().ok_or_else(|| {
                     RunnerError::Unavailable("mounted library was not found".to_owned())
                 })?;

@@ -611,7 +611,28 @@ impl RuntimeRunner for RemoteRunner {
         let header = decode_external_library_file(&bytes).map_err(|error| {
             RunnerError::Session(format!("invalid .voxlib file {}: {error}", path.display()))
         })?;
-        self.mount_library(header.manifest)
+
+        let mut payload = PayloadWriter::new();
+        payload.write_u8(2);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_u8(0);
+        payload.write_bytes(&bytes).map_err(protocol_to_runner)?;
+
+        let frame = self.invoke(Opcode::MountLibrary, 0, 0, payload.into_inner())?;
+        let mut response = PayloadReader::new(&frame.payload);
+        let library_id = response.read_u32().map_err(protocol_to_runner)?;
+        let _revision = response.read_u64().map_err(protocol_to_runner)?;
+        response.finish().map_err(protocol_to_runner)?;
+
+        let library = LibraryId(library_id as u64);
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|error| RunnerError::Unavailable(error.to_string()))?;
+        state.mounted_manifests.push((library, header.manifest));
+        Ok(library)
     }
 
     fn load_script(

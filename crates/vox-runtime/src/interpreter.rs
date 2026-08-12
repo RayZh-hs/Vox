@@ -212,13 +212,9 @@ pub(crate) fn evaluate_package_value(
     package: &ModulePath,
     name: &str,
 ) -> Result<RuntimeValue, String> {
-    let artifact_id = runtime.package_artifact(package).ok_or_else(|| {
-        format!(
-            "package value implementation is not mounted for `{}.{}`",
-            package.as_str(),
-            name
-        )
-    })?;
+    let Some(artifact_id) = runtime.package_artifact(package) else {
+        return runtime.invoke_package_value(package, name);
+    };
     let artifact = runtime
         .artifacts
         .get(artifact_id)

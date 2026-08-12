@@ -52,9 +52,14 @@ Use `--package` to override auto-detection and force `.voxlib` output.
 
 `--mount PATH` supports:
 
-- `.voxlib` files: decoded and registered in the compilation host registry.
+- `.voxlib` files: decoded and registered in the compilation host registry;
+  their manifests provide dependency surfaces during compilation.
 - Directories: scanned for `.voxlib` files (non-recursive).
 - `.vox` files: not supported directly; compile to `.voxlib` first.
+
+Package output uses the universal [Voxlib package
+ABI](../runtime/voxlib-abi.md). Public functions and values are emitted as
+stable wasm exports that the runtime validates and invokes after mounting.
 
 ## Pipeline
 

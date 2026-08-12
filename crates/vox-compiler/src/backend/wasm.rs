@@ -8,12 +8,20 @@ use wasm_encoder::{
 
 use vox_core::{
     builtins,
+    external_library::{
+        VOXLIB_HEAP_TOP_EXPORT_NAME, VOXLIB_HOST_IMPORT_NAME, VOXLIB_MEMORY_EXPORT_NAME,
+        VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_MEMORY_IMPORT_NAME, VOXLIB_OPERATION_IMPORT_NAME,
+        VOXLIB_TAG_BOOL, VOXLIB_TAG_CLOSURE, VOXLIB_TAG_FLOAT, VOXLIB_TAG_HANDLE, VOXLIB_TAG_INT,
+        VOXLIB_TAG_LIST, VOXLIB_TAG_NULL, VOXLIB_TAG_RECORD, VOXLIB_TAG_STRING, VOXLIB_TAG_TUPLE,
+        VOXLIB_TAG_UINT, voxlib_function_export, voxlib_value_export,
+    },
     mir::{
         MirBlock, MirBlockId, MirBody, MirBodyId, MirBodyKind, MirModule, MirOpKind,
         MirPathSegment, MirProjection, MirTerminator, MirValue, MirValueDefinition, MirValueId,
         MirVersionId, MirVersionSource,
     },
     plan::WasmArtifact,
+    source::ModuleKind,
     types::VoxType,
     value::InlineValue,
 };
@@ -27,17 +35,17 @@ pub(crate) enum WasmLowering {
     Unsupported(String),
 }
 
-const TAG_INT: i32 = 0;
-const TAG_FLOAT: i32 = 1;
-const TAG_BOOL: i32 = 2;
-const TAG_STRING: i32 = 3;
-const TAG_TUPLE: i32 = 4;
-const TAG_RECORD: i32 = 5;
-const TAG_LIST: i32 = 6;
-const TAG_HANDLE: i32 = 7;
-const TAG_NULL: i32 = 8;
-const TAG_UINT: i32 = 9;
-const TAG_CLOSURE: i32 = 10;
+const TAG_INT: i32 = VOXLIB_TAG_INT;
+const TAG_FLOAT: i32 = VOXLIB_TAG_FLOAT;
+const TAG_BOOL: i32 = VOXLIB_TAG_BOOL;
+const TAG_STRING: i32 = VOXLIB_TAG_STRING;
+const TAG_TUPLE: i32 = VOXLIB_TAG_TUPLE;
+const TAG_RECORD: i32 = VOXLIB_TAG_RECORD;
+const TAG_LIST: i32 = VOXLIB_TAG_LIST;
+const TAG_HANDLE: i32 = VOXLIB_TAG_HANDLE;
+const TAG_NULL: i32 = VOXLIB_TAG_NULL;
+const TAG_UINT: i32 = VOXLIB_TAG_UINT;
+const TAG_CLOSURE: i32 = VOXLIB_TAG_CLOSURE;
 
 const SCRATCH_OFF: u32 = 0;
 const RESULT_OFF: u32 = 16384;
@@ -318,7 +326,10 @@ impl WasmBackend {
         match lower_module(module) {
             Ok(bytes) => WasmLowering::Lowered(WasmArtifact {
                 bytes,
-                entry_export: "script_entry".to_owned(),
+                entry_export: match module.kind {
+                    ModuleKind::Script { .. } => "script_entry".to_owned(),
+                    ModuleKind::Package => "vox package ABI exports".to_owned(),
+                },
                 summary: format!("wasm: {} bodies", module.bodies.len()),
             }),
             Err(reason) => WasmLowering::Unsupported(reason),
@@ -395,8 +406,8 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
 
     let mut imports = ImportSection::new();
     imports.import(
-        "vox",
-        "memory",
+        VOXLIB_MEMORY_IMPORT_MODULE,
+        VOXLIB_MEMORY_IMPORT_NAME,
         EntityType::Memory(MemoryType {
             minimum: INITIAL_MEMORY_PAGES as u64,
             maximum: None,
@@ -405,8 +416,16 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
             page_size_log2: None,
         }),
     );
-    imports.import("vox", "__vox_op", EntityType::Function(0));
-    imports.import("vox", "__vox_host", EntityType::Function(1));
+    imports.import(
+        VOXLIB_MEMORY_IMPORT_MODULE,
+        VOXLIB_OPERATION_IMPORT_NAME,
+        EntityType::Function(0),
+    );
+    imports.import(
+        VOXLIB_MEMORY_IMPORT_MODULE,
+        VOXLIB_HOST_IMPORT_NAME,
+        EntityType::Function(1),
+    );
 
     let mut funcs = FunctionSection::new();
 
@@ -444,15 +463,37 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         func_index += 1;
     }
 
-    let entry_func_index = entry_func_index
-        .ok_or_else(|| "module must have a ScriptEntry body for wasm".to_owned())?;
-
     let func_map_clone = func_map.clone();
 
     let mut exports = ExportSection::new();
-    exports.export("script_entry", ExportKind::Func, entry_func_index);
-    exports.export("memory", ExportKind::Memory, 0);
-    exports.export("__vox_heap_top", ExportKind::Global, HEAP_TOP_GLOBAL);
+    if let Some(entry_func_index) = entry_func_index {
+        exports.export("script_entry", ExportKind::Func, entry_func_index);
+    }
+    for (body, function_index) in bodies.iter().zip(2u32..) {
+        match body.kind {
+            MirBodyKind::Function if body.exported => {
+                exports.export(
+                    &voxlib_function_export(&body.name),
+                    ExportKind::Func,
+                    function_index,
+                );
+            }
+            MirBodyKind::ValueInitializer if body.exported => {
+                let name = body.name.strip_prefix("init.").unwrap_or(&body.name);
+                exports.export(&voxlib_value_export(name), ExportKind::Func, function_index);
+            }
+            MirBodyKind::ScriptEntry
+            | MirBodyKind::Lambda
+            | MirBodyKind::Function
+            | MirBodyKind::ValueInitializer => {}
+        }
+    }
+    exports.export(VOXLIB_MEMORY_EXPORT_NAME, ExportKind::Memory, 0);
+    exports.export(
+        VOXLIB_HEAP_TOP_EXPORT_NAME,
+        ExportKind::Global,
+        HEAP_TOP_GLOBAL,
+    );
 
     let mut ctx = Ctx::new(bodies[0], module);
     ctx.func_map = func_map;
@@ -573,7 +614,7 @@ fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
     let has_entry = bodies
         .iter()
         .any(|b| matches!(b.kind, MirBodyKind::ScriptEntry));
-    if !has_entry {
+    if matches!(module.kind, ModuleKind::Script { .. }) && !has_entry {
         return Err("module must have a ScriptEntry body for wasm".to_owned());
     }
 

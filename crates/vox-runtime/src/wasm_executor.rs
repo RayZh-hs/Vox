@@ -1,9 +1,18 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use wasmtime::*;
 
 use vox_core::{
     builtins::{self, BuiltinReceiver},
+    external_library::{
+        VOXLIB_HEAP_TOP_EXPORT_NAME, VOXLIB_HOST_IMPORT_NAME, VOXLIB_MEMORY_EXPORT_NAME,
+        VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_MEMORY_IMPORT_NAME, VOXLIB_OPERATION_IMPORT_NAME,
+        VOXLIB_TAG_BOOL, VOXLIB_TAG_CLOSURE, VOXLIB_TAG_FLOAT, VOXLIB_TAG_HANDLE, VOXLIB_TAG_INT,
+        VOXLIB_TAG_LIST, VOXLIB_TAG_NULL, VOXLIB_TAG_RECORD, VOXLIB_TAG_STRING, VOXLIB_TAG_TUPLE,
+        VOXLIB_TAG_UINT, voxlib_function_export, voxlib_value_export,
+    },
+    host::PackageManifest,
     ids::HandleId,
     source::ModulePath,
     value::{HandleData, HandleSummary, InlineValue, RuntimeValue},
@@ -14,17 +23,17 @@ use crate::{
     interpreter::{self, CallArgument, Value},
 };
 
-const TAG_INT: i32 = 0;
-const TAG_FLOAT: i32 = 1;
-const TAG_BOOL: i32 = 2;
-const TAG_STRING: i32 = 3;
-const TAG_TUPLE: i32 = 4;
-const TAG_RECORD: i32 = 5;
-const TAG_LIST: i32 = 6;
-const TAG_HANDLE: i32 = 7;
-const TAG_NULL: i32 = 8;
-const TAG_UINT: i32 = 9;
-const TAG_CLOSURE: i32 = 10;
+const TAG_INT: i32 = VOXLIB_TAG_INT;
+const TAG_FLOAT: i32 = VOXLIB_TAG_FLOAT;
+const TAG_BOOL: i32 = VOXLIB_TAG_BOOL;
+const TAG_STRING: i32 = VOXLIB_TAG_STRING;
+const TAG_TUPLE: i32 = VOXLIB_TAG_TUPLE;
+const TAG_RECORD: i32 = VOXLIB_TAG_RECORD;
+const TAG_LIST: i32 = VOXLIB_TAG_LIST;
+const TAG_HANDLE: i32 = VOXLIB_TAG_HANDLE;
+const TAG_NULL: i32 = VOXLIB_TAG_NULL;
+const TAG_UINT: i32 = VOXLIB_TAG_UINT;
+const TAG_CLOSURE: i32 = VOXLIB_TAG_CLOSURE;
 const TAG_INVALID: i32 = -1;
 const STRDATA_OFF: i64 = 32768;
 const WASM_PAGE_SIZE: u32 = 65536;
@@ -45,20 +54,190 @@ struct WasmIteratorState {
     position: usize,
 }
 
+#[derive(Clone)]
+pub(crate) struct CompiledVoxlib {
+    engine: Engine,
+    module: Module,
+}
+
+impl fmt::Debug for CompiledVoxlib {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompiledVoxlib")
+    }
+}
+
+impl CompiledVoxlib {
+    pub(crate) fn execute(
+        &self,
+        runtime: &mut Runtime,
+        export_name: &str,
+        arguments: &[RuntimeValue],
+    ) -> Result<RuntimeValue, String> {
+        execute_module_export(runtime, &self.engine, &self.module, export_name, arguments)
+    }
+}
+
 pub fn try_wasm_execute(
     runtime: &mut Runtime,
     wasm_bytes: &[u8],
+    arguments: &[RuntimeValue],
+) -> Result<RuntimeValue, String> {
+    try_wasm_execute_export(runtime, wasm_bytes, "script_entry", arguments)
+}
+
+pub(crate) fn compile_voxlib_wasm(
+    wasm_bytes: &[u8],
+    manifest: &PackageManifest,
+) -> Result<CompiledVoxlib, String> {
+    let mut config = Config::new();
+    config.max_wasm_stack(8 * 1024 * 1024);
+    let engine = Engine::new(&config).map_err(|error| error.to_string())?;
+    let module = Module::new(&engine, wasm_bytes)
+        .map_err(|error| format!("invalid wasm module: {error}"))?;
+    if manifest.functions.is_empty() && manifest.values.is_empty() {
+        return Ok(CompiledVoxlib { engine, module });
+    }
+
+    let imports = module.imports().collect::<Vec<_>>();
+    let required_imports = [
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_MEMORY_IMPORT_NAME),
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_OPERATION_IMPORT_NAME),
+        (VOXLIB_MEMORY_IMPORT_MODULE, VOXLIB_HOST_IMPORT_NAME),
+    ];
+    if imports.len() != required_imports.len()
+        || imports
+            .iter()
+            .zip(required_imports)
+            .any(|(actual, expected)| actual.module() != expected.0 || actual.name() != expected.1)
+    {
+        return Err(format!(
+            "package wasm must import `vox.memory`, `vox.__vox_op`, and `vox.__vox_host` in that order"
+        ));
+    }
+    let ExternType::Memory(memory_import) = imports[0].ty() else {
+        return Err("package wasm has invalid Vox ABI import types".to_owned());
+    };
+    if memory_import.is_64()
+        || memory_import.is_shared()
+        || memory_import.minimum() > INITIAL_MEMORY_PAGES as u64
+        || memory_import.maximum().is_some()
+    {
+        return Err(format!(
+            "package wasm must accept the Vox runtime's {INITIAL_MEMORY_PAGES}-page 32-bit unshared memory"
+        ));
+    }
+    let ExternType::Func(operation_import) = imports[1].ty() else {
+        return Err("package wasm has an invalid `vox.__vox_op` import type".to_owned());
+    };
+    let ExternType::Func(host_import) = imports[2].ty() else {
+        return Err("package wasm has an invalid `vox.__vox_host` import type".to_owned());
+    };
+    if !void_i32_function(&operation_import, 6) || !void_i32_function(&host_import, 5) {
+        return Err(
+            "package wasm imports must use `__vox_op(i32, i32, i32, i32, i32, i32)` and `__vox_host(i32, i32, i32, i32, i32)`"
+                .to_owned(),
+        );
+    }
+
+    let exports = module
+        .exports()
+        .map(|export| (export.name().to_owned(), export.ty()))
+        .collect::<BTreeMap<_, _>>();
+    if !matches!(
+        exports.get(VOXLIB_MEMORY_EXPORT_NAME),
+        Some(ExternType::Memory(_))
+    ) {
+        return Err(format!(
+            "package wasm must export memory as `{VOXLIB_MEMORY_EXPORT_NAME}`"
+        ));
+    }
+    let Some(ExternType::Global(heap_top)) = exports.get(VOXLIB_HEAP_TOP_EXPORT_NAME) else {
+        return Err(format!(
+            "package wasm must export the mutable heap pointer as `{VOXLIB_HEAP_TOP_EXPORT_NAME}`"
+        ));
+    };
+    if !heap_top.content().is_i32() || heap_top.mutability() != Mutability::Var {
+        return Err(format!(
+            "package wasm export `{VOXLIB_HEAP_TOP_EXPORT_NAME}` must be a mutable i32 global"
+        ));
+    }
+
+    for function in &manifest.functions {
+        validate_package_export(
+            &exports,
+            &voxlib_function_export(&function.name),
+            function.parameters.len(),
+        )?;
+    }
+    for value in &manifest.values {
+        validate_package_export(&exports, &voxlib_value_export(&value.name), 0)?;
+    }
+    Ok(CompiledVoxlib { engine, module })
+}
+
+fn void_i32_function(function: &FuncType, parameter_count: usize) -> bool {
+    let parameters = function.params().collect::<Vec<_>>();
+    parameters.len() == parameter_count
+        && parameters.iter().all(ValType::is_i32)
+        && function.results().next().is_none()
+}
+
+fn validate_package_export(
+    exports: &BTreeMap<String, ExternType>,
+    name: &str,
+    parameter_count: usize,
+) -> Result<(), String> {
+    let Some(ExternType::Func(function)) = exports.get(name) else {
+        return Err(format!("package wasm is missing function export `{name}`"));
+    };
+    let actual_parameters = function.params().collect::<Vec<_>>();
+    let actual_results = function.results().collect::<Vec<_>>();
+    let parameters_match = actual_parameters.len() == parameter_count * 2
+        && actual_parameters.iter().enumerate().all(|(index, ty)| {
+            if index % 2 == 0 {
+                ty.is_i32()
+            } else {
+                ty.is_i64()
+            }
+        });
+    let results_match =
+        actual_results.len() == 2 && actual_results[0].is_i32() && actual_results[1].is_i64();
+    if !parameters_match || !results_match {
+        return Err(format!(
+            "package export `{name}` must have signature ({}) -> (i32, i64)",
+            (0..parameter_count)
+                .map(|_| "i32, i64")
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(())
+}
+
+pub fn try_wasm_execute_export(
+    runtime: &mut Runtime,
+    wasm_bytes: &[u8],
+    export_name: &str,
     arguments: &[RuntimeValue],
 ) -> Result<RuntimeValue, String> {
     let mut config = Config::new();
     config.max_wasm_stack(8 * 1024 * 1024);
     let engine = Engine::new(&config).map_err(|e| e.to_string())?;
     let module = Module::new(&engine, wasm_bytes).map_err(|e| format!("{e:?}"))?;
+    execute_module_export(runtime, &engine, &module, export_name, arguments)
+}
 
+fn execute_module_export(
+    runtime: &mut Runtime,
+    engine: &Engine,
+    module: &Module,
+    export_name: &str,
+    arguments: &[RuntimeValue],
+) -> Result<RuntimeValue, String> {
     let runtime_ptr = runtime as *mut Runtime;
 
     let mut store = Store::new(
-        &engine,
+        engine,
         State {
             runtime: runtime_ptr,
             iterators: BTreeMap::new(),
@@ -68,7 +247,7 @@ pub fn try_wasm_execute(
     let memory_ty = MemoryType::new(INITIAL_MEMORY_PAGES, None);
     let memory = Memory::new(&mut store, memory_ty).map_err(|e| e.to_string())?;
 
-    let vox_op_ty = FuncType::new(&engine, vec![ValType::I32; 6], vec![]);
+    let vox_op_ty = FuncType::new(engine, vec![ValType::I32; 6], vec![]);
     let vox_op = Func::new(
         &mut store,
         vox_op_ty.clone(),
@@ -90,7 +269,10 @@ pub fn try_wasm_execute(
             let runtime = unsafe { &mut *runtime_ptr };
             let iterators = unsafe { &mut *iterators_ptr };
 
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+            let Some(mem) = caller
+                .get_export(VOXLIB_MEMORY_EXPORT_NAME)
+                .and_then(|e| e.into_memory())
+            else {
                 return Err(wasmtime::Error::msg(
                     "wasm import __vox_op: memory export not found",
                 ));
@@ -117,7 +299,7 @@ pub fn try_wasm_execute(
         },
     );
 
-    let vox_host_ty = FuncType::new(&engine, vec![ValType::I32; 5], vec![]);
+    let vox_host_ty = FuncType::new(engine, vec![ValType::I32; 5], vec![]);
     let vox_host = Func::new(
         &mut store,
         vox_host_ty,
@@ -131,7 +313,10 @@ pub fn try_wasm_execute(
             let state = caller.data();
             let runtime = unsafe { &mut *state.runtime };
 
-            let Some(mem) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
+            let Some(mem) = caller
+                .get_export(VOXLIB_MEMORY_EXPORT_NAME)
+                .and_then(|e| e.into_memory())
+            else {
                 return Err(wasmtime::Error::msg(
                     "wasm import __vox_host: memory export not found",
                 ));
@@ -151,17 +336,17 @@ pub fn try_wasm_execute(
 
     let instance = Instance::new(
         &mut store,
-        &module,
+        module,
         &[memory.into(), vox_op.into(), vox_host.into()],
     )
     .map_err(|e| e.to_string())?;
 
     let mem = instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| "memory export not found".to_owned())?;
+        .get_memory(&mut store, VOXLIB_MEMORY_EXPORT_NAME)
+        .ok_or_else(|| format!("{VOXLIB_MEMORY_EXPORT_NAME} export not found"))?;
     let heap_top = instance
-        .get_global(&mut store, "__vox_heap_top")
-        .ok_or_else(|| "__vox_heap_top export not found".to_owned())?;
+        .get_global(&mut store, VOXLIB_HEAP_TOP_EXPORT_NAME)
+        .ok_or_else(|| format!("{VOXLIB_HEAP_TOP_EXPORT_NAME} export not found"))?;
 
     let mut entry_args = Vec::with_capacity(arguments.len() * 2);
     for arg in arguments {
@@ -171,8 +356,8 @@ pub fn try_wasm_execute(
     }
 
     let entry = instance
-        .get_func(&mut store, "script_entry")
-        .ok_or_else(|| "script_entry export not found".to_owned())?;
+        .get_func(&mut store, export_name)
+        .ok_or_else(|| format!("{export_name} export not found"))?;
     let mut results = [Val::I32(TAG_INVALID), Val::I64(0)];
     entry
         .call(&mut store, &entry_args, &mut results)

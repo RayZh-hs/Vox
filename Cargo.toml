@@ -24,4 +24,5 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "io-std", "io-util"] }
 tower-lsp = "0.20"
 wasm-encoder = "0.221"
+wasmparser = "0.221"
 wasmtime = "29"

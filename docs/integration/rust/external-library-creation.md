@@ -227,6 +227,12 @@ containing:
 - the embedded wasm module;
 - optionally, an annotated metadata section at the end.
 
+The supplied module must implement the universal
+[Voxlib package ABI](../../system/runtime/voxlib-abi.md). Generation rejects
+arbitrary wasm that does not provide the imports and exports declared by the
+manifest. This is the same ABI emitted for Vox source packages and validated by
+the runtime when mounted.
+
 The resulting `GeneratedExternalLibrary` can be written to disk via
 `write_to_dir(dir)`.
 

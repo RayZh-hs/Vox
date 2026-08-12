@@ -23,7 +23,7 @@ use crate::frontend::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
         ExprKind, ForHeader, FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl,
         Mutability, QualifiedName, StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp,
-        UpdatedPathSegment, ValueDecl, WhenExpr,
+        UpdatedPathSegment, ValueDecl, Visibility, WhenExpr,
     },
 };
 use crate::imports::ImportResolution;
@@ -104,7 +104,8 @@ impl<'a> MirLowerer<'a> {
         rankings: &'a [vox_core::opt::OptimizationRanking],
         import_resolution: ImportResolution,
     ) -> Self {
-        let function_return_types = collect_function_return_types(frontend);
+        let mut function_return_types = collect_function_return_types(frontend);
+        function_return_types.extend(import_resolution.function_return_types.clone());
         Self {
             frontend,
             optimization,
@@ -259,7 +260,8 @@ impl<'a> MirLowerer<'a> {
 
         let result = body.lower_expr(&function.body);
         body.terminate(MirTerminator::Return(result));
-        let (finished, lambda_bodies) = body.finish();
+        let (mut finished, lambda_bodies) = body.finish();
+        finished.exported = matches!(function.visibility, Visibility::Public);
         self.lambda_bodies.extend(lambda_bodies);
         if let Some(result_type) = finished.result_type.clone() {
             self.function_return_types
@@ -286,7 +288,8 @@ impl<'a> MirLowerer<'a> {
         );
         let result = body.lower_expr(&value.initializer);
         body.terminate(MirTerminator::Return(result));
-        let (finished, lambda_bodies) = body.finish();
+        let (mut finished, lambda_bodies) = body.finish();
+        finished.exported = matches!(value.visibility, Visibility::Public);
         self.lambda_bodies.extend(lambda_bodies);
         finished
     }
@@ -394,6 +397,7 @@ impl BodyBuilder {
             id: self.body_id,
             name: self.name,
             kind: self.kind,
+            exported: false,
             span: self.span,
             purity: self.purity,
             optimization_rank: self.rank,

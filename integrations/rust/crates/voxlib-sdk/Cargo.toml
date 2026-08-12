@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 inventory.workspace = true
+wasmparser.workspace = true
 vox-core = { path = "../../../../crates/vox-core" }
 voxlib-macros = { path = "../voxlib-macros" }

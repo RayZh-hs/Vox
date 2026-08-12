@@ -572,6 +572,12 @@ u8 reserved[3]
 bytes source
 ```
 
+Source kind 2 contains the complete `.voxlib` file. It is the portable mount
+form used by remote runners; the server validates and retains its manifest,
+wasm implementation, and metadata. Source kind 1 registers a manifest for a
+host implementation already available inside the runtime process. Source kind
+0 is reserved and is not accepted by the current server.
+
 Success response payload:
 
 ```text
