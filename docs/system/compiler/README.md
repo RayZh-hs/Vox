@@ -43,7 +43,8 @@ vox-compiler -o out.wasm hello.vox
 
 The compiler inspects the source to decide the output format:
 
-- Sources starting with `package` → `.voxlib` (compiled via `compile_to_voxlib`)
+- Sources whose first non-comment token is `package` → `.voxlib` (compiled via
+  `compile_to_voxlib`)
 - All other sources → raw wasm bytes
 
 Use `--package` to override auto-detection and force `.voxlib` output.

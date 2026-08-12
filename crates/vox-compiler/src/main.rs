@@ -5,7 +5,7 @@ use std::{
     process,
 };
 
-use vox_compiler::{CompileRequest, Compiler, compile_to_voxlib};
+use vox_compiler::{CompileRequest, Compiler, compile_to_voxlib, frontend::has_package_header};
 use vox_core::{
     external_library::decode_external_library_file, host::HostRegistry, opt::OptimizationLevel,
     source::SourceText, tier::LanguageTier,
@@ -30,7 +30,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("cannot read `{}`: {error}", args.input.display()))?;
     let source = SourceText::new(&args.input.to_string_lossy(), 1, &source_text);
 
-    let is_package = args.force_package || is_package_source(&source_text);
+    let is_package = args.force_package || has_package_header(&source_text);
 
     if is_package {
         let request = CompileRequest {
@@ -74,10 +74,6 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn is_package_source(source: &str) -> bool {
-    source.trim_start().starts_with("package")
 }
 
 struct Args {

@@ -20,9 +20,7 @@ mod wasm_executor;
 
 use thiserror::Error;
 use vox_compiler::{
-    CompileRequest, Compiler,
-    frontend::lexer::{Lexer, TokenKind},
-    package_manifest_from_frontend,
+    CompileRequest, Compiler, frontend::has_package_header, package_manifest_from_frontend,
 };
 use vox_core::{
     external_library::{decode_external_library_file, voxlib_function_export, voxlib_value_export},
@@ -248,15 +246,6 @@ fn is_package_vox_file(path: &Path) -> Result<bool, String> {
     let text = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     Ok(has_package_header(&text))
-}
-
-fn has_package_header(source: &str) -> bool {
-    let (tokens, _) = Lexer::new(source, 0).lex_lossy();
-    tokens.into_iter().find_map(|token| match token.kind {
-        TokenKind::DocComment(_) => None,
-        TokenKind::Package => Some(true),
-        _ => Some(false),
-    }) == Some(true)
 }
 
 impl Runtime {
