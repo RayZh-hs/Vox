@@ -22,8 +22,8 @@ use crate::frontend::{
     ast::{
         Argument, BinaryOp, BlockExpr, BlockItem, CompilationUnit, CompoundAssignmentOp, Expr,
         ExprKind, ForHeader, FunctionDecl, IfExpr, IntrinsicExpr, LambdaExpr, LocalValueDecl,
-        Mutability, QualifiedName, StringLiteral, StringPart, TopLevelItem, TypeSyntax, UnaryOp,
-        UpdatedPathSegment, ValueDecl, Visibility, WhenExpr,
+        Mutability, QualifiedName, StringLiteral, StringPart, TopLevelItem, TypeKind, TypeSyntax,
+        UnaryOp, UpdatedPathSegment, ValueDecl, Visibility, WhenExpr,
     },
 };
 use crate::imports::ImportResolution;
@@ -241,7 +241,7 @@ impl<'a> MirLowerer<'a> {
         );
 
         for parameter in &function.parameters {
-            let ty = Some(VoxType::opaque_surface(parameter.ty.to_source_string()));
+            let ty = Some(type_syntax_to_vox(&parameter.ty));
             let value = body.new_value(
                 ty.clone(),
                 MirValueDefinition::Parameter(parameter.name.clone()),
@@ -1030,12 +1030,22 @@ impl BodyBuilder {
 
                 self.current = body_block;
                 self.push_scope();
+                let item_type = self
+                    .value_type(item)
+                    .cloned()
+                    .map(|ty| mir_non_null_type(&ty))
+                    .unwrap_or_else(|| VoxType::opaque_surface("Unknown"));
+                let refined_item = self.emit_op(
+                    MirOpKind::TypeRefine(render_type_key(&item_type)),
+                    vec![item],
+                    span.clone(),
+                );
                 self.declare_binding(
                     pattern.clone(),
                     MirMutability::Val,
-                    None,
+                    Some(item_type),
                     span.clone(),
-                    item,
+                    refined_item,
                     MirVersionSource::Loop,
                 );
                 self.loop_stack.push(LoopContext {
@@ -1098,8 +1108,37 @@ impl BodyBuilder {
         span: Option<vox_core::diagnostics::TextSpan>,
     ) -> MirValueId {
         if name.segments.len() == 1 {
-            self.use_name(&name.segments[0], span)
+            let local = &name.segments[0];
+            if self.resolve_binding(local).is_some() {
+                return self.use_name(local, span);
+            }
+            if let Some(callee) = self.import_resolution.unqualified.get(local).cloned()
+                && self.function_return_types.contains_key(&callee)
+            {
+                return self.emit_op(
+                    MirOpKind::Call {
+                        callee,
+                        purity: Purity::Pure,
+                    },
+                    Vec::new(),
+                    span,
+                );
+            }
+            self.use_name(local, span)
         } else {
+            let qualified = self
+                .resolve_module_prefix(&name.segments)
+                .unwrap_or_else(|| name.to_source_string());
+            if self.function_return_types.contains_key(&qualified) {
+                return self.emit_op(
+                    MirOpKind::Call {
+                        callee: qualified,
+                        purity: Purity::Pure,
+                    },
+                    Vec::new(),
+                    span,
+                );
+            }
             self.terminate_with_panic(format!(
                 "qualified name `{}` is not available as a MIR value",
                 name.to_source_string()
@@ -1273,7 +1312,9 @@ impl BodyBuilder {
             MirOpKind::Binary(name) => Some(mir_type_from_binary_op(name, &args, self)),
             MirOpKind::Unary(name) => Some(mir_type_from_unary_op(name, &args, self)),
             MirOpKind::Use(_) => args.first().and_then(|arg| self.value_type(*arg).cloned()),
-            MirOpKind::TypeRefine(ty) => Some(VoxType::opaque_surface(ty.clone())),
+            MirOpKind::TypeRefine(ty) => {
+                Some(parse_type_key(ty).unwrap_or_else(|| VoxType::opaque_surface(ty.clone())))
+            }
             MirOpKind::Unit => Some(VoxType::Tuple(Vec::new())),
             MirOpKind::NonNull => args
                 .first()
@@ -1548,11 +1589,11 @@ impl BodyBuilder {
         }
     }
 
-    fn register_external_value(&mut self, value_id: MirValueId) {
+    fn register_external_value(&mut self, value_id: MirValueId, ty: Option<VoxType>) {
         if !self.values.iter().any(|v| v.id == value_id) {
             self.values.push(MirValue {
                 id: value_id,
-                ty: None,
+                ty,
                 definition: MirValueDefinition::Capture("".to_owned()),
                 span: None,
                 binding_version: None,
@@ -1563,6 +1604,7 @@ impl BodyBuilder {
                 storage: MirStorage::Fresh,
             });
         }
+        self.next_value = self.next_value.max(value_id.0.saturating_add(1));
     }
 
     fn lower_lambda(&mut self, lambda: &LambdaExpr, expr: &Expr) -> MirValueId {
@@ -1596,7 +1638,7 @@ impl BodyBuilder {
         );
 
         for (name, value) in capture_names.iter().zip(captures.iter()) {
-            child.register_external_value(*value);
+            child.register_external_value(*value, self.value_type(*value).cloned());
             child.declare_binding(
                 name.clone(),
                 MirMutability::Val,
@@ -1683,8 +1725,10 @@ fn collect_free_names_for_lambda(
         ExprKind::Call { callee, arguments } => {
             collect_free_names_for_lambda(callee, param_set, names);
             for arg in arguments {
-                if let Argument::Positional(expr) = arg {
-                    collect_free_names_for_lambda(expr, param_set, names);
+                match arg {
+                    Argument::Positional(expr) | Argument::Named { value: expr, .. } => {
+                        collect_free_names_for_lambda(expr, param_set, names);
+                    }
                 }
             }
         }
@@ -1695,9 +1739,24 @@ fn collect_free_names_for_lambda(
         } => {
             collect_free_names_for_lambda(receiver, param_set, names);
             for arg in arguments {
-                if let Argument::Positional(expr) = arg {
-                    collect_free_names_for_lambda(expr, param_set, names);
+                match arg {
+                    Argument::Positional(expr) | Argument::Named { value: expr, .. } => {
+                        collect_free_names_for_lambda(expr, param_set, names);
+                    }
                 }
+            }
+        }
+        ExprKind::String(literal) => {
+            collect_free_names_for_lambda_string(literal, param_set, names);
+        }
+        ExprKind::List(items) | ExprKind::Tuple(items) => {
+            for item in items {
+                collect_free_names_for_lambda(item, param_set, names);
+            }
+        }
+        ExprKind::Record(fields) => {
+            for field in fields {
+                collect_free_names_for_lambda(&field.value, param_set, names);
             }
         }
         ExprKind::Unary { expr: inner, .. } => {
@@ -1707,32 +1766,7 @@ fn collect_free_names_for_lambda(
             collect_free_names_for_lambda(left, param_set, names);
             collect_free_names_for_lambda(right, param_set, names);
         }
-        ExprKind::Block(block) => {
-            let mut block_param_names = BTreeSet::new();
-            for item in &block.items {
-                match item {
-                    BlockItem::LocalValue(local) => {
-                        collect_free_names_for_lambda(&local.initializer, param_set, names);
-                        block_param_names.insert(local.name.clone());
-                    }
-                    BlockItem::Assignment(a) => {
-                        collect_free_names_for_lambda(&a.value, param_set, names);
-                    }
-                    BlockItem::CompoundAssignment(ca) => {
-                        collect_free_names_for_lambda(&ca.value, param_set, names);
-                    }
-                    BlockItem::Expr(e) => {
-                        collect_free_names_for_lambda(e, param_set, names);
-                    }
-                    _ => {}
-                }
-            }
-            let inner_set: BTreeSet<String> =
-                param_set.union(&block_param_names).cloned().collect();
-            if let Some(trailing) = &block.trailing {
-                collect_free_names_for_lambda(trailing, &inner_set, names);
-            }
-        }
+        ExprKind::Block(block) => collect_free_names_for_lambda_block(block, param_set, names),
         ExprKind::Lambda(inner_lambda) => {
             let mut inner_params: BTreeSet<String> = param_set.clone();
             for p in &inner_lambda.parameters {
@@ -1770,7 +1804,11 @@ fn collect_free_names_for_lambda(
         ExprKind::When(when) => {
             collect_free_names_for_lambda(&when.subject, param_set, names);
             for arm in &when.arms {
-                collect_free_names_for_lambda(&arm.body, param_set, names);
+                let mut arm_params = param_set.clone();
+                if let Some(binding) = &arm.binding {
+                    arm_params.insert(binding.clone());
+                }
+                collect_free_names_for_lambda(&arm.body, &arm_params, names);
             }
             if let Some(else_arm) = &when.else_arm {
                 collect_free_names_for_lambda(else_arm, param_set, names);
@@ -1778,12 +1816,18 @@ fn collect_free_names_for_lambda(
         }
         ExprKind::For(for_expr) => match &for_expr.header {
             ForHeader::In { pattern, iterable } => {
+                if let Some(init) = &for_expr.init {
+                    collect_free_names_for_lambda_block_item(init, param_set, names);
+                }
                 collect_free_names_for_lambda(iterable, param_set, names);
                 let mut for_params = param_set.clone();
                 for_params.insert(pattern.clone());
                 collect_free_names_for_lambda_block(&for_expr.body, &for_params, names);
             }
             ForHeader::Condition(cond) => {
+                if let Some(init) = &for_expr.init {
+                    collect_free_names_for_lambda_block_item(init, param_set, names);
+                }
                 collect_free_names_for_lambda(cond, param_set, names);
                 collect_free_names_for_lambda_block(&for_expr.body, param_set, names);
             }
@@ -1811,36 +1855,66 @@ fn collect_free_names_for_lambda_block(
     param_set: &BTreeSet<String>,
     names: &mut BTreeSet<String>,
 ) {
-    let mut block_param_names = BTreeSet::new();
+    let mut scope = param_set.clone();
     for item in &block.items {
-        match item {
-            BlockItem::LocalValue(local) => {
-                collect_free_names_for_lambda(&local.initializer, param_set, names);
-                block_param_names.insert(local.name.clone());
-            }
-            BlockItem::Assignment(a) => {
-                collect_free_names_for_lambda(&a.value, param_set, names);
-            }
-            BlockItem::CompoundAssignment(ca) => {
-                collect_free_names_for_lambda(&ca.value, param_set, names);
-            }
-            BlockItem::Expr(e) => {
-                collect_free_names_for_lambda(e, param_set, names);
-            }
-            BlockItem::Return(r) => {
-                if let Some(expr) = &r.value {
-                    collect_free_names_for_lambda(expr, param_set, names);
-                }
-            }
-            BlockItem::Panic(_)
-            | BlockItem::Break(_)
-            | BlockItem::Continue(_)
-            | BlockItem::BlockStatement(_) => {}
+        collect_free_names_for_lambda_block_item(item, &scope, names);
+        if let BlockItem::LocalValue(local) = item {
+            scope.insert(local.name.clone());
         }
     }
-    let inner_set: BTreeSet<String> = param_set.union(&block_param_names).cloned().collect();
     if let Some(trailing) = &block.trailing {
-        collect_free_names_for_lambda(trailing, &inner_set, names);
+        collect_free_names_for_lambda(trailing, &scope, names);
+    }
+}
+
+fn collect_free_names_for_lambda_block_item(
+    item: &BlockItem,
+    param_set: &BTreeSet<String>,
+    names: &mut BTreeSet<String>,
+) {
+    match item {
+        BlockItem::LocalValue(local) => {
+            collect_free_names_for_lambda(&local.initializer, param_set, names);
+        }
+        BlockItem::Assignment(assignment) => {
+            if let Some(target) = &assignment.target {
+                collect_free_names_for_lambda(target, param_set, names);
+            }
+            collect_free_names_for_lambda(&assignment.value, param_set, names);
+        }
+        BlockItem::CompoundAssignment(assignment) => {
+            if let Some(target) = &assignment.target {
+                collect_free_names_for_lambda(target, param_set, names);
+            }
+            collect_free_names_for_lambda(&assignment.value, param_set, names);
+            if !param_set.contains(&assignment.name) {
+                names.insert(assignment.name.clone());
+            }
+        }
+        BlockItem::Return(return_statement) => {
+            if let Some(expr) = &return_statement.value {
+                collect_free_names_for_lambda(expr, param_set, names);
+            }
+        }
+        BlockItem::Panic(panic) => {
+            collect_free_names_for_lambda_string(&panic.message, param_set, names);
+        }
+        BlockItem::BlockStatement(expr) | BlockItem::Expr(expr) => {
+            collect_free_names_for_lambda(expr, param_set, names);
+        }
+        BlockItem::Break(_) | BlockItem::Continue(_) => {}
+    }
+}
+
+fn collect_free_names_for_lambda_string(
+    literal: &StringLiteral,
+    param_set: &BTreeSet<String>,
+    names: &mut BTreeSet<String>,
+) {
+    for part in &literal.parts {
+        if let StringPart::Interpolation(expr) = part {
+            collect_free_names_for_lambda(expr, param_set, names);
+        }
     }
 }
 
@@ -2532,7 +2606,34 @@ fn mark_slot_demand(values: &mut [MirValue], target: MirValueId, slot: usize) {
 }
 
 fn type_syntax_to_vox(ty: &TypeSyntax) -> VoxType {
-    VoxType::opaque_surface(ty.to_source_string())
+    match &ty.kind {
+        TypeKind::Nullable(inner) => VoxType::Nullable(Box::new(type_syntax_to_vox(inner))),
+        TypeKind::Named { name, arguments } => match name.to_source_string().as_str() {
+            "Int" => VoxType::Int,
+            "UInt" => VoxType::UInt,
+            "Float" => VoxType::Float,
+            "Bool" => VoxType::Bool,
+            "String" => VoxType::String,
+            "List" if arguments.len() == 1 => {
+                VoxType::List(Box::new(type_syntax_to_vox(&arguments[0])))
+            }
+            _ => VoxType::opaque_surface(ty.to_source_string()),
+        },
+        TypeKind::Grouped(inner) => type_syntax_to_vox(inner),
+        TypeKind::Tuple(items) => VoxType::Tuple(items.iter().map(type_syntax_to_vox).collect()),
+        TypeKind::Record(fields) => VoxType::Record(
+            fields
+                .iter()
+                .map(|field| vox_core::types::RecordField {
+                    name: field.name.clone(),
+                    ty: type_syntax_to_vox(&field.ty),
+                })
+                .collect(),
+        ),
+        TypeKind::Function { .. } | TypeKind::Dyn(_) => {
+            VoxType::opaque_surface(ty.to_source_string())
+        }
+    }
 }
 
 fn collect_function_return_types(frontend: &FrontendUnit) -> BTreeMap<String, VoxType> {
@@ -2706,13 +2807,31 @@ fn render_type_key(ty: &VoxType) -> String {
         VoxType::Float => "Float".to_owned(),
         VoxType::Bool => "Bool".to_owned(),
         VoxType::String => "String".to_owned(),
+        VoxType::List(item) => format!("List[{}]", render_type_key(item)),
+        VoxType::Tuple(items) => format!(
+            "Tuple[{}]",
+            items
+                .iter()
+                .map(render_type_key)
+                .collect::<Vec<_>>()
+                .join(";")
+        ),
+        VoxType::Record(fields) => format!(
+            "Record[{}]",
+            fields
+                .iter()
+                .map(|field| format!("{}:{}", field.name, render_type_key(&field.ty)))
+                .collect::<Vec<_>>()
+                .join(";")
+        ),
+        VoxType::Nullable(item) => format!("Nullable[{}]", render_type_key(item)),
         VoxType::OpaqueSurface(name) => name.clone(),
         other => format!("{other:?}"),
     }
 }
 
 fn parse_type_key(raw: &str) -> Option<VoxType> {
-    match raw {
+    let primitive = match raw {
         "Int" => Some(VoxType::Int),
         "UInt" => Some(VoxType::UInt),
         "Float" => Some(VoxType::Float),
@@ -2720,7 +2839,68 @@ fn parse_type_key(raw: &str) -> Option<VoxType> {
         "String" => Some(VoxType::String),
         "Null" => Some(VoxType::opaque_surface("Null")),
         _ => None,
+    };
+    if primitive.is_some() {
+        return primitive;
     }
+
+    if let Some(inner) = type_key_payload(raw, "List") {
+        return Some(VoxType::List(Box::new(parse_type_key(inner)?)));
+    }
+    if let Some(inner) = type_key_payload(raw, "Nullable") {
+        return Some(VoxType::Nullable(Box::new(parse_type_key(inner)?)));
+    }
+    if let Some(inner) = type_key_payload(raw, "Tuple") {
+        return split_type_key_items(inner)
+            .into_iter()
+            .map(parse_type_key)
+            .collect::<Option<Vec<_>>>()
+            .map(VoxType::Tuple);
+    }
+    if let Some(inner) = type_key_payload(raw, "Record") {
+        return split_type_key_items(inner)
+            .into_iter()
+            .map(|field| {
+                let (name, ty) = field.split_once(':')?;
+                Some(vox_core::types::RecordField {
+                    name: name.to_owned(),
+                    ty: parse_type_key(ty)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(VoxType::Record);
+    }
+
+    Some(VoxType::opaque_surface(raw))
+}
+
+fn type_key_payload<'a>(raw: &'a str, kind: &str) -> Option<&'a str> {
+    raw.strip_prefix(kind)
+        .and_then(|rest| rest.strip_prefix('['))
+        .and_then(|rest| rest.strip_suffix(']'))
+}
+
+fn split_type_key_items(raw: &str) -> Vec<&str> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, character) in raw.char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ';' if depth == 0 => {
+                items.push(&raw[start..index]);
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&raw[start..]);
+    items
 }
 
 fn function_result_type(ty: &VoxType) -> Option<VoxType> {

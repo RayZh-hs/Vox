@@ -99,6 +99,8 @@ struct Ctx {
     lambda_table: BTreeMap<MirBodyId, (u32, usize)>,
     lambda_types: BTreeMap<usize, u32>,
     is_lambda_body: bool,
+    temporary_values: Vec<MirValueId>,
+    next_temporary_value: usize,
 }
 
 impl Ctx {
@@ -118,6 +120,8 @@ impl Ctx {
             lambda_table: BTreeMap::new(),
             lambda_types: BTreeMap::new(),
             is_lambda_body: false,
+            temporary_values: Vec::new(),
+            next_temporary_value: 0,
         };
         ctx.init_for_body(body);
         ctx
@@ -130,6 +134,8 @@ impl Ctx {
         self.temp_count = 0;
         self.version_index.clear();
         self.version_count = 0;
+        self.temporary_values.clear();
+        self.next_temporary_value = 0;
 
         self.is_lambda_body = matches!(body.kind, MirBodyKind::Lambda);
 
@@ -265,51 +271,53 @@ impl Ctx {
 
     fn version_tag_local(&self, version: MirVersionId) -> u32 {
         let idx = self.version_index.get(&version).copied().unwrap_or(0);
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + idx * 2
+        self.parameter_local_count() + self.num_value_locals() + idx * 2
     }
 
     fn version_data_local(&self, version: MirVersionId) -> u32 {
         let idx = self.version_index.get(&version).copied().unwrap_or(0);
-        self.parameter_local_count() + self.num_value_locals() + self.temp_count * 2 + idx * 2 + 1
+        self.parameter_local_count() + self.num_value_locals() + idx * 2 + 1
     }
 
     fn total_locals(&self) -> u32 {
-        self.num_value_locals() + self.temp_count * 2 + self.version_count * 2 + 3
+        self.num_value_locals() + self.version_count * 2 + 3
     }
 
     fn block_id_local(&self) -> u32 {
-        self.parameter_local_count()
-            + self.num_value_locals()
-            + self.temp_count * 2
-            + self.version_count * 2
+        self.parameter_local_count() + self.num_value_locals() + self.version_count * 2
     }
 
     fn result_tag_local(&self) -> u32 {
-        self.parameter_local_count()
-            + self.num_value_locals()
-            + self.temp_count * 2
-            + self.version_count * 2
-            + 1
+        self.parameter_local_count() + self.num_value_locals() + self.version_count * 2 + 1
     }
 
     fn result_data_local(&self) -> u32 {
-        self.parameter_local_count()
-            + self.num_value_locals()
-            + self.temp_count * 2
-            + self.version_count * 2
-            + 2
+        self.parameter_local_count() + self.num_value_locals() + self.version_count * 2 + 2
     }
 
     fn block_idx(&self, id: MirBlockId) -> usize {
         self.block_index.get(&id).copied().unwrap_or(0) as usize
     }
 
-    fn alloc_temp_value(&mut self) -> MirValueId {
-        let idx = (self.num_value_locals() / 2) + self.temp_count;
-        self.temp_count += 1;
-        let id = MirValueId(100000 + idx);
-        self.value_index.insert(id, idx);
-        id
+    fn reserve_temporary_values(&mut self, count: usize) {
+        let first_index = self.value_index.len() as u32;
+        for offset in 0..count as u32 {
+            let id = MirValueId(100000 + first_index + offset);
+            self.value_index.insert(id, first_index + offset);
+            self.temporary_values.push(id);
+        }
+    }
+
+    fn alloc_temp_value(&mut self) -> Result<MirValueId, String> {
+        let Some(value) = self
+            .temporary_values
+            .get(self.next_temporary_value)
+            .copied()
+        else {
+            return Err("wasm lowering exhausted its reserved temporary values".to_owned());
+        };
+        self.next_temporary_value += 1;
+        Ok(value)
     }
 }
 
@@ -383,13 +391,7 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         if !matches!(body.kind, MirBodyKind::Lambda) {
             continue;
         }
-        let capture_count: usize = body
-            .name
-            .split('.')
-            .nth(2)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let explicit_params = body.parameters.len().saturating_sub(capture_count);
+        let explicit_params = body.parameters.len();
         if closure_type_indices.contains_key(&explicit_params) {
             continue;
         }
@@ -442,13 +444,7 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
             entry_func_index = Some(func_index);
         }
         let type_idx = if matches!(body.kind, MirBodyKind::Lambda) {
-            let capture_count: usize = body
-                .name
-                .split('.')
-                .nth(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let explicit_params = body.parameters.len().saturating_sub(capture_count);
+            let explicit_params = body.parameters.len();
             *closure_type_indices.get(&explicit_params).ok_or_else(|| {
                 format!("missing wasm closure type for {explicit_params} explicit parameters")
             })?
@@ -524,12 +520,7 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
                 .copied()
                 .ok_or_else(|| format!("lambda body {} not found in func_map", body.name))?;
             elem_funcs.push(func_idx);
-            let capture_count: usize = body
-                .name
-                .split('.')
-                .nth(2)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let capture_count = lambda_capture_count(body);
             if let Some(item) = module.bodies.iter().find(|b| b.name == body.name) {
                 ctx.lambda_table
                     .insert(item.id, (table_index, capture_count));
@@ -548,6 +539,7 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
         if i > 0 {
             ctx.init_for_body(body);
         }
+        ctx.reserve_temporary_values(required_wasm_temporary_values(body));
         let func = emit_body(body, &mut ctx)?;
         codes.function(&func);
     }
@@ -599,6 +591,52 @@ fn lower_module(module: &MirModule) -> Result<Vec<u8>, String> {
     Ok(wasm.finish())
 }
 
+fn required_wasm_temporary_values(body: &MirBody) -> usize {
+    body.blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .map(|op| match &op.kind {
+            MirOpKind::Literal(value) => literal_temporary_values(value),
+            MirOpKind::Call { callee, .. } => {
+                let Some((builtins::BuiltinReceiver::List, method)) =
+                    builtins::split_builtin_callee(callee)
+                else {
+                    return 0;
+                };
+                match method {
+                    "map" => 4,
+                    "filter" => 5,
+                    "fold" | "foldRight" => 4,
+                    "flatMap" => 11,
+                    "zip" => 6,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        })
+        .sum()
+}
+
+fn literal_temporary_values(value: &InlineValue) -> usize {
+    match value {
+        InlineValue::Tuple(values) => values
+            .iter()
+            .map(|value| 1 + literal_temporary_values(value))
+            .sum(),
+        InlineValue::Record(fields) => fields
+            .values()
+            .map(|value| 1 + literal_temporary_values(value))
+            .sum(),
+        InlineValue::Int(_)
+        | InlineValue::UInt(_)
+        | InlineValue::Float(_)
+        | InlineValue::Bool(_)
+        | InlineValue::String(_)
+        | InlineValue::Null
+        | InlineValue::Handle(_) => 0,
+    }
+}
+
 fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
     let bodies: Vec<&MirBody> = module
         .bodies
@@ -622,7 +660,8 @@ fn validate_wasm_supported(module: &MirModule) -> Result<(), String> {
         for value in &body.values {
             if !is_supported_wasm_value_type(value.ty.as_ref()) {
                 return Err(format!(
-                    "value %{} has unsupported wasm type {}",
+                    "body `{}` value %{} has unsupported wasm type {}",
+                    body.name,
                     value.id.0,
                     render_mir_type(value.ty.as_ref())
                 ));
@@ -742,17 +781,6 @@ fn validate_wasm_call_op(
     args: &[MirValueId],
     body_map: &BTreeMap<String, &MirBody>,
 ) -> Result<(), String> {
-    if let Some((builtins::BuiltinReceiver::List, method)) = builtins::split_builtin_callee(callee)
-        && matches!(
-            method,
-            "fold" | "foldRight" | "map" | "filter" | "flatMap" | "zip"
-        )
-    {
-        return Err(format!(
-            "List.{method} is not supported by the WASM backend yet"
-        ));
-    }
-
     let Some(target) = body_map.get(callee) else {
         return Ok(());
     };
@@ -1031,15 +1059,20 @@ fn is_supported_wasm_value_type(ty: Option<&VoxType>) -> bool {
         Some(VoxType::List(item)) | Some(VoxType::Nullable(item)) => {
             is_supported_wasm_value_type(Some(item))
         }
-        Some(VoxType::OpaqueSurface(name)) => {
-            matches!(
-                name.as_str(),
-                "Int" | "UInt" | "Float" | "Bool" | "String" | "Null"
-            ) || name.starts_with("Iterator<")
-                || name.starts_with("Function<")
-        }
+        Some(VoxType::OpaqueSurface(name)) => is_supported_wasm_surface_type(name),
         _ => false,
     }
+}
+
+fn is_supported_wasm_surface_type(name: &str) -> bool {
+    if let Some(inner) = name.strip_suffix('?') {
+        return is_supported_wasm_surface_type(inner);
+    }
+    matches!(
+        name,
+        "Int" | "UInt" | "Float" | "Bool" | "String" | "Null" | "Unknown"
+    ) || name.starts_with("Iterator<")
+        || name.starts_with("Function<")
 }
 
 fn wasm_scalar_type(body: &MirBody, value: MirValueId) -> Option<WasmScalar> {
@@ -1107,6 +1140,13 @@ fn mir_op_name(kind: &MirOpKind) -> &'static str {
         MirOpKind::IteratorNext => "IteratorNext",
         MirOpKind::Unknown(_) => "Unknown",
     }
+}
+
+fn lambda_capture_count(body: &MirBody) -> usize {
+    body.versions
+        .iter()
+        .filter(|version| version.source == MirVersionSource::Capture)
+        .count()
 }
 
 fn emit_body(body: &MirBody, ctx: &mut Ctx) -> Result<Function, String> {
@@ -1426,7 +1466,15 @@ fn emit_op(
         }
         MirOpKind::Call { callee, .. } => {
             if let Some(rid) = result {
-                if builtins::split_builtin_callee(callee).is_some() {
+                if let Some((builtins::BuiltinReceiver::List, method)) =
+                    builtins::split_builtin_callee(callee)
+                    && matches!(
+                        method,
+                        "fold" | "foldRight" | "map" | "filter" | "flatMap" | "zip"
+                    )
+                {
+                    emit_higher_order_list_call(method, args, rid, ctx, f, body)?;
+                } else if builtins::split_builtin_callee(callee).is_some() {
                     builtin_op_call(
                         BuiltinOp::BuiltinMethod,
                         args,
@@ -1525,7 +1573,7 @@ fn emit_literal(
             } else {
                 let mut temp_ids = Vec::new();
                 for item in items.iter() {
-                    let tid = ctx.alloc_temp_value();
+                    let tid = ctx.alloc_temp_value()?;
                     emit_literal(item, Some(tid), ctx, f)?;
                     temp_ids.push(tid);
                 }
@@ -1549,7 +1597,7 @@ fn emit_literal(
             let mut names: Vec<Vec<u8>> = Vec::new();
             for (name, value) in fields {
                 names.push(name.as_bytes().to_vec());
-                let tid = ctx.alloc_temp_value();
+                let tid = ctx.alloc_temp_value()?;
                 emit_literal(value, Some(tid), ctx, f)?;
                 temp_ids.push(tid);
             }
@@ -2007,6 +2055,493 @@ fn emit_list_new(
     emit_value_sequence_new(TAG_LIST, args, result, ctx, f)
 }
 
+fn emit_higher_order_list_call(
+    method: &str,
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    match method {
+        "map" => emit_list_map(args, result, ctx, f, body),
+        "filter" => emit_list_filter(args, result, ctx, f, body),
+        "fold" => emit_list_fold(args, result, false, ctx, f, body),
+        "foldRight" => emit_list_fold(args, result, true, ctx, f, body),
+        "flatMap" => emit_list_flat_map(args, result, ctx, f, body),
+        "zip" => emit_list_zip(args, result, ctx, f),
+        _ => Err(format!("unsupported higher-order List method `{method}`")),
+    }
+}
+
+fn emit_list_map(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    let [list, callback] = args else {
+        return Err("List.map expected a receiver and callback".to_owned());
+    };
+    let index = ctx.alloc_temp_value()?;
+    let count = ctx.alloc_temp_value()?;
+    let item = ctx.alloc_temp_value()?;
+    let mapped = ctx.alloc_temp_value()?;
+
+    emit_list_count(*list, count, ctx, f);
+    emit_list_allocate_capacity(count, result, ctx, f);
+    emit_int_value(index, 0, ctx, f);
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(index, count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(*list, index, item, ctx, f);
+    emit_dynamic_call(*callback, &[item], mapped, ctx, f, body)?;
+    emit_list_store_item(result, index, mapped, ctx, f);
+    emit_increment(index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    emit_list_set_length(result, count, ctx, f);
+    Ok(())
+}
+
+fn emit_list_filter(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    let [list, callback] = args else {
+        return Err("List.filter expected a receiver and callback".to_owned());
+    };
+    let index = ctx.alloc_temp_value()?;
+    let count = ctx.alloc_temp_value()?;
+    let item = ctx.alloc_temp_value()?;
+    let predicate = ctx.alloc_temp_value()?;
+    let output_index = ctx.alloc_temp_value()?;
+
+    emit_list_count(*list, count, ctx, f);
+    emit_list_allocate_capacity(count, result, ctx, f);
+    emit_int_value(index, 0, ctx, f);
+    emit_int_value(output_index, 0, ctx, f);
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(index, count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(*list, index, item, ctx, f);
+    emit_dynamic_call(*callback, &[item], predicate, ctx, f, body)?;
+    emit_require_tag(predicate, TAG_BOOL, ctx, f);
+    local_get(f, ctx.data_local(predicate));
+    f.instruction(&Instruction::I64Const(0));
+    f.instruction(&Instruction::I64Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    emit_list_store_item(result, output_index, item, ctx, f);
+    emit_increment(output_index, ctx, f);
+    f.instruction(&Instruction::End);
+    emit_increment(index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    emit_list_set_length(result, output_index, ctx, f);
+    Ok(())
+}
+
+fn emit_list_fold(
+    args: &[MirValueId],
+    result: MirValueId,
+    reverse: bool,
+    ctx: &mut Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    let [list, initial, callback] = args else {
+        return Err("List.fold expected a receiver, initial value, and callback".to_owned());
+    };
+    let index = ctx.alloc_temp_value()?;
+    let count = ctx.alloc_temp_value()?;
+    let item = ctx.alloc_temp_value()?;
+    let next = ctx.alloc_temp_value()?;
+
+    emit_list_count(*list, count, ctx, f);
+    emit_copy_value(result, *initial, ctx, f);
+    if reverse {
+        emit_copy_value(index, count, ctx, f);
+    } else {
+        emit_int_value(index, 0, ctx, f);
+    }
+
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    if reverse {
+        local_get(f, ctx.data_local(index));
+        f.instruction(&Instruction::I64Const(0));
+        f.instruction(&Instruction::I64Eq);
+        f.instruction(&Instruction::BrIf(1));
+        emit_decrement(index, ctx, f);
+    } else {
+        emit_index_at_or_after(index, count, ctx, f);
+        f.instruction(&Instruction::BrIf(1));
+    }
+    emit_list_load_item(*list, index, item, ctx, f);
+    if reverse {
+        emit_dynamic_call(*callback, &[item, result], next, ctx, f, body)?;
+    } else {
+        emit_dynamic_call(*callback, &[result, item], next, ctx, f, body)?;
+    }
+    emit_copy_value(result, next, ctx, f);
+    if !reverse {
+        emit_increment(index, ctx, f);
+    }
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+    Ok(())
+}
+
+fn emit_list_flat_map(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+    body: &MirBody,
+) -> Result<(), String> {
+    let [list, callback] = args else {
+        return Err("List.flatMap expected a receiver and callback".to_owned());
+    };
+    let input_count = ctx.alloc_temp_value()?;
+    let input_index = ctx.alloc_temp_value()?;
+    let item = ctx.alloc_temp_value()?;
+    let mapped = ctx.alloc_temp_value()?;
+    let mapped_lists = ctx.alloc_temp_value()?;
+    let total = ctx.alloc_temp_value()?;
+    let outer_index = ctx.alloc_temp_value()?;
+    let mapped_list = ctx.alloc_temp_value()?;
+    let mapped_count = ctx.alloc_temp_value()?;
+    let inner_index = ctx.alloc_temp_value()?;
+    let flattened_item = ctx.alloc_temp_value()?;
+
+    // Call each callback exactly once. The temporary list retains the resulting
+    // lists while the second pass computes the exact flattened allocation size.
+    emit_list_count(*list, input_count, ctx, f);
+    emit_list_allocate_capacity(input_count, mapped_lists, ctx, f);
+    emit_int_value(input_index, 0, ctx, f);
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(input_index, input_count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(*list, input_index, item, ctx, f);
+    emit_dynamic_call(*callback, &[item], mapped, ctx, f, body)?;
+    emit_require_memory_backed_list(mapped, ctx, f);
+    emit_list_store_item(mapped_lists, input_index, mapped, ctx, f);
+    emit_increment(input_index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+    emit_list_set_length(mapped_lists, input_count, ctx, f);
+
+    emit_int_value(total, 0, ctx, f);
+    emit_int_value(outer_index, 0, ctx, f);
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(outer_index, input_count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(mapped_lists, outer_index, mapped_list, ctx, f);
+    emit_list_count(mapped_list, mapped_count, ctx, f);
+    local_get(f, ctx.data_local(total));
+    local_get(f, ctx.data_local(mapped_count));
+    f.instruction(&Instruction::I64Add);
+    local_set(f, ctx.data_local(total));
+    emit_increment(outer_index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    emit_list_allocate_capacity(total, result, ctx, f);
+    emit_int_value(total, 0, ctx, f);
+    emit_int_value(outer_index, 0, ctx, f);
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(outer_index, input_count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(mapped_lists, outer_index, mapped_list, ctx, f);
+    emit_list_count(mapped_list, mapped_count, ctx, f);
+    emit_int_value(inner_index, 0, ctx, f);
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(inner_index, mapped_count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(mapped_list, inner_index, flattened_item, ctx, f);
+    emit_list_store_item(result, total, flattened_item, ctx, f);
+    emit_increment(total, ctx, f);
+    emit_increment(inner_index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+    emit_increment(outer_index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    emit_list_set_length(result, total, ctx, f);
+    Ok(())
+}
+
+fn emit_list_zip(
+    args: &[MirValueId],
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+) -> Result<(), String> {
+    let [left, right] = args else {
+        return Err("List.zip expected a receiver and another list".to_owned());
+    };
+    let count = ctx.alloc_temp_value()?;
+    let other_count = ctx.alloc_temp_value()?;
+    let index = ctx.alloc_temp_value()?;
+    let left_item = ctx.alloc_temp_value()?;
+    let right_item = ctx.alloc_temp_value()?;
+    let pair = ctx.alloc_temp_value()?;
+
+    emit_list_count(*left, count, ctx, f);
+    emit_list_count(*right, other_count, ctx, f);
+    local_get(f, ctx.data_local(other_count));
+    local_get(f, ctx.data_local(count));
+    f.instruction(&Instruction::I64LtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    emit_copy_value(count, other_count, ctx, f);
+    f.instruction(&Instruction::End);
+
+    emit_list_allocate_capacity(count, result, ctx, f);
+    emit_int_value(index, 0, ctx, f);
+    f.instruction(&Instruction::Block(BlockType::Empty));
+    f.instruction(&Instruction::Loop(BlockType::Empty));
+    emit_index_at_or_after(index, count, ctx, f);
+    f.instruction(&Instruction::BrIf(1));
+    emit_list_load_item(*left, index, left_item, ctx, f);
+    emit_list_load_item(*right, index, right_item, ctx, f);
+    emit_tuple_new(&[left_item, right_item], pair, ctx, f)?;
+    emit_list_store_item(result, index, pair, ctx, f);
+    emit_increment(index, ctx, f);
+    f.instruction(&Instruction::Br(0));
+    f.instruction(&Instruction::End);
+    f.instruction(&Instruction::End);
+
+    emit_list_set_length(result, count, ctx, f);
+    Ok(())
+}
+
+fn emit_int_value(value: MirValueId, data: i64, ctx: &Ctx, f: &mut Function) {
+    i32(f, TAG_INT);
+    local_set(f, ctx.tag_local(value));
+    f.instruction(&Instruction::I64Const(data));
+    local_set(f, ctx.data_local(value));
+}
+
+fn emit_copy_value(target: MirValueId, source: MirValueId, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.tag_local(source));
+    local_set(f, ctx.tag_local(target));
+    local_get(f, ctx.data_local(source));
+    local_set(f, ctx.data_local(target));
+}
+
+fn emit_increment(value: MirValueId, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64Add);
+    local_set(f, ctx.data_local(value));
+}
+
+fn emit_decrement(value: MirValueId, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I64Const(1));
+    f.instruction(&Instruction::I64Sub);
+    local_set(f, ctx.data_local(value));
+}
+
+fn emit_require_tag(value: MirValueId, tag: i32, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.tag_local(value));
+    i32(f, tag);
+    f.instruction(&Instruction::I32Ne);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+}
+
+fn emit_require_memory_backed_list(value: MirValueId, ctx: &Ctx, f: &mut Function) {
+    emit_require_tag(value, TAG_LIST, ctx, f);
+    local_get(f, ctx.data_local(value));
+    f.instruction(&Instruction::I64Const(STRDATA_OFF as i64));
+    f.instruction(&Instruction::I64LtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+}
+
+fn emit_list_count(list: MirValueId, count: MirValueId, ctx: &Ctx, f: &mut Function) {
+    emit_require_memory_backed_list(list, ctx, f);
+    local_get(f, ctx.data_local(list));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    f.instruction(&Instruction::I64ExtendI32U);
+    local_set(f, ctx.data_local(count));
+    i32(f, TAG_INT);
+    local_set(f, ctx.tag_local(count));
+}
+
+fn emit_list_set_length(list: MirValueId, count: MirValueId, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.data_local(list));
+    f.instruction(&Instruction::I32WrapI64);
+    local_get(f, ctx.data_local(count));
+    f.instruction(&Instruction::I32WrapI64);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+}
+
+fn emit_list_entry_address(
+    list: MirValueId,
+    index: MirValueId,
+    extra_offset: u32,
+    ctx: &Ctx,
+    f: &mut Function,
+) {
+    local_get(f, ctx.data_local(list));
+    f.instruction(&Instruction::I32WrapI64);
+    i32(f, 4);
+    f.instruction(&Instruction::I32Add);
+    local_get(f, ctx.data_local(index));
+    f.instruction(&Instruction::I32WrapI64);
+    i32(f, 16);
+    f.instruction(&Instruction::I32Mul);
+    f.instruction(&Instruction::I32Add);
+    if extra_offset > 0 {
+        i32(f, extra_offset as i32);
+        f.instruction(&Instruction::I32Add);
+    }
+}
+
+fn emit_list_load_item(
+    list: MirValueId,
+    index: MirValueId,
+    item: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) {
+    emit_list_entry_address(list, index, 0, ctx, f);
+    f.instruction(&Instruction::I32Load(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    local_set(f, ctx.tag_local(item));
+    emit_list_entry_address(list, index, 8, ctx, f);
+    f.instruction(&Instruction::I64Load(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
+    local_set(f, ctx.data_local(item));
+}
+
+fn emit_list_store_item(
+    list: MirValueId,
+    index: MirValueId,
+    item: MirValueId,
+    ctx: &Ctx,
+    f: &mut Function,
+) {
+    emit_list_entry_address(list, index, 0, ctx, f);
+    local_get(f, ctx.tag_local(item));
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    emit_list_entry_address(list, index, 8, ctx, f);
+    local_get(f, ctx.data_local(item));
+    f.instruction(&Instruction::I64Store(MemArg {
+        offset: 0,
+        align: 3,
+        memory_index: 0,
+    }));
+}
+
+fn emit_index_at_or_after(index: MirValueId, count: MirValueId, ctx: &Ctx, f: &mut Function) {
+    local_get(f, ctx.data_local(index));
+    local_get(f, ctx.data_local(count));
+    f.instruction(&Instruction::I64GeU);
+}
+
+fn emit_list_allocate_capacity(
+    capacity: MirValueId,
+    result: MirValueId,
+    ctx: &mut Ctx,
+    f: &mut Function,
+) {
+    let max_items = (HEAP_LIMIT - 8) / 16;
+    local_get(f, ctx.data_local(capacity));
+    f.instruction(&Instruction::I64Const(max_items as i64));
+    f.instruction(&Instruction::I64GtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    i32(f, BuiltinOp::HeapExhausted as i32);
+    i32(f, SCRATCH_OFF as i32);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, RESULT_OFF as i32);
+    f.instruction(&Instruction::Call(0));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+
+    f.instruction(&Instruction::GlobalGet(HEAP_TOP_GLOBAL));
+    f.instruction(&Instruction::I64ExtendI32U);
+    local_set(f, ctx.data_local(result));
+
+    f.instruction(&Instruction::GlobalGet(HEAP_TOP_GLOBAL));
+    local_get(f, ctx.data_local(capacity));
+    f.instruction(&Instruction::I32WrapI64);
+    i32(f, 16);
+    f.instruction(&Instruction::I32Mul);
+    i32(f, 11);
+    f.instruction(&Instruction::I32Add);
+    i32(f, -8);
+    f.instruction(&Instruction::I32And);
+    f.instruction(&Instruction::I32Add);
+    f.instruction(&Instruction::LocalTee(ctx.result_tag_local()));
+    i32(f, HEAP_LIMIT as i32);
+    f.instruction(&Instruction::I32GtU);
+    f.instruction(&Instruction::If(BlockType::Empty));
+    i32(f, BuiltinOp::HeapExhausted as i32);
+    i32(f, SCRATCH_OFF as i32);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, 0);
+    i32(f, RESULT_OFF as i32);
+    f.instruction(&Instruction::Call(0));
+    f.instruction(&Instruction::Unreachable);
+    f.instruction(&Instruction::End);
+    local_get(f, ctx.result_tag_local());
+    f.instruction(&Instruction::GlobalSet(HEAP_TOP_GLOBAL));
+
+    i32(f, TAG_LIST);
+    local_set(f, ctx.tag_local(result));
+    emit_list_set_length(result, capacity, ctx, f);
+    record_known_tag(ctx, result, TAG_LIST);
+}
+
 fn emit_value_sequence_new(
     tag: i32,
     args: &[MirValueId],
@@ -2347,16 +2882,36 @@ fn emit_closure_new(
         .ok_or_else(|| format!("no closure type for {} explicit params", explicit_params))?;
     let size = 8u32 + capture_count as u32 * 16;
     emit_heap_alloc_const(size, result, ctx, f);
+    emit_addr_at_heap_value(f, ctx, result, 0);
     i32(f, table_index as i32);
-    i32_store_at(f, ctx, result, 0);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
+    emit_addr_at_heap_value(f, ctx, result, 4);
     i32(f, capture_count as i32);
-    i32_store_at(f, ctx, result, 4);
+    f.instruction(&Instruction::I32Store(MemArg {
+        offset: 0,
+        align: 2,
+        memory_index: 0,
+    }));
     for (i, cap) in captures.iter().enumerate().take(capture_count) {
         let offset = 8u32 + i as u32 * 16;
+        emit_addr_at_heap_value(f, ctx, result, offset);
         local_get(f, ctx.tag_local(*cap));
-        i32_store_at(f, ctx, result, offset);
+        f.instruction(&Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        emit_addr_at_heap_value(f, ctx, result, offset + 8);
         local_get(f, ctx.data_local(*cap));
-        i64_store_at(f, ctx, result, offset + 8);
+        f.instruction(&Instruction::I64Store(MemArg {
+            offset: 0,
+            align: 3,
+            memory_index: 0,
+        }));
     }
     i32(f, TAG_CLOSURE);
     local_set(f, ctx.tag_local(result));
@@ -2381,6 +2936,7 @@ fn emit_dynamic_call(
     f.instruction(&Instruction::End);
 
     local_get(f, closure_data);
+    f.instruction(&Instruction::I32WrapI64);
 
     for arg in args {
         local_get(f, ctx.tag_local(*arg));
@@ -2395,6 +2951,7 @@ fn emit_dynamic_call(
         .unwrap_or_else(|| *ctx.lambda_types.values().next().unwrap_or(&0));
 
     local_get(f, closure_data);
+    f.instruction(&Instruction::I32WrapI64);
     f.instruction(&Instruction::I32Load(MemArg {
         offset: 0,
         align: 2,
@@ -2409,30 +2966,6 @@ fn emit_dynamic_call(
     f.instruction(&Instruction::LocalSet(ctx.data_local(result)));
     f.instruction(&Instruction::LocalSet(ctx.tag_local(result)));
     Ok(())
-}
-
-fn i32_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
-    local_get(f, ctx.data_local(value));
-    f.instruction(&Instruction::I32WrapI64);
-    i32(f, offset as i32);
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I32Store(MemArg {
-        offset: 0,
-        align: 2,
-        memory_index: 0,
-    }));
-}
-
-fn i64_store_at(f: &mut Function, ctx: &Ctx, value: MirValueId, offset: u32) {
-    local_get(f, ctx.data_local(value));
-    f.instruction(&Instruction::I32WrapI64);
-    i32(f, offset as i32);
-    f.instruction(&Instruction::I32Add);
-    f.instruction(&Instruction::I64Store(MemArg {
-        offset: 0,
-        align: 3,
-        memory_index: 0,
-    }));
 }
 
 fn emit_lambda_capture_prologue(body: &MirBody, ctx: &Ctx, f: &mut Function) -> Result<(), String> {

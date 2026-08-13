@@ -879,6 +879,20 @@ impl Runtime {
             return (entry.handler)(self, arguments);
         }
 
+        if self
+            .host
+            .package(package)
+            .is_some_and(|manifest| manifest.values.iter().any(|value| value.name == function))
+        {
+            if !arguments.is_empty() {
+                return Err(format!(
+                    "package value `{}` does not accept arguments",
+                    qualified_host_name(package, function)
+                ));
+            }
+            return interpreter::evaluate_package_value(self, package, function);
+        }
+
         let values = arguments
             .iter()
             .map(|argument| {

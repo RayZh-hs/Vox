@@ -37,6 +37,10 @@ pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportRes
                     function.return_type.clone(),
                 );
             }
+            for value in &manifest.values {
+                function_return_types
+                    .insert(format!("{}.{}", module_str, value.name), value.ty.clone());
+            }
         }
 
         match &import.items {
@@ -46,6 +50,13 @@ pub fn resolve_imports(imports: &[ImportDecl], host: &HostRegistry) -> ImportRes
                         let qualified = format!("{}.{}", module_str, function.name);
                         unqualified_sources
                             .entry(function.name.clone())
+                            .or_default()
+                            .push(qualified);
+                    }
+                    for value in &manifest.values {
+                        let qualified = format!("{}.{}", module_str, value.name);
+                        unqualified_sources
+                            .entry(value.name.clone())
                             .or_default()
                             .push(qualified);
                     }

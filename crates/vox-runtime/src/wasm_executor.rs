@@ -1562,11 +1562,17 @@ fn memory_backed_offset(val: i64) -> bool {
     val >= STRDATA_OFF
 }
 
-fn memory_value_to_handle_data(data: &[u8], tag: i32, val: i64) -> Result<HandleData, String> {
-    memory_value_to_handle_data_depth(data, tag, val, 0)
+fn memory_value_to_handle_data(
+    runtime: &Runtime,
+    data: &[u8],
+    tag: i32,
+    val: i64,
+) -> Result<HandleData, String> {
+    memory_value_to_handle_data_depth(runtime, data, tag, val, 0)
 }
 
 fn memory_value_to_handle_data_depth(
+    runtime: &Runtime,
     data: &[u8],
     tag: i32,
     val: i64,
@@ -1604,6 +1610,7 @@ fn memory_value_to_handle_data_depth(
                 let item_tag = mem_read_i32(data, base)?;
                 let item_data = mem_read_i64(data, base + 8)?;
                 values.push(memory_or_inline_to_handle_data(
+                    runtime,
                     data,
                     item_tag,
                     item_data,
@@ -1646,7 +1653,13 @@ fn memory_value_to_handle_data_depth(
                     .ok_or_else(|| "record field data offset overflow".to_owned())?;
                 fields.insert(
                     name,
-                    memory_or_inline_to_handle_data(data, field_tag, field_data, depth + 1)?,
+                    memory_or_inline_to_handle_data(
+                        runtime,
+                        data,
+                        field_tag,
+                        field_data,
+                        depth + 1,
+                    )?,
                 );
             }
             Ok(HandleData::Record(fields))
@@ -1656,6 +1669,7 @@ fn memory_value_to_handle_data_depth(
 }
 
 fn memory_or_inline_to_handle_data(
+    runtime: &Runtime,
     data: &[u8],
     tag: i32,
     val: i64,
@@ -1669,7 +1683,10 @@ fn memory_or_inline_to_handle_data(
         TAG_NULL => Ok(HandleData::Null),
         TAG_TUPLE if val == 0 => Ok(HandleData::Tuple(vec![])),
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST if memory_backed_offset(val) => {
-            memory_value_to_handle_data_depth(data, tag, val, depth)
+            memory_value_to_handle_data_depth(runtime, data, tag, val, depth)
+        }
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST | TAG_HANDLE => {
+            runtime.get_handle_data(HandleId(val as u64))
         }
         other => Err(format!(
             "memory-backed value contains unsupported nested tag {other}"
@@ -1683,14 +1700,9 @@ fn handle_data_to_runtime_handle(
 ) -> Result<RuntimeValue, String> {
     let (tag, val) = handle_data_result_to_wasm(runtime, data)?;
     match tag {
-        TAG_STRING | TAG_TUPLE | TAG_RECORD => {
-            let handle = HandleId(val as u64);
-            match runtime.get_handle_data(handle) {
-                Ok(data) => handle_data_to_inline(data).map(RuntimeValue::Inline),
-                Err(_) => Ok(RuntimeValue::Handle(handle)),
-            }
+        TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST | TAG_HANDLE => {
+            Ok(RuntimeValue::Handle(HandleId(val as u64)))
         }
-        TAG_LIST | TAG_HANDLE => Ok(RuntimeValue::Handle(HandleId(val as u64))),
         TAG_INT | TAG_UINT | TAG_FLOAT | TAG_BOOL | TAG_NULL => from_wasm(runtime, None, tag, val),
         _ => Err(format!("unknown wasm result tag {tag}")),
     }
@@ -1714,12 +1726,15 @@ fn from_wasm(
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST
             if memory_backed_offset(val)
                 && memory
-                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .map(|data| memory_value_to_handle_data(runtime, data, tag, val).is_ok())
                     .unwrap_or(false) =>
         {
-            let data = memory_value_to_handle_data(memory.expect("checked above"), tag, val)?;
+            let data =
+                memory_value_to_handle_data(runtime, memory.expect("checked above"), tag, val)?;
             match data {
-                HandleData::List(_) => handle_data_to_runtime_handle(runtime, data),
+                HandleData::List(_) | HandleData::Record(_) => {
+                    handle_data_to_runtime_handle(runtime, data)
+                }
                 other => handle_data_to_inline(other).map(RuntimeValue::Inline),
             }
         }
@@ -1752,10 +1767,10 @@ fn wasm_to_inline(
         TAG_STRING | TAG_TUPLE | TAG_RECORD
             if memory_backed_offset(val)
                 && memory
-                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .map(|data| memory_value_to_handle_data(runtime, data, tag, val).is_ok())
                     .unwrap_or(false) =>
         {
-            memory_value_to_handle_data(memory.expect("checked above"), tag, val)
+            memory_value_to_handle_data(runtime, memory.expect("checked above"), tag, val)
                 .and_then(handle_data_to_inline)
         }
         TAG_STRING | TAG_TUPLE | TAG_RECORD => {
@@ -1835,10 +1850,10 @@ fn wasm_to_data(
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST
             if memory_backed_offset(val)
                 && memory
-                    .map(|data| memory_value_to_handle_data(data, tag, val).is_ok())
+                    .map(|data| memory_value_to_handle_data(runtime, data, tag, val).is_ok())
                     .unwrap_or(false) =>
         {
-            memory_value_to_handle_data(memory.expect("checked above"), tag, val)
+            memory_value_to_handle_data(runtime, memory.expect("checked above"), tag, val)
         }
         TAG_STRING | TAG_TUPLE | TAG_RECORD | TAG_LIST | TAG_HANDLE => {
             runtime.get_handle_data(HandleId(val as u64))
@@ -1966,7 +1981,7 @@ fn wasm_matches_type(
         ("Unit", TAG_TUPLE) => {
             if let Some(data) = memory.filter(|_| memory_backed_offset(val)) {
                 return matches!(
-                    memory_value_to_handle_data(data, tag, val),
+                    memory_value_to_handle_data(runtime, data, tag, val),
                     Ok(HandleData::Tuple(items)) if items.is_empty()
                 );
             }
